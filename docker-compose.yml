@@ -1,0 +1,37 @@
+services:
+  ons-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ons-rooster-backend:latest
+    container_name: ons-rooster
+    restart: unless-stopped
+    environment:
+      PUBLIC_BASE_URL: https://onsrooster.stefhermans.nl
+      APP_HOST: 0.0.0.0
+      APP_PORT: 8080
+      DATA_DIR: /data
+      LOG_LEVEL: INFO
+      TZ: Europe/Amsterdam
+      DEFAULT_LOGIN_URL: https://landvanhorne.hasmoves.com
+      SYNC_INTERVAL_MINUTES: 360
+      SMS_TIMEOUT_SECONDS: 150
+      LOGIN_TIMEOUT_SECONDS: 30
+      PLAYWRIGHT_HEADLESS: "true"
+      SETUP_SECRET:
+      DEBUG_TOKEN:
+      ADMIN_TOKEN:
+      STORAGE_KEY:
+      FCM_PROJECT_ID:
+      FCM_SERVICE_ACCOUNT_FILE:
+      FCM_SERVICE_ACCOUNT_JSON:
+      POST_LOGIN_URL:
+      ROSTER_URL:
+    ports:
+      - "18080:8080"
+    volumes:
+      - ons_rooster_data:/data
+
+volumes:
+  ons_rooster_data:
+    name: ons_rooster_data

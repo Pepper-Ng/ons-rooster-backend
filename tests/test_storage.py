@@ -1,0 +1,63 @@
+from __future__ import annotations
+
+from ons_backend.config import AppConfig
+from ons_backend.models import AppState, LoginCredentials
+from ons_backend.storage import StateStore
+
+
+def build_config(tmp_path):
+    return AppConfig(
+        host="127.0.0.1",
+        port=8080,
+        public_base_url="https://onsrooster.stefhermans.nl",
+        data_dir=tmp_path,
+        log_level="INFO",
+        timezone="Europe/Amsterdam",
+        default_login_url="https://example.invalid/login",
+        sync_interval_minutes=0,
+        sms_timeout_seconds=30,
+        login_timeout_seconds=30,
+        setup_secret="",
+        debug_token="",
+        admin_token="",
+        storage_key="",
+        fcm_project_id="",
+        fcm_service_account_file=None,
+        fcm_service_account_json="",
+        playwright_headless=True,
+        post_login_url="",
+        roster_url="",
+    )
+
+
+def test_state_store_encrypts_credentials(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    credentials = LoginCredentials(
+        login_url="https://example.invalid/login",
+        username="alice@example.invalid",
+        password="super-secret",
+    )
+    state = AppState()
+
+    store.save(state, credentials)
+    raw = config.state_file.read_text(encoding="utf-8")
+
+    assert "alice@example.invalid" not in raw
+    assert "super-secret" not in raw
+
+    loaded_state, loaded_credentials = store.load()
+    assert loaded_state.to_dict() == state.to_dict()
+    assert loaded_credentials == credentials
+
+
+def test_state_store_persists_snapshot_and_ics(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+
+    store.write_snapshot("<html>snapshot</html>")
+    store.write_ics(b"BEGIN:VCALENDAR\nEND:VCALENDAR\n")
+
+    assert config.snapshot_file.read_text(encoding="utf-8") == "<html>snapshot</html>"
+    assert store.read_ics() == b"BEGIN:VCALENDAR\nEND:VCALENDAR\n"
+    assert not config.state_file.exists()

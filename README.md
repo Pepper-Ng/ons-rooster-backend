@@ -1,168 +1,164 @@
-# ONS Rooster Relay v2 — FCM-architectuur
+# ONS Rooster Backend
 
-## Waarom FCM in plaats van een altijd-open WebSocket?
+This repository now contains a deployable backend service for the ONS roster workflow instead of a single Raspberry Pi script.
 
-| | WebSocket (v1) | FCM (v2) |
-|---|---|---|
-| Stroomverbruik | Hoog — service draait continu | Minimaal — OS beheert de verbinding |
-| Na reboot | Vereist BootReceiver + foreground service | Automatisch — OS start FCM bij boot |
-| Geen netwerk | Retry in de app, maar service kan gekilled worden | Android levert push zodra netwerk terug is |
-| Zoals WhatsApp/Telegram | ✗ | ✓ |
+The backend is designed to run continuously as a Docker stack in Portainer. The Android app is responsible for the one-time setup flow and the SMS-based 2FA step. The backend stores the ONS login credentials securely, initiates the browser login, requests the SMS code from the phone through Firebase Cloud Messaging, and exposes operator-facing debug endpoints over HTTPS.
 
-FCM houdt één verbinding open op OS-niveau (niet per app). Dat is precies hoe WhatsApp en Telegram het doen.
+## Current architecture
 
----
-
-## Architectuur
-
-```
-[Cron job op backend host]
-      │  POST /refresh
+```text
+[Android app]
+      │  Setup form
+      │  - Backend URL
+      │  - ONS login URL
+      │  - Username
+      │  - Password
       ▼
-[backend service]
-      │  1. Start Playwright login bij ONS
-      │  2. ONS vraagt om 2FA-code
+[HTTPS backend API]
+      │  Stores credentials encrypted at rest
+      │  Issues device bearer token
+      │  Starts Playwright login when setup or sync runs
       │
-      │  FCM data-push ("listen_sms")
+      │  FCM data push: listen_sms
       ▼
-[Google FCM servers]  ──────────────►  [Android OS]
-                                              │ wekt OnsFirebaseService
-                                              │ registreert tijdelijke SMS-listener
-                                              │ SMS van Nedap binnenkomt
-                                              │ POST /sms_code naar backend
-      ◄─────────────────────────────────────┘
-      │  3. 2FA-code invullen, inloggen
-      │  4. Rooster scrapen
-      │  5. .ics genereren en opslaan
+[Firebase Cloud Messaging]
       ▼
-[GET /rooster.ics]  ◄──  Google Calendar / Outlook abonnement
+[Android phone]
+      │  Reads incoming ONS SMS
+      │  Relays the code back over HTTPS
+      ▼
+[HTTPS backend API]
+      │  Completes login
+      │  Scrapes the roster with fallback heuristics
+      │  Writes roster.ics
+      │  Sends auth_result notification to the phone
+      ▼
+[Debug and calendar endpoints]
 ```
 
----
+## What changed
 
-## Eenmalige setup
+- The backend is now a Python package under `src/ons_backend`.
+- Credentials are stored encrypted in the persistent data directory.
+- The Android app drives the initial setup instead of editing backend source code or `.env` credentials manually.
+- The backend exposes authenticated mobile endpoints, a debug page, and a calendar endpoint.
+- A Dockerfile, stack compose file, and environment template are included for Portainer.
+- Unit and end-to-end style tests are included for the backend flow without requiring real ONS credentials.
 
-### Stap 1: Firebase project aanmaken (gratis)
-
-1. Ga naar https://console.firebase.google.com
-2. Maak een nieuw project aan (bijv. "ons-relay")
-3. Voeg een Android-app toe met package name `nl.landvanhorne.smsrelay`
-4. Download `google-services.json` → zet dit in `sms-relay-android/app/`
-5. Ga naar Project Settings → Service Accounts → Generate new private key
-6. Download het JSON-bestand → sla op op de backend host, bijvoorbeeld als `/opt/ons-backend/firebase_key.json`
-7. Noteer je Project ID (staat in Project Settings)
-
-### Stap 2: Backend configureren
-
-Pas in `backend.py` aan:
-```python
-ONS_USERNAME        = "lia@landvanhorne.nl"
-ONS_PASSWORD        = "jouw_wachtwoord"    # of gebruik .env
-FIREBASE_PROJECT_ID = "ons-relay-xxxxx"   # je Firebase Project ID
-```
-
-Of via environment variabelen (aanbevolen):
-```bash
-export ONS_USERNAME="lia@landvanhorne.nl"
-export ONS_PASSWORD="jouw_wachtwoord"
-```
-
-### Stap 3: Backend dependencies installeren
+## Local development
 
 ```bash
-pip3 install aiohttp playwright icalendar google-auth requests python-dotenv
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .[dev]
 playwright install chromium
-playwright install-deps
+pytest
 ```
 
-### Stap 4: Android app bouwen
+On Windows PowerShell, use the virtual environment under `.venv\Scripts\Activate.ps1` instead.
 
-- Zet `google-services.json` in `sms-relay-android/app/`
-- Pas in `OnsFirebaseService.kt` het backend-adres aan:
-  ```kotlin
-      const val SERVER_CALLBACK_URL = "http://backend-host.local:8080/sms_code"
-  ```
-- Bouw en installeer de app
-- Open de app, verleen SMS-toestemming, zet battery-optimalisatie uit
-- Kopieer het FCM-token dat de app toont
+## Docker and Portainer deployment
 
-### Stap 5: FCM-token op backend host opslaan
+The repository root contains `docker-compose.yml` for a Git-backed Portainer stack.
+
+### Service defaults
+
+- Container name: `ons-rooster`
+- Internal port: `8080`
+- Published host port: `18080`
+- Persistent volume: `ons_rooster_data`
+- Public base URL default: `https://onsrooster.stefhermans.nl`
+
+### Important stack environment values
+
+These values are exposed directly in `docker-compose.yml` and `.env.example`.
+
+| Variable | Purpose |
+|---|---|
+| `PUBLIC_BASE_URL` | Public HTTPS base URL used by the app and debug links. |
+| `DEFAULT_LOGIN_URL` | Default ONS login page shown in the app. |
+| `SYNC_INTERVAL_MINUTES` | Automatic sync interval. Set `0` to disable the scheduler. |
+| `SMS_TIMEOUT_SECONDS` | How long the backend waits for the Android app to return a code. |
+| `LOGIN_TIMEOUT_SECONDS` | How long the Playwright login heuristics may wait for state changes. |
+| `SETUP_SECRET` | Optional setup code for first-time pairing or credential rotation. |
+| `DEBUG_TOKEN` | Optional token for the HTTPS debug page. |
+| `ADMIN_TOKEN` | Optional token for `POST /api/v1/admin/refresh`. |
+| `STORAGE_KEY` | Optional pre-generated Fernet key. If omitted, one is generated in the data volume. |
+| `FCM_PROJECT_ID` | Firebase project ID used for FCM pushes. |
+| `FCM_SERVICE_ACCOUNT_FILE` | Optional path to a mounted Firebase service account JSON file. |
+| `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
+| `POST_LOGIN_URL` | Optional URL to open immediately after login. |
+| `ROSTER_URL` | Optional explicit roster page URL. |
+
+### Important note about Firebase
+
+The backend needs a Firebase service account to send FCM data pushes. The Android app already contains the client-side Firebase configuration, but the backend service account key should not be committed to this repository.
+
+Use either:
+
+- `FCM_SERVICE_ACCOUNT_FILE` with a mounted file on the Portainer host, or
+- `FCM_SERVICE_ACCOUNT_JSON` as a stack environment value.
+
+## Android-led setup flow
+
+1. Install the Android app from the sibling repository.
+2. Open the app and grant the SMS and notification permissions.
+3. Enter:
+   - backend base URL
+   - ONS login URL
+   - ONS username
+   - ONS password
+   - optional setup code
+4. Tap the save button.
+5. The backend stores the credentials encrypted, starts a login attempt, and requests the SMS code when ONS triggers 2FA.
+6. The phone receives the SMS, relays the code over HTTPS, and gets a small confirmation notification when the backend is ready.
+
+The app does not persist the ONS password locally after submission. The backend becomes the long-running worker and keeps the credentials for future refreshes.
+
+## HTTPS endpoints
+
+| Route | Purpose |
+|---|---|
+| `GET /healthz` | Basic health check. |
+| `GET /rooster.ics` | Calendar output based on the last successful scrape. |
+| `GET /debug` | Operator-facing HTML debug page. Optional `DEBUG_TOKEN` protection is supported. |
+| `GET /api/v1/mobile/status` | Authenticated status endpoint for the Android app. |
+| `POST /api/v1/mobile/setup` | Android setup and credential update endpoint. |
+| `POST /api/v1/mobile/tokens/fcm` | Android FCM token refresh endpoint. |
+| `POST /api/v1/mobile/challenges/{id}/sms-code` | Android callback endpoint for a 2FA code. |
+| `POST /api/v1/admin/refresh` | Optional authenticated manual refresh trigger. |
+
+## Debug page
+
+The debug page is intended for live verification on `https://onsrooster.stefhermans.nl/debug`.
+
+It shows:
+
+- latest backend status
+- last success or failure timestamps
+- current login phase
+- last HTML snapshot
+- roster-like rows detected by the fallback scraper
+- recent debug notes from the login flow
+
+If `DEBUG_TOKEN` is set, pass it as `?token=...` or `X-Debug-Token`.
+
+## Tests
+
+Backend tests currently cover:
+
+- encrypted state persistence
+- snapshot and ICS persistence
+- authenticated mobile setup flow
+- end-to-end SMS roundtrip using fake push and fake browser clients
+- debug endpoint access control
+
+Run them with:
 
 ```bash
-echo "het-gekopieerde-fcm-token" > /opt/ons-backend/fcm_token.txt
-```
-(De app stuurt het token ook automatisch als `/register_token` bereikbaar is vanaf de backend host.)
-
-### Stap 6: Backend starten
-
-```bash
-python3 backend.py
+pytest tests/test_storage.py tests/test_app_flow.py -q
 ```
 
-Als systemd-service (autostart):
-```ini
-# /etc/systemd/system/ons-relay.service
-[Unit]
-Description=ONS Rooster Relay
-After=network-online.target
+## Current limitation
 
-[Service]
-ExecStart=/usr/bin/python3 /opt/ons-backend/backend.py
-WorkingDirectory=/opt/ons-backend
-Restart=always
-User=onsrelay
-EnvironmentFile=/opt/ons-backend/.env
-
-[Install]
-WantedBy=multi-user.target
-```
-```bash
-sudo systemctl enable ons-relay
-sudo systemctl start ons-relay
-```
-
-### Stap 7: Cron job instellen
-
-```bash
-crontab -e
-# Elke 1e van de maand om 07:00
-0 7 1 * * curl -s -X POST http://localhost:8080/refresh
-```
-
-### Stap 8: Kalender abonneren
-
-```
-http://<backend-host>:8080/rooster.ics
-```
-
-**Google Calendar:** Andere agenda's → Via URL → plak URL
-**Outlook:** Agenda toevoegen → Abonneren via internet → plak URL
-
----
-
-## Beveiliging
-
-De endpoints zijn alleen bedoeld voor intern gebruik. Exposeer ze niet publiek.
-Gebruik Tailscale of WireGuard als je de iCal-URL ook buiten je thuisnetwerk wilt bereiken.
-
-Wachtwoord veilig opslaan:
-```bash
-# /opt/ons-backend/.env
-ONS_USERNAME=lia@landvanhorne.nl
-ONS_PASSWORD=jouw_wachtwoord
-```
-
----
-
-## Retry-gedrag
-
-**Android → backend (SMS-code terugsturen):**
-De app probeert maximaal 5 keer met exponential backoff (3s, 6s, 12s, 24s, 30s).
-Als de telefoon tijdelijk geen wifi/4G heeft, blijft de app het proberen.
-
-**Backend wacht op SMS-code:**
-De backend wacht standaard 120 seconden. Aanpasbaar via `SMS_TIMEOUT` in `backend.py`.
-
-**FCM levering:**
-FCM bewaart een push maximaal 4 weken als het apparaat offline is.
-Zodra de telefoon weer verbinding heeft, wordt de push alsnog bezorgd.
+The backend already handles the remote login handshake and state management, but the actual roster extraction still uses generic HTML heuristics until real ONS page structure and live credentials are available. That means the authentication loop is in place, while the post-login scraping selectors will likely need one more tuning pass against the live page.

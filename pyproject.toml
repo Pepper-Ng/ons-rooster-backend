@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ons-rooster-backend"
+version = "0.1.0"
+description = "Backend service for Android-led ONS roster authentication and scraping."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.9,<4",
+    "beautifulsoup4>=4.12,<5",
+    "cryptography>=42,<45",
+    "google-auth>=2.29,<3",
+    "icalendar>=6,<7",
+    "playwright>=1.44,<2",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.2,<9",
+    "pytest-aiohttp>=1.0,<2",
+    "pytest-asyncio>=0.23,<1",
+]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
