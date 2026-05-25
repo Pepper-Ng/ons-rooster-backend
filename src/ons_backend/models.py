@@ -5,6 +5,37 @@ from typing import Any
 
 
 @dataclass
+class PortalDefinition:
+    portal_id: str
+    name: str
+    login_url: str
+    logo_url: str = ""
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "portal_id": self.portal_id,
+            "name": self.name,
+            "login_url": self.login_url,
+            "logo_url": self.logo_url,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PortalDefinition":
+        return cls(
+            portal_id=str(data.get("portal_id", "")).strip() or "portal",
+            name=str(data.get("name", "")).strip(),
+            login_url=str(data.get("login_url", "")).strip(),
+            logo_url=str(data.get("logo_url", "")).strip(),
+            created_at=str(data.get("created_at", "")).strip(),
+            updated_at=str(data.get("updated_at", "")).strip(),
+        )
+
+
+@dataclass
 class DeviceRegistration:
     device_id: str
     device_label: str
@@ -43,12 +74,14 @@ class LoginCredentials:
     login_url: str
     username: str
     password: str
+    portal_id: str | None = None
 
     def to_dict(self) -> dict[str, str]:
         return {
             "login_url": self.login_url,
             "username": self.username,
             "password": self.password,
+            "portal_id": self.portal_id or "",
         }
 
     @classmethod
@@ -57,6 +90,7 @@ class LoginCredentials:
             login_url=data.get("login_url", ""),
             username=data.get("username", ""),
             password=data.get("password", ""),
+            portal_id=str(data.get("portal_id", "")).strip() or None,
         )
 
 
@@ -158,6 +192,7 @@ class SyncState:
 @dataclass
 class AppState:
     devices: list[DeviceRegistration] = field(default_factory=list)
+    portals: list[PortalDefinition] = field(default_factory=list)
     active_device_id: str | None = None
     credentials_updated_at: str | None = None
     sync: SyncState = field(default_factory=SyncState)
@@ -165,6 +200,7 @@ class AppState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "devices": [device.to_dict() for device in self.devices],
+            "portals": [portal.to_dict() for portal in self.portals],
             "active_device_id": self.active_device_id,
             "credentials_updated_at": self.credentials_updated_at,
             "sync": self.sync.to_dict(),
@@ -185,6 +221,7 @@ class AppState:
 
         return cls(
             devices=devices,
+            portals=[PortalDefinition.from_dict(portal) for portal in data.get("portals", [])],
             active_device_id=active_device_id,
             credentials_updated_at=data.get("credentials_updated_at"),
             sync=SyncState.from_dict(data.get("sync", {})),

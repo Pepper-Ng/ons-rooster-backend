@@ -153,6 +153,137 @@ async def test_mobile_setup_and_sms_roundtrip(aiohttp_client, test_context):
 
 
 @pytest.mark.asyncio
+async def test_mobile_device_delete_unpairs_backend_device(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert response.status == 200
+    api_token = (await response.json())["api_token"]
+    assert service.device_count() == 1
+
+    delete_response = await client.delete(
+        "/api/v1/mobile/device",
+        headers={"Authorization": f"Bearer {api_token}"},
+    )
+    assert delete_response.status == 200
+    delete_payload = await delete_response.json()
+    assert delete_payload["message"] == "Pixel is ontkoppeld."
+    assert service.device_count() == 0
+
+    status_response = await client.get(
+        "/api/v1/mobile/status",
+        headers={"Authorization": f"Bearer {api_token}"},
+    )
+    assert status_response.status == 401
+
+
+@pytest.mark.asyncio
+async def test_mobile_config_and_admin_portals_support_portal_id_setup(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    config_response = await client.get("/api/v1/mobile/config")
+    assert config_response.status == 200
+    config_payload = await config_response.json()
+    assert config_payload["default_portal_id"] == "land-van-horne"
+    assert config_payload["portals"][0]["name"] == "Land van Horne"
+
+    portal_response = await client.post(
+        "/api/v1/admin/portals?token=admin-code",
+        json={
+            "name": "Demo Portaal",
+            "login_url": "demo.example.invalid/login",
+            "logo_url": "https://example.invalid/logo.png",
+        },
+    )
+    assert portal_response.status == 200
+    portal_payload = await portal_response.json()
+    portal_id = portal_payload["portal"]["portal_id"]
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "portal_id": portal_id,
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-portal",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+    assert service.credentials is not None
+    assert service.credentials.portal_id == portal_id
+    assert service.mobile_status_payload()["login_url"] == "https://demo.example.invalid/login"
+
+
+@pytest.mark.asyncio
+async def test_status_live_websocket_receives_device_updates(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    first_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert first_setup.status == 200
+
+    websocket = await client.ws_connect("/status/live?token=admin-code")
+    initial_message = await websocket.receive(timeout=1.0)
+    initial_payload = json.loads(initial_message.data)
+    assert initial_payload["status"]["device_count"] == 1
+    assert initial_payload["devices"][0]["device_label"] == "Pixel"
+
+    second_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-2",
+            "device_label": "Tablet",
+        },
+    )
+    assert second_setup.status == 200
+
+    update_message = await websocket.receive(timeout=1.0)
+    update_payload = json.loads(update_message.data)
+    assert update_payload["status"]["device_count"] == 2
+    assert any(device["device_label"] == "Tablet" for device in update_payload["devices"])
+
+    await websocket.close()
+
+
+@pytest.mark.asyncio
 async def test_debug_endpoint_requires_token(aiohttp_client, test_context):
     app, _, _, _ = test_context
     client = await aiohttp_client(app)

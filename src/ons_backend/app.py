@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import html
 import hmac
+import json
 import logging
 from datetime import UTC, datetime
 from typing import Any
@@ -17,6 +19,7 @@ from .storage import StateStore
 
 OPS_SESSION_COOKIE = "ons_status_session"
 MOCK_SMS_CODE = "123456"
+ONS_BRAND_LOGO_DATA_URI = "data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMzgyIiBoZWlnaHQ9IjEzMSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48ZyBmaWxsPSIjQkRCREJEIiBmaWxsLXJ1bGU9ImV2ZW5vZGQiPjxwYXRoIGQ9Ik0xNTEuMDMxIDEyNy40NDlWMy4xNDJoMzcuNjQ2djE2LjIwMVMyMDAuNjMuNzE5IDIyNC45MjcuNzE5YzI0LjY5MiAwIDQ0Ljc0IDE3LjgyMSA0NC43NCA0MS4yOTZ2ODUuNDM0aC0zOC44NzRWNTQuNTc4YzAtMTAuMzQzLTIuODM0LTIwLjA1LTE5LjQzMi0yMC4wNS0xMi4xNDkgMC0yMi4yNjcgOS45MjMtMjIuMjY3IDIxLjg1OHY3MS4wNjNoLTM4LjA2M002Ni44NjggOTUuNDY3Yy0xNy41NjUgMC0zMC41ODgtMTMuMjMtMzAuNTg4LTMwLjE3OCAwLS41NDYuMDQ1LTEuMDc5LjA2OC0xLjYxOGg2MS4wOWMtLjA5IDE5LjcwNy0xMS42MjIgMzEuNzk2LTMwLjU3IDMxLjc5NlptLjM5LTk0Ljc0OEMyOS43NDMuNzE5LjU2OSAyOC4xMTkuNTY5IDY0LjYzMmMwIDMzLjk1NiAyOC41NzYgNjQuNTIzIDY1Ljg5NiA2NC41MjMgMzkuNjk5IDAgNjYuNDkzLTI3Ljk5NSA2Ni40OTMtNjUuMTEzIDAtMzYuNzE0LTI4Ljc2Ni02My4zMjMtNjUuNy02My4zMjNaTTMyMy44IDM4LjM2OGMwLTQuODQyIDMuODM1LTcuNDg0IDkuOTA1LTcuNDg0IDEwLjkzNyAwIDE1LjM5OCA5LjcwOSAxNS4zOTggOS43MDloMzAuNzgzYzAtMTQuMTQ3LTEyLjc1MS0zOS44NzQtNDIuOTMxLTM5Ljg3NC0yNy41MzQgMC00Ny41NzkgMTYuNDAxLTQ3LjU3OSA0MC40ODYgMCA0My43MyA1NS42NzQgMzUuNjM0IDU1LjY3NCA1MS4wMTQgMCA1Ljg3LTcuMjkzIDguNzA0LTEzLjM1OCA4LjcwNC0xMS4xNDIgMC0xNy40MjUtMTAuOTI1LTE3LjQyNS0xMC45MjVsLTI4LjkzOCAxNC41NjhjOS43MTggMTguMjM3IDI1LjA5OCAyNS45MTMgNDUuOTUgMjUuOTEzIDI2LjMyMyAwIDQ5LjgwMy0xNC4zNzIgNDkuODAzLTQxLjI5MiAwLTQyLjUxLTU3LjI4Mi0zNi44NC01Ny4yODItNTAuODE5Ii8+PC9nPjwvc3ZnPg=="
 
 
 def create_app(
@@ -59,11 +62,22 @@ def create_app(
     app.router.add_post("/sandbox/hasmoves/login", handle_mock_login_submit)
     app.router.add_post("/sandbox/hasmoves/challenge", handle_mock_challenge_submit)
     app.router.add_get("/sandbox/hasmoves/rooster", handle_mock_rooster_page)
+    app.router.add_get("/status/live", handle_status_live)
+    app.router.add_get("/api/v1/mobile/config", handle_mobile_config)
     app.router.add_get("/api/v1/mobile/status", handle_mobile_status)
+    app.router.add_get("/api/v1/mobile/live", handle_mobile_live)
     app.router.add_post("/api/v1/mobile/setup", handle_mobile_setup)
     app.router.add_put("/api/v1/mobile/setup", handle_mobile_setup)
+    app.router.add_delete("/api/v1/mobile/device", handle_mobile_device_remove)
     app.router.add_post("/api/v1/mobile/tokens/fcm", handle_fcm_token)
     app.router.add_post("/api/v1/mobile/challenges/{challenge_id}/sms-code", handle_sms_code)
+    app.router.add_get("/api/v1/admin/status", handle_admin_status)
+    app.router.add_post("/api/v1/admin/challenges/mock-sms", handle_admin_mock_sms)
+    app.router.add_post("/api/v1/admin/devices/{device_id}/activate", handle_admin_activate_device)
+    app.router.add_post("/api/v1/admin/devices/{device_id}/ping", handle_admin_ping_device)
+    app.router.add_delete("/api/v1/admin/devices/{device_id}", handle_admin_remove_device)
+    app.router.add_post("/api/v1/admin/portals", handle_admin_portal_upsert)
+    app.router.add_delete("/api/v1/admin/portals/{portal_id}", handle_admin_portal_remove)
     app.router.add_post("/api/v1/admin/refresh", handle_refresh)
     app.router.add_get("/api/v1/admin/fcm", handle_admin_fcm_status)
     app.router.add_post("/api/v1/admin/fcm/test", handle_admin_fcm_test)
@@ -440,9 +454,69 @@ async def handle_mock_rooster_page(request: web.Request) -> web.Response:
     return web.Response(text=body, content_type="text/html")
 
 
+async def handle_status_live(request: web.Request) -> web.StreamResponse:
+    _require_ops_auth(request)
+    service = _service(request.app)
+    websocket = web.WebSocketResponse(heartbeat=20.0)
+    await websocket.prepare(request)
+
+    version = service.live_version()
+    await websocket.send_json(service.operator_status_payload())
+
+    try:
+        while True:
+            try:
+                version = await service.wait_for_live_update(version, timeout_seconds=25)
+                await websocket.send_json(service.operator_status_payload())
+            except asyncio.TimeoutError:
+                if websocket.closed:
+                    break
+                await websocket.ping()
+    except ConnectionResetError:
+        pass
+    finally:
+        if not websocket.closed:
+            await websocket.close()
+
+    return websocket
+
+
+async def handle_mobile_config(request: web.Request) -> web.Response:
+    return web.json_response(_service(request.app).mobile_config_payload())
+
+
 async def handle_mobile_status(request: web.Request) -> web.Response:
-    _require_mobile_auth(request)
-    return web.json_response(_service(request.app).mobile_status_payload())
+    auth_token = _require_mobile_auth(request)
+    return web.json_response(_service(request.app).mobile_status_payload(auth_token))
+
+
+async def handle_mobile_live(request: web.Request) -> web.StreamResponse:
+    auth_token = _require_mobile_auth(request)
+    service = _service(request.app)
+    websocket = web.WebSocketResponse(heartbeat=20.0)
+    await websocket.prepare(request)
+
+    device = await service.register_mobile_live_connection(auth_token)
+    version = service.live_version()
+    await websocket.send_json(service.mobile_status_payload(auth_token))
+
+    try:
+        while True:
+            try:
+                version = await service.wait_for_live_update(version, timeout_seconds=25)
+                await websocket.send_json(service.mobile_status_payload(auth_token))
+            except asyncio.TimeoutError:
+                if websocket.closed:
+                    break
+                await websocket.ping()
+    except ConnectionResetError:
+        pass
+    finally:
+        await service.unregister_mobile_live_connection(device.device_id)
+        if not websocket.closed:
+            await websocket.close()
+
+    return websocket
 
 
 async def handle_mobile_setup(request: web.Request) -> web.Response:
@@ -450,6 +524,9 @@ async def handle_mobile_setup(request: web.Request) -> web.Response:
     payload = await request.json()
     auth_token = _extract_bearer_token(request)
     setup_secret = payload.get("setup_secret") or request.headers.get("X-Setup-Secret")
+    portal_id = str(payload.get("portal_id", "")).strip() or None
+    selected_portal = service.portal_by_id(portal_id)
+    resolved_login_url = selected_portal.login_url if selected_portal is not None else str(payload.get("login_url", ""))
 
     if service.has_device():
         if not (service.mobile_token_is_valid(auth_token) or service.setup_secret_is_valid(setup_secret)):
@@ -457,13 +534,16 @@ async def handle_mobile_setup(request: web.Request) -> web.Response:
     elif not service.setup_secret_is_valid(setup_secret):
         raise web.HTTPUnauthorized(text="Ongeldige installatiecode.")
 
-    required_fields = ["login_url", "username", "password", "fcm_token"]
+    required_fields = ["username", "password", "fcm_token"]
     missing = [field for field in required_fields if not str(payload.get(field, "")).strip()]
+    if not str(resolved_login_url).strip():
+        missing.append("login_url of portal_id")
     if missing:
         raise web.HTTPBadRequest(text=f"Ontbrekende velden: {', '.join(missing)}")
 
     result = await service.upsert_mobile_setup(
-        login_url=str(payload.get("login_url", "")),
+        login_url=str(resolved_login_url),
+        portal_id=selected_portal.portal_id if selected_portal is not None else portal_id,
         username=str(payload.get("username", "")),
         password=str(payload.get("password", "")),
         fcm_token=str(payload.get("fcm_token", "")),
@@ -482,6 +562,17 @@ async def handle_fcm_token(request: web.Request) -> web.Response:
         raise web.HTTPBadRequest(text="Het FCM-token ontbreekt.")
     await _service(request.app).update_fcm_token_for_device(auth_token, token, payload.get("device_label"))
     return web.json_response({"message": "Het FCM-token is bijgewerkt."})
+
+
+async def handle_mobile_device_remove(request: web.Request) -> web.Response:
+    auth_token = _require_mobile_auth(request)
+    device = await _service(request.app).remove_device_for_mobile_token(auth_token)
+    return web.json_response(
+        {
+            "message": f"{device.device_label} is ontkoppeld.",
+            "device_id": device.device_id,
+        }
+    )
 
 
 async def handle_sms_code(request: web.Request) -> web.Response:
@@ -507,6 +598,91 @@ async def handle_refresh(request: web.Request) -> web.Response:
         raise web.HTTPUnauthorized(text="Ongeldig admin-token.")
     status = await service.trigger_refresh(reason="manual", wait=False)
     return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": status})
+
+
+async def handle_admin_status(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    return web.json_response(_service(request.app).operator_status_payload())
+
+
+async def handle_admin_mock_sms(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    try:
+        await _service(request.app).submit_mock_sms_code(code=MOCK_SMS_CODE)
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response({"message": f"Mock OTP {MOCK_SMS_CODE} is ingestuurd."})
+
+
+async def handle_admin_activate_device(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    try:
+        device = await _service(request.app).activate_device(request.match_info["device_id"])
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response({"message": f"{device.device_label} is nu het actieve apparaat."})
+
+
+async def handle_admin_ping_device(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    service = _service(request.app)
+    device = service.device_by_id(request.match_info["device_id"])
+    if device is None:
+        raise web.HTTPBadRequest(text="Het gevraagde apparaat bestaat niet meer.")
+
+    message = f"Ping vanaf de statuspagina voor {device.device_label} om {datetime.now(UTC).strftime('%H:%M:%S')} UTC."
+    try:
+        await service.send_test_notification(message, device_id=device.device_id)
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response({"message": f"FCM-ping is verzonden naar {device.device_label}."})
+
+
+async def handle_admin_remove_device(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    try:
+        device = await _service(request.app).remove_device(request.match_info["device_id"])
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response({"message": f"{device.device_label} is verwijderd.", "device_id": device.device_id})
+
+
+async def handle_admin_portal_upsert(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    payload = await _read_request_payload(request)
+    try:
+        portal = await _service(request.app).upsert_portal(
+            portal_id=str(payload.get("portal_id", "")).strip() or None,
+            name=str(payload.get("name", "")),
+            login_url=str(payload.get("login_url", "")),
+            logo_url=str(payload.get("logo_url", "")),
+        )
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+
+    return web.json_response(
+        {
+            "message": f"Portal {portal.name} is opgeslagen.",
+            "portal": portal.to_dict(),
+            "status": _service(request.app).operator_status_payload(),
+        }
+    )
+
+
+async def handle_admin_portal_remove(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    try:
+        portal = await _service(request.app).remove_portal(request.match_info["portal_id"])
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+
+    return web.json_response(
+        {
+            "message": f"Portal {portal.name} is verwijderd.",
+            "portal_id": portal.portal_id,
+            "status": _service(request.app).operator_status_payload(),
+        }
+    )
 
 
 async def handle_admin_fcm_status(request: web.Request) -> web.Response:
@@ -645,49 +821,59 @@ def _render_status_page(
 """
         return web.Response(text=body, content_type="text/html", status=status)
 
-    status_payload = service.mobile_status_payload()
+    status_snapshot = service.operator_status_payload()
+    status_payload = status_snapshot["status"]
     diagnostics = _fcm_diagnostics(app)
-    devices = service.paired_devices_payload()
+    devices = status_snapshot["devices"]
+    portals = status_snapshot["portals"]
     mock_basic_url = f"{config.public_base_url}/sandbox/hasmoves/login"
     mock_sms_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sms"
-    challenge_controls = ""
+    challenge_controls = "hidden"
     if status_payload["sync"]["current_challenge_id"]:
-        challenge_controls = f"""
-  <section>
-    <h2>Actieve testuitdaging</h2>
-    <p><strong>Challenge-ID:</strong> {html.escape(status_payload['sync']['current_challenge_id'])}</p>
-    <p>Gebruik de mock code <code>{MOCK_SMS_CODE}</code> om een sandbox-OTP in te vullen zonder echte SMS.</p>
-    <form method="post" action="/status/challenges/mock-sms">
-      <button type="submit">Vul mock OTP {MOCK_SMS_CODE} in</button>
-    </form>
-  </section>
-"""
+        challenge_controls = ""
 
     device_rows = "".join(
         f"""
-        <tr>
+                <tr data-device-id="{html.escape(device['device_id'])}" data-device-label="{html.escape(device['device_label'])}">
           <td>{html.escape(device['device_label'])}</td>
           <td><code>{html.escape(device['device_id'])}</code></td>
           <td>{html.escape(device['fcm_token_suffix'] or '-')}</td>
           <td>{html.escape(device['last_seen_at'] or '-')}</td>
+                    <td>{'Verbonden' if device['is_connected'] else 'Niet verbonden'}</td>
           <td>{'Ja' if device['is_active'] else 'Nee'}</td>
           <td>
             <div class="actions">
-              <form method="post" action="/status/devices/{html.escape(device['device_id'])}/ping">
-                <button type="submit">FCM-ping</button>
-              </form>
-              <form method="post" action="/status/devices/{html.escape(device['device_id'])}/activate">
-                <button type="submit"{' disabled' if device['is_active'] else ''}>Maak actief</button>
-              </form>
-              <form method="post" action="/status/devices/{html.escape(device['device_id'])}/remove" onsubmit="return confirmRemoveDevice('{html.escape(device['device_label'])}');">
-                <button type="submit" class="danger">Verwijder</button>
-              </form>
+                            <button type="button" data-device-action="ping">FCM-ping</button>
+                            <button type="button" data-device-action="activate"{' disabled' if device['is_active'] else ''}>Maak actief</button>
+                            <button type="button" class="danger" data-device-action="remove">Verwijder</button>
             </div>
           </td>
         </tr>
 """
         for device in devices
     )
+
+    portal_cards = "".join(
+        f"""
+                <article class="portal-card" data-portal-id="{html.escape(portal['portal_id'])}">
+                    <div class="portal-card-header">
+                        <div>
+                            <h3>{html.escape(portal['name'])}</h3>
+                            <p>{html.escape(portal['login_url'])}</p>
+                        </div>
+                        {f'<img src="{html.escape(portal["logo_url"])}" alt="{html.escape(portal["name"])} logo">' if portal['logo_url'] else '<div class="portal-logo-placeholder">Geen logo</div>'}
+                    </div>
+                    <div class="actions">
+                        <button type="button" data-portal-action="edit">Wijzig</button>
+                        <button type="button" class="danger" data-portal-action="remove">Verwijder</button>
+                    </div>
+                </article>
+"""
+        for portal in portals
+    )
+
+    selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
+    initial_snapshot_json = html.escape(json.dumps(status_snapshot, ensure_ascii=True))
 
     body = f"""
 <!doctype html>
@@ -696,12 +882,15 @@ def _render_status_page(
   <meta charset="utf-8">
   <title>ONS Rooster Operatorstatus</title>
   <style>
-    body {{ font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; }}
+        body {{ font-family: "Segoe UI", Aptos, sans-serif; margin: 2rem; background: linear-gradient(180deg, #f8fafc 0%, #eef4f5 100%); color: #1f2937; }}
     h1, h2 {{ margin-bottom: 0.5rem; }}
-    section {{ background: white; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }}
+        h3 {{ margin: 0 0 0.35rem; }}
+        section {{ background: white; border-radius: 16px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 12px 32px rgba(15, 23, 42, 0.08); }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ text-align: left; padding: 0.6rem; border-bottom: 1px solid #e5e7eb; vertical-align: top; }}
-    form {{ display: inline; }}
+        form {{ display: grid; gap: 0.85rem; }}
+        label {{ display: grid; gap: 0.35rem; font-weight: 600; }}
+        input {{ font: inherit; padding: 0.7rem 0.85rem; border: 1px solid #cbd5e1; border-radius: 10px; }}
     .actions {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
     button {{ border: 0; border-radius: 999px; padding: 0.6rem 0.95rem; background: #0f766e; color: white; cursor: pointer; }}
     button.danger {{ background: #b91c1c; }}
@@ -711,20 +900,48 @@ def _render_status_page(
     .flash-error {{ background: #fee2e2; color: #991b1b; }}
     code {{ background: #eef2ff; padding: 0.1rem 0.35rem; border-radius: 4px; }}
     .toolbar {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
+        .toolbar form {{ display: inline; }}
     a {{ color: #0f766e; }}
+        .hero {{ display: flex; align-items: center; justify-content: space-between; gap: 1.5rem; margin-bottom: 1rem; }}
+        .hero-copy {{ display: grid; gap: 0.5rem; }}
+        .hero-copy p {{ margin: 0; max-width: 48rem; color: #475569; }}
+        .brand-mark {{ width: 220px; max-width: 38vw; height: auto; opacity: 0.9; }}
+        .live-pill {{ display: inline-flex; align-items: center; gap: 0.5rem; width: fit-content; border-radius: 999px; padding: 0.45rem 0.8rem; background: #e2e8f0; color: #334155; font-size: 0.92rem; font-weight: 600; }}
+        .live-pill::before {{ content: ""; width: 10px; height: 10px; border-radius: 999px; background: #94a3b8; }}
+        .live-pill.live::before {{ background: #16a34a; }}
+        .live-pill.retrying::before {{ background: #f59e0b; }}
+        .overview-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 0.85rem; }}
+        .overview-card {{ border-radius: 14px; background: #f8fafc; padding: 0.9rem 1rem; }}
+        .overview-card strong {{ display: block; margin-bottom: 0.35rem; font-size: 0.92rem; color: #0f172a; }}
+        .status-duo {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
+        .status-chip {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.9rem; font-weight: 600; background: #e2e8f0; color: #0f172a; }}
+        .status-chip.online {{ background: #dcfce7; color: #166534; }}
+        .status-chip.paired {{ background: #dbeafe; color: #1d4ed8; }}
+        .portal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.85rem; }}
+        .portal-card {{ border: 1px solid #e2e8f0; border-radius: 16px; padding: 1rem; background: #fcfdfd; }}
+        .portal-card-header {{ display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.85rem; }}
+        .portal-card-header p {{ margin: 0; word-break: break-word; color: #475569; font-size: 0.92rem; }}
+        .portal-card img, .portal-logo-placeholder {{ width: 64px; height: 64px; border-radius: 14px; background: #f1f5f9; object-fit: contain; padding: 0.35rem; flex: 0 0 auto; }}
+        .portal-logo-placeholder {{ display: inline-flex; align-items: center; justify-content: center; font-size: 0.75rem; color: #64748b; text-align: center; }}
+        .portal-form-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+        .portal-form-actions {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
+        .challenge-note {{ margin: 0; color: #475569; }}
+        @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
-  <script>
-    function confirmRemoveDevice(deviceLabel) {{
-      return confirm('Weet je zeker dat je "' + deviceLabel + '" wilt verwijderen? Dit kan niet ongedaan gemaakt worden.');
-    }}
-  </script>
 </head>
 <body>
-  <h1>ONS Rooster Operatorstatus</h1>
-  {flash}
+    <div class="hero">
+        <div class="hero-copy">
+            <img class="brand-mark" src="{ONS_BRAND_LOGO_DATA_URI}" alt="ONS logo">
+            <h1>ONS Rooster Operatorstatus</h1>
+            <p>De pagina luistert live mee met backendwijzigingen. Nieuwe koppelingen, verwijderingen, statusfases en OTP-verzoeken verschijnen automatisch zonder handmatige refresh.</p>
+            <span id="live-indicator" class="live-pill">Live updates verbinden...</span>
+        </div>
+    </div>
+    <div id="flash-host">{flash}</div>
   <section>
     <div class="toolbar">
-      <form method="post" action="/status/refresh"><button type="submit">Start sync nu</button></form>
+            <button type="button" id="btn-refresh-sync">Start sync nu</button>
       <form method="post" action="/status/logout"><button type="submit">Uitloggen</button></form>
       <a href="/install">Firebase-installatie</a>
       <a href="/debug?token={html.escape(config.debug_token)}">Debugpagina</a>
@@ -732,25 +949,63 @@ def _render_status_page(
   </section>
   <section>
     <h2>Overzicht</h2>
-    <p><strong>Backend-URL:</strong> {html.escape(status_payload['public_base_url'])}</p>
-    <p><strong>Inlogpagina:</strong> {html.escape(status_payload['login_url'])}</p>
-    <p><strong>Actief apparaat:</strong> {html.escape(status_payload['active_device_label'] or '-')}</p>
-    <p><strong>Aantal apparaten:</strong> {status_payload['device_count']}</p>
-    <p><strong>FCM geconfigureerd:</strong> {diagnostics['configured']}</p>
-    <p><strong>Laatste status:</strong> {html.escape(str(status_payload['sync']['last_message'] or '-'))}</p>
-    <p><strong>Laatste fout:</strong> {html.escape(str(status_payload['sync']['last_error'] or '-'))}</p>
-    <p><strong>Huidige fase:</strong> {html.escape(str(status_payload['sync']['current_phase'] or '-'))}</p>
+        <div id="overview-grid" class="overview-grid">
+            <div class="overview-card"><strong>Backend-URL</strong><span>{html.escape(status_payload['public_base_url'])}</span></div>
+            <div class="overview-card"><strong>Inlogpagina</strong><span>{html.escape(status_payload['login_url'])}</span></div>
+            <div class="overview-card"><strong>Status badge</strong><div class="status-duo"><span class="status-chip {'online' if devices and any(device['is_connected'] for device in devices) else ''}">{'Verbonden' if devices and any(device['is_connected'] for device in devices) else 'Niet live verbonden'}</span><span class="status-chip {'paired' if status_payload['device_registered'] else ''}">{'Gekoppeld' if status_payload['device_registered'] else 'Niet gekoppeld'}</span></div></div>
+            <div class="overview-card"><strong>Actief apparaat</strong><span>{html.escape(status_payload['active_device_label'] or '-')}</span></div>
+            <div class="overview-card"><strong>Aantal apparaten</strong><span>{status_payload['device_count']}</span></div>
+            <div class="overview-card"><strong>FCM geconfigureerd</strong><span>{diagnostics['configured']}</span></div>
+            <div class="overview-card"><strong>Laatste status</strong><span>{html.escape(str(status_payload['sync']['last_message'] or '-'))}</span></div>
+            <div class="overview-card"><strong>Laatste fout</strong><span>{html.escape(str(status_payload['sync']['last_error'] or '-'))}</span></div>
+            <div class="overview-card"><strong>Huidige fase</strong><span>{html.escape(str(status_payload['sync']['current_phase'] or '-'))}</span></div>
+            <div class="overview-card"><strong>Laatste succesvolle login</strong><span>{html.escape(str(status_payload['sync']['last_success_at'] or '-'))}</span></div>
+        </div>
   </section>
   <section>
     <h2>Gekoppelde apparaten</h2>
     <table>
       <thead>
-        <tr><th>Label</th><th>Device-ID</th><th>FCM suffix</th><th>Laatst gezien</th><th>Actief</th><th>Acties</th></tr>
+                <tr><th>Label</th><th>Device-ID</th><th>FCM suffix</th><th>Laatst gezien</th><th>Verbonden</th><th>Actief</th><th>Acties</th></tr>
       </thead>
-      <tbody>{device_rows or '<tr><td colspan="6">Nog geen apparaten gekoppeld.</td></tr>'}</tbody>
+            <tbody id="device-table-body">{device_rows or '<tr><td colspan="7">Nog geen apparaten gekoppeld.</td></tr>'}</tbody>
     </table>
   </section>
-  {challenge_controls}
+    <section id="challenge-section" {challenge_controls}>
+        <h2>Actieve testuitdaging</h2>
+        <p id="challenge-id-line"><strong>Challenge-ID:</strong> {html.escape(status_payload['sync']['current_challenge_id'] or '-')}</p>
+        <p class="challenge-note">Gebruik de mock code <code>{MOCK_SMS_CODE}</code> om een sandbox-OTP in te vullen zonder echte SMS.</p>
+        <div class="actions"><button type="button" id="btn-mock-sms">Vul mock OTP {MOCK_SMS_CODE} in</button></div>
+    </section>
+    <section>
+        <h2>Portalen</h2>
+        <p>Deze portalen worden centraal beheerd door de backend. De Android-app toont alleen de naam en het logo; de URL blijft daar buiten beeld.</p>
+        <div id="portal-list" class="portal-grid">{portal_cards}</div>
+    </section>
+    <section>
+        <h2>Portaal wijzigen of toevoegen</h2>
+        <form id="portal-form" action="/api/v1/admin/portals" method="post">
+            <input type="hidden" id="portal_id" name="portal_id" value="{html.escape(selected_portal['portal_id'] if selected_portal else '')}">
+            <div class="portal-form-grid">
+                <label>
+                    <span>Naam</span>
+                    <input type="text" id="portal_name" name="name" value="{html.escape(selected_portal['name'] if selected_portal else '')}" required>
+                </label>
+                <label>
+                    <span>Login-URL</span>
+                    <input type="url" id="portal_login_url" name="login_url" value="{html.escape(selected_portal['login_url'] if selected_portal else '')}" required>
+                </label>
+                <label>
+                    <span>Logo-URL</span>
+                    <input type="url" id="portal_logo_url" name="logo_url" value="{html.escape(selected_portal['logo_url'] if selected_portal else '')}">
+                </label>
+            </div>
+            <div class="portal-form-actions">
+                <button type="submit">Portaal opslaan</button>
+                <button type="button" id="btn-portal-reset">Nieuw portaal</button>
+            </div>
+        </form>
+    </section>
   <section>
     <h2>Mock HasMoves testflow</h2>
     <p>Gebruik deze URL als ONS-inlog-URL in de app of in backend-tests om de live HasMoves-site te omzeilen.</p>
@@ -758,6 +1013,285 @@ def _render_status_page(
     <p><strong>SMS-flow:</strong> <a href="{html.escape(mock_sms_url)}">{html.escape(mock_sms_url)}</a></p>
     <p>Voor de SMS-flow accepteert de mock challenge code <code>{MOCK_SMS_CODE}</code>. Je kunt die via de knop hierboven in de actieve uitdaging injecteren.</p>
   </section>
+    <script id="initial-status-json" type="application/json">{initial_snapshot_json}</script>
+    <script>
+        const initialStatus = JSON.parse(document.getElementById('initial-status-json').textContent);
+        const liveIndicator = document.getElementById('live-indicator');
+        const flashHost = document.getElementById('flash-host');
+        const overviewGrid = document.getElementById('overview-grid');
+        const deviceTableBody = document.getElementById('device-table-body');
+        const challengeSection = document.getElementById('challenge-section');
+        const challengeIdLine = document.getElementById('challenge-id-line');
+        const portalList = document.getElementById('portal-list');
+        const portalForm = document.getElementById('portal-form');
+        const portalIdInput = document.getElementById('portal_id');
+        const portalNameInput = document.getElementById('portal_name');
+        const portalLoginUrlInput = document.getElementById('portal_login_url');
+        const portalLogoUrlInput = document.getElementById('portal_logo_url');
+        const liveUrl = `${{window.location.protocol === 'https:' ? 'wss' : 'ws'}}://${{window.location.host}}/status/live`;
+        let socket = null;
+        let reconnectHandle = null;
+        let statusSnapshot = initialStatus;
+
+        function escapeHtml(value) {{
+            const div = document.createElement('div');
+            div.textContent = value ?? '';
+            return div.innerHTML;
+        }}
+
+        function formatTimestamp(value) {{
+            if (!value) return '-';
+            const parsed = new Date(value);
+            if (Number.isNaN(parsed.getTime())) return value;
+            return parsed.toLocaleString('nl-NL');
+        }}
+
+        function setFlash(kind, text) {{
+            if (!text) return;
+            flashHost.innerHTML = `<p class="flash ${{kind === 'error' ? 'flash-error' : 'flash-ok'}}">${{escapeHtml(text)}}</p>`;
+        }}
+
+        function clearPortalForm() {{
+            portalIdInput.value = '';
+            portalNameInput.value = '';
+            portalLoginUrlInput.value = '';
+            portalLogoUrlInput.value = '';
+        }}
+
+        function fillPortalForm(portal) {{
+            portalIdInput.value = portal.portal_id || '';
+            portalNameInput.value = portal.name || '';
+            portalLoginUrlInput.value = portal.login_url || '';
+            portalLogoUrlInput.value = portal.logo_url || '';
+        }}
+
+        function renderOverview(snapshot) {{
+            const status = snapshot.status;
+            const anyConnected = snapshot.devices.some((device) => device.is_connected);
+            overviewGrid.innerHTML = `
+                <div class="overview-card"><strong>Backend-URL</strong><span>${{escapeHtml(status.public_base_url)}}</span></div>
+                <div class="overview-card"><strong>Inlogpagina</strong><span>${{escapeHtml(status.login_url)}}</span></div>
+                <div class="overview-card"><strong>Status badge</strong><div class="status-duo"><span class="status-chip ${{anyConnected ? 'online' : ''}}">${{anyConnected ? 'Verbonden' : 'Niet live verbonden'}}</span><span class="status-chip ${{status.device_registered ? 'paired' : ''}}">${{status.device_registered ? 'Gekoppeld' : 'Niet gekoppeld'}}</span></div></div>
+                <div class="overview-card"><strong>Actief apparaat</strong><span>${{escapeHtml(status.active_device_label || '-')}}</span></div>
+                <div class="overview-card"><strong>Aantal apparaten</strong><span>${{snapshot.devices.length}}</span></div>
+                <div class="overview-card"><strong>FCM geconfigureerd</strong><span>${{snapshot.fcm_configured ? 'Ja' : 'Nee'}}</span></div>
+                <div class="overview-card"><strong>Laatste status</strong><span>${{escapeHtml(status.sync.last_message || '-')}}</span></div>
+                <div class="overview-card"><strong>Laatste fout</strong><span>${{escapeHtml(status.sync.last_error || '-')}}</span></div>
+                <div class="overview-card"><strong>Huidige fase</strong><span>${{escapeHtml(status.sync.current_phase || '-')}}</span></div>
+                <div class="overview-card"><strong>Laatste succesvolle login</strong><span>${{escapeHtml(formatTimestamp(status.sync.last_success_at))}}</span></div>`;
+        }}
+
+        function renderDevices(snapshot) {{
+            if (!snapshot.devices.length) {{
+                deviceTableBody.innerHTML = '<tr><td colspan="7">Nog geen apparaten gekoppeld.</td></tr>';
+                return;
+            }}
+
+            deviceTableBody.innerHTML = snapshot.devices.map((device) => `
+                <tr data-device-id="${{escapeHtml(device.device_id)}}" data-device-label="${{escapeHtml(device.device_label)}}">
+                    <td>${{escapeHtml(device.device_label)}}</td>
+                    <td><code>${{escapeHtml(device.device_id)}}</code></td>
+                    <td>${{escapeHtml(device.fcm_token_suffix || '-')}}</td>
+                    <td>${{escapeHtml(formatTimestamp(device.last_seen_at))}}</td>
+                    <td>${{device.is_connected ? 'Verbonden' : 'Niet verbonden'}}</td>
+                    <td>${{device.is_active ? 'Ja' : 'Nee'}}</td>
+                    <td>
+                        <div class="actions">
+                            <button type="button" data-device-action="ping">FCM-ping</button>
+                            <button type="button" data-device-action="activate" ${{device.is_active ? 'disabled' : ''}}>Maak actief</button>
+                            <button type="button" class="danger" data-device-action="remove">Verwijder</button>
+                        </div>
+                    </td>
+                </tr>`).join('');
+        }}
+
+        function renderChallenge(snapshot) {{
+            const challengeId = snapshot.status.sync.current_challenge_id;
+            if (!challengeId) {{
+                challengeSection.hidden = true;
+                challengeIdLine.innerHTML = '<strong>Challenge-ID:</strong> -';
+                return;
+            }}
+
+            challengeSection.hidden = false;
+            challengeIdLine.innerHTML = `<strong>Challenge-ID:</strong> ${{escapeHtml(challengeId)}}`;
+        }}
+
+        function renderPortals(snapshot) {{
+            if (!snapshot.portals.length) {{
+                portalList.innerHTML = '<p>Er zijn nog geen portalen geconfigureerd.</p>';
+                return;
+            }}
+
+            portalList.innerHTML = snapshot.portals.map((portal) => `
+                <article class="portal-card" data-portal-id="${{escapeHtml(portal.portal_id)}}">
+                    <div class="portal-card-header">
+                        <div>
+                            <h3>${{escapeHtml(portal.name)}}</h3>
+                            <p>${{escapeHtml(portal.login_url)}}</p>
+                        </div>
+                        ${{portal.logo_url ? `<img src="${{escapeHtml(portal.logo_url)}}" alt="${{escapeHtml(portal.name)}} logo">` : '<div class="portal-logo-placeholder">Geen logo</div>'}}
+                    </div>
+                    <div class="actions">
+                        <button type="button" data-portal-action="edit">Wijzig</button>
+                        <button type="button" class="danger" data-portal-action="remove">Verwijder</button>
+                    </div>
+                </article>`).join('');
+        }}
+
+        function render(snapshot) {{
+            statusSnapshot = snapshot;
+            renderOverview(snapshot);
+            renderDevices(snapshot);
+            renderChallenge(snapshot);
+            renderPortals(snapshot);
+        }}
+
+        async function callJson(url, options = {{}}) {{
+            const response = await fetch(url, {{
+                headers: {{ 'Accept': 'application/json', ...(options.body ? {{ 'Content-Type': 'application/json' }} : {{}}) }},
+                ...options,
+            }});
+            const text = await response.text();
+            let payload = {{}};
+            if (text) {{
+                try {{
+                    payload = JSON.parse(text);
+                }} catch (_error) {{
+                    payload = {{ message: text }};
+                }}
+            }}
+            if (!response.ok) {{
+                throw new Error(payload.message || text || 'Er ging iets mis.');
+            }}
+            return payload;
+        }}
+
+        async function connectLive() {{
+            if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {{
+                return;
+            }}
+
+            liveIndicator.textContent = 'Live updates verbinden...';
+            liveIndicator.className = 'live-pill retrying';
+            socket = new WebSocket(liveUrl);
+            socket.addEventListener('open', () => {{
+                liveIndicator.textContent = 'Live updates actief';
+                liveIndicator.className = 'live-pill live';
+            }});
+            socket.addEventListener('message', (event) => {{
+                render(JSON.parse(event.data));
+            }});
+            socket.addEventListener('close', () => {{
+                liveIndicator.textContent = 'Live updates onderbroken, opnieuw verbinden...';
+                liveIndicator.className = 'live-pill retrying';
+                reconnectHandle = window.setTimeout(connectLive, 2000);
+            }});
+            socket.addEventListener('error', () => {{
+                socket.close();
+            }});
+        }}
+
+        document.getElementById('btn-refresh-sync').addEventListener('click', async () => {{
+            try {{
+                const response = await callJson('/api/v1/admin/refresh', {{ method: 'POST' }});
+                setFlash('ok', response.message || 'Synchronisatie gestart.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-mock-sms').addEventListener('click', async () => {{
+            try {{
+                const response = await callJson('/api/v1/admin/challenges/mock-sms', {{ method: 'POST' }});
+                setFlash('ok', response.message || 'Mock OTP ingestuurd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        deviceTableBody.addEventListener('click', async (event) => {{
+            const button = event.target.closest('button[data-device-action]');
+            if (!button) return;
+
+            const row = button.closest('tr[data-device-id]');
+            const deviceId = row?.dataset.deviceId;
+            const deviceLabel = row?.dataset.deviceLabel || 'dit apparaat';
+            if (!deviceId) return;
+
+            const action = button.dataset.deviceAction;
+            const endpoints = {{
+                ping: ['/api/v1/admin/devices/' + deviceId + '/ping', 'POST'],
+                activate: ['/api/v1/admin/devices/' + deviceId + '/activate', 'POST'],
+                remove: ['/api/v1/admin/devices/' + deviceId, 'DELETE'],
+            }};
+            const [url, method] = endpoints[action] || [];
+            if (!url) return;
+            if (action === 'remove' && !window.confirm(`Weet je zeker dat je "${{deviceLabel}}" wilt verwijderen?`)) {{
+                return;
+            }}
+
+            try {{
+                const response = await callJson(url, {{ method }});
+                setFlash('ok', response.message || 'Actie uitgevoerd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        portalList.addEventListener('click', async (event) => {{
+            const button = event.target.closest('button[data-portal-action]');
+            if (!button) return;
+            const card = button.closest('[data-portal-id]');
+            const portalId = card?.dataset.portalId;
+            if (!portalId) return;
+
+            const portal = statusSnapshot.portals.find((item) => item.portal_id === portalId);
+            if (!portal) return;
+
+            if (button.dataset.portalAction === 'edit') {{
+                fillPortalForm(portal);
+                return;
+            }}
+
+            if (!window.confirm(`Weet je zeker dat je het portaal "${{portal.name}}" wilt verwijderen?`)) {{
+                return;
+            }}
+
+            try {{
+                const response = await callJson('/api/v1/admin/portals/' + portalId, {{ method: 'DELETE' }});
+                if (portalIdInput.value === portalId) {{
+                    clearPortalForm();
+                }}
+                setFlash('ok', response.message || 'Portaal verwijderd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        portalForm.addEventListener('submit', async (event) => {{
+            event.preventDefault();
+            try {{
+                const response = await callJson('/api/v1/admin/portals', {{
+                    method: 'POST',
+                    body: JSON.stringify({{
+                        portal_id: portalIdInput.value,
+                        name: portalNameInput.value,
+                        login_url: portalLoginUrlInput.value,
+                        logo_url: portalLogoUrlInput.value,
+                    }}),
+                }});
+                setFlash('ok', response.message || 'Portaal opgeslagen.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-portal-reset').addEventListener('click', () => clearPortalForm());
+
+        render(initialStatus);
+        connectLive();
+    </script>
 </body>
 </html>
 """
@@ -947,6 +1481,18 @@ def _extract_bearer_token(request: web.Request) -> str | None:
     if authorization.lower().startswith("bearer "):
         return authorization.split(" ", 1)[1].strip()
     return None
+
+
+async def _read_request_payload(request: web.Request) -> dict[str, Any]:
+    if request.content_type.startswith("application/json"):
+        payload = await request.json()
+        if isinstance(payload, dict):
+            return payload
+        return {}
+    if request.can_read_body:
+        form = await request.post()
+        return {key: value for key, value in form.items()}
+    return {}
 
 
 def _require_mobile_auth(request: web.Request) -> str:

@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import re
 import secrets
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -14,7 +15,7 @@ from icalendar import Calendar, Event
 
 from .clients import AutomationClient, FcmPushClient, PushClient
 from .config import AppConfig
-from .models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, RosterItem
+from .models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, PortalDefinition, RosterItem
 from .storage import StateStore
 
 log = logging.getLogger(__name__)
@@ -34,6 +35,11 @@ class PendingChallenge:
     code: str | None = None
 
 
+DEFAULT_PORTAL_ID = "land-van-horne"
+DEFAULT_PORTAL_NAME = "Land van Horne"
+DEFAULT_PORTAL_LOGO_URL = "https://aanmelden.ons-diensten.nl/api/images/a2d1a875-feed-4cc0-91d5-149c4f129db8.png"
+
+
 class BackendService:
     def __init__(
         self,
@@ -47,9 +53,13 @@ class BackendService:
         self.push_client = push_client
         self.automation_client = automation_client
         self.state, self.credentials = self.store.load()
+        self._ensure_default_portals()
         self._pending_challenges: dict[str, PendingChallenge] = {}
         self._state_lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
+        self._live_condition = asyncio.Condition()
+        self._live_version = 0
+        self._connected_device_counts: dict[str, int] = {}
         self._scheduler_task: asyncio.Task[None] | None = None
         self._current_sync_task: asyncio.Task[None] | None = None
 
@@ -98,6 +108,49 @@ class BackendService:
                 return device
         return None
 
+    def default_portal(self) -> PortalDefinition | None:
+        if not self.state.portals:
+            return None
+        return self.state.portals[0]
+
+    def portal_by_id(self, portal_id: str | None) -> PortalDefinition | None:
+        if not portal_id:
+            return None
+        for portal in self.state.portals:
+            if portal.portal_id == portal_id:
+                return portal
+        return None
+
+    def selected_portal(self) -> PortalDefinition | None:
+        if self.credentials is not None:
+            selected = self.portal_by_id(self.credentials.portal_id)
+            if selected is not None:
+                return selected
+            normalized_login_url = self._normalize_external_url(self.credentials.login_url)
+            for portal in self.state.portals:
+                if self._normalize_external_url(portal.login_url) == normalized_login_url:
+                    return portal
+        return self.default_portal()
+
+    def portal_catalog_payload(self) -> list[dict[str, Any]]:
+        selected_portal = self.selected_portal()
+        selected_portal_id = selected_portal.portal_id if selected_portal else None
+        return [
+            {
+                "portal_id": portal.portal_id,
+                "name": portal.name,
+                "login_url": portal.login_url,
+                "logo_url": portal.logo_url,
+                "created_at": portal.created_at,
+                "updated_at": portal.updated_at,
+                "is_selected": portal.portal_id == selected_portal_id,
+            }
+            for portal in self.state.portals
+        ]
+
+    def device_is_connected(self, device_id: str) -> bool:
+        return self._connected_device_counts.get(device_id, 0) > 0
+
     def paired_devices_payload(self) -> list[dict[str, Any]]:
         active_device = self.active_device()
         active_device_id = active_device.device_id if active_device else None
@@ -110,6 +163,7 @@ class BackendService:
                 "last_seen_at": device.last_seen_at,
                 "fcm_token_suffix": self._suffix(device.fcm_token),
                 "is_active": device.device_id == active_device_id,
+                "is_connected": self.device_is_connected(device.device_id),
             }
             for device in sorted(self.state.devices, key=lambda item: (item.updated_at, item.created_at))
         ]
@@ -142,6 +196,7 @@ class BackendService:
         self,
         *,
         login_url: str,
+        portal_id: str | None,
         username: str,
         password: str,
         fcm_token: str,
@@ -188,15 +243,16 @@ class BackendService:
             self._save_device(updated_device)
             self.state.active_device_id = updated_device.device_id
             self.credentials = LoginCredentials(
-                login_url=login_url.strip() or self.config.default_login_url,
+                login_url=self._normalize_external_url(login_url.strip() or self.config.default_login_url),
                 username=username.strip(),
                 password=password,
+                portal_id=portal_id,
             )
             self.state.credentials_updated_at = now
             self._remember_note(
                 "De Android-app heeft de verbindingsgegevens bijgewerkt.",
             )
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
         await self.trigger_refresh(reason="setup", wait=False)
 
@@ -236,7 +292,7 @@ class BackendService:
                 )
             else:
                 self._remember_note("De Android-app heeft het FCM-token bijgewerkt.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
     async def remove_device(self, device_id: str) -> DeviceRegistration:
         async with self._state_lock:
@@ -244,16 +300,15 @@ class BackendService:
             if device is None:
                 raise RuntimeError("Het opgegeven apparaat bestaat niet meer.")
 
-            self.state.devices = [item for item in self.state.devices if item.device_id != device_id]
-            if self.state.active_device_id == device_id:
-                self.state.active_device_id = self.state.devices[-1].device_id if self.state.devices else None
+            return await self._remove_device_locked(device)
 
-            if not self.state.devices:
-                self._pending_challenges.clear()
+    async def remove_device_for_mobile_token(self, auth_token: str | None) -> DeviceRegistration:
+        async with self._state_lock:
+            device = self.device_for_mobile_token(auth_token)
+            if device is None:
+                raise RuntimeError("Het gekoppelde apparaat bestaat niet meer of de app-token is ongeldig.")
 
-            self._remember_note(f"Het gekoppelde apparaat {device.device_label} is verwijderd.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
-            return device
+            return await self._remove_device_locked(device)
 
     async def submit_sms_code(
         self,
@@ -308,7 +363,7 @@ class BackendService:
                 raise RuntimeError("Het gevraagde apparaat bestaat niet meer.")
             self.state.active_device_id = device.device_id
             self._remember_note(f"{device.device_label} is als actief apparaat gemarkeerd.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
             return device
 
     async def submit_mock_sms_code(self, code: str = "123456", sender: str = "Mock ONS") -> None:
@@ -337,23 +392,41 @@ class BackendService:
         async with self._state_lock:
             await asyncio.to_thread(self.store.write_managed_fcm_service_account, normalized_payload)
             self._remember_note("De Firebase-beheersleutel is via de installatiepagina bijgewerkt.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
         return FcmPushClient(self.config).diagnostics()
 
-    def mobile_status_payload(self) -> dict[str, Any]:
-        username = self.credentials.username if self.credentials else ""
+    def mobile_config_payload(self) -> dict[str, Any]:
+        default_portal = self.default_portal()
+        return {
+            "public_base_url": self.config.public_base_url,
+            "default_portal_id": default_portal.portal_id if default_portal else "",
+            "portals": self.portal_catalog_payload(),
+        }
+
+    def mobile_status_payload(self, auth_token: str | None = None) -> dict[str, Any]:
+        resolved_credentials = self._resolved_credentials()
+        username = resolved_credentials.username if resolved_credentials else ""
         masked_username = self._mask_value(username)
         active_device = self.active_device()
+        current_device = self.device_for_mobile_token(auth_token) if auth_token is not None else active_device
+        selected_portal = self.selected_portal()
         return {
             "public_base_url": self.config.public_base_url,
             "device_registered": self.has_device(),
             "device_count": self.device_count(),
             "active_device_label": active_device.device_label if active_device else "",
-            "credentials_present": self.credentials is not None,
-            "login_url": self.credentials.login_url if self.credentials else self.config.default_login_url,
+            "credentials_present": resolved_credentials is not None,
+            "login_url": resolved_credentials.login_url if resolved_credentials else self._normalize_external_url(self.config.default_login_url),
             "username": masked_username,
             "fcm_configured": self.push_client.is_configured(),
+            "portal_id": selected_portal.portal_id if selected_portal else "",
+            "portal_name": selected_portal.name if selected_portal else "",
+            "portal_logo_url": selected_portal.logo_url if selected_portal else "",
+            "portals": self.portal_catalog_payload(),
+            "paired": current_device is not None,
+            "connected": bool(current_device and self.device_is_connected(current_device.device_id)),
+            "device_id": current_device.device_id if current_device else "",
             "sync": {
                 "status": self.state.sync.status,
                 "current_phase": self.state.sync.current_phase,
@@ -374,6 +447,107 @@ class BackendService:
                 "debug_notes": list(self.state.sync.debug_notes),
             },
         }
+
+    def operator_status_payload(self) -> dict[str, Any]:
+        return {
+            "public_base_url": self.config.public_base_url,
+            "fcm_configured": self.push_client.is_configured(),
+            "status": self.mobile_status_payload(),
+            "devices": self.paired_devices_payload(),
+            "portals": self.portal_catalog_payload(),
+        }
+
+    def live_version(self) -> int:
+        return self._live_version
+
+    async def wait_for_live_update(self, current_version: int, timeout_seconds: float | None = None) -> int:
+        async with self._live_condition:
+            if self._live_version != current_version:
+                return self._live_version
+
+            waiter = self._live_condition.wait_for(lambda: self._live_version != current_version)
+            if timeout_seconds is None:
+                await waiter
+            else:
+                await asyncio.wait_for(waiter, timeout=timeout_seconds)
+            return self._live_version
+
+    async def register_mobile_live_connection(self, auth_token: str | None) -> DeviceRegistration:
+        async with self._state_lock:
+            device = self.device_for_mobile_token(auth_token)
+            if device is None:
+                raise RuntimeError("De app-token hoort niet bij een gekoppeld apparaat.")
+
+            updated_device = replace(device, last_seen_at=utc_now())
+            self._save_device(updated_device)
+            self._connected_device_counts[device.device_id] = self._connected_device_counts.get(device.device_id, 0) + 1
+            await self._persist_state()
+            return updated_device
+
+    async def unregister_mobile_live_connection(self, device_id: str) -> None:
+        current_count = self._connected_device_counts.get(device_id, 0)
+        if current_count <= 1:
+            self._connected_device_counts.pop(device_id, None)
+        else:
+            self._connected_device_counts[device_id] = current_count - 1
+        await self._publish_live_update()
+
+    async def upsert_portal(
+        self,
+        *,
+        portal_id: str | None,
+        name: str,
+        login_url: str,
+        logo_url: str,
+    ) -> PortalDefinition:
+        normalized_name = name.strip()
+        normalized_login_url = self._normalize_external_url(login_url)
+        normalized_logo_url = logo_url.strip()
+        if not normalized_name or not normalized_login_url:
+            raise RuntimeError("Naam en login-URL zijn verplicht.")
+
+        async with self._state_lock:
+            existing = self.portal_by_id(portal_id)
+            now = utc_now()
+            if existing is None:
+                portal = PortalDefinition(
+                    portal_id=self._unique_portal_id(normalized_name),
+                    name=normalized_name,
+                    login_url=normalized_login_url,
+                    logo_url=normalized_logo_url,
+                    created_at=now,
+                    updated_at=now,
+                )
+                self.state.portals.append(portal)
+                self._remember_note(f"Portal {portal.name} is toegevoegd.")
+            else:
+                portal = replace(
+                    existing,
+                    name=normalized_name,
+                    login_url=normalized_login_url,
+                    logo_url=normalized_logo_url,
+                    updated_at=now,
+                )
+                self._save_portal(portal)
+                self._remember_note(f"Portal {portal.name} is bijgewerkt.")
+
+            await self._persist_state()
+            return portal
+
+    async def remove_portal(self, portal_id: str) -> PortalDefinition:
+        async with self._state_lock:
+            portal = self.portal_by_id(portal_id)
+            if portal is None:
+                raise RuntimeError("Het gevraagde portal bestaat niet meer.")
+            if len(self.state.portals) <= 1:
+                raise RuntimeError("Er moet minimaal één portal beschikbaar blijven.")
+
+            self.state.portals = [item for item in self.state.portals if item.portal_id != portal_id]
+            if self.credentials is not None and self.credentials.portal_id == portal_id:
+                self.credentials = replace(self.credentials, portal_id=None)
+            self._remember_note(f"Portal {portal.name} is verwijderd.")
+            await self._persist_state()
+            return portal
 
     def roster_items(self) -> list[RosterItem]:
         return list(self.state.sync.roster_items)
@@ -398,10 +572,12 @@ class BackendService:
                     self.state.sync.last_error = None
                     self.state.sync.last_message = "De backend is gestart met een nieuwe aanmeldpoging."
                     self._remember_note("Er is een nieuwe backend-synchronisatie gestart.")
-                    await asyncio.to_thread(self.store.save, self.state, self.credentials)
+                    await self._persist_state()
 
                 if self.credentials is None:
                     raise RuntimeError("Er zijn nog geen ONS-inloggegevens opgeslagen.")
+                resolved_credentials = self._resolved_credentials()
+                assert resolved_credentials is not None
                 active_device = self.active_device()
                 if active_device is None:
                     raise RuntimeError("Er is nog geen Android-apparaat gekoppeld.")
@@ -413,7 +589,7 @@ class BackendService:
                     )
 
                 result = await self.automation_client.authenticate_and_scrape(
-                    credentials=self.credentials,
+                    credentials=resolved_credentials,
                     request_sms_code=self._request_sms_code,
                     snapshot_path=self.config.snapshot_file,
                     config=self.config,
@@ -443,7 +619,7 @@ class BackendService:
             self.state.sync.challenge_created_at = pending.created_at
             self.state.sync.last_message = "De backend wacht op de SMS-code van de Android-app."
             self._remember_note("De backend heeft een SMS-luisterverzoek naar de Android-app verstuurd.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
         try:
             await self.push_client.send_listen_sms(
@@ -477,7 +653,7 @@ class BackendService:
             self.state.sync.roster_items = result.roster_items
             self.state.sync.debug_notes = list(result.debug_notes[-25:])
             self._remember_note("De backend heeft de ONS-aanmelding succesvol afgerond.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
             await asyncio.to_thread(self.store.write_ics, self._generate_ical())
 
         await self._notify_auth_result(
@@ -496,7 +672,7 @@ class BackendService:
             self.state.sync.current_challenge_id = None
             self.state.sync.challenge_created_at = None
             self._remember_note(f"De backend-synchronisatie is mislukt: {exc}")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
         await self._notify_auth_result(
             False,
@@ -586,7 +762,7 @@ class BackendService:
             self.state.sync.current_phase = "sms_received"
             self.state.sync.last_message = "De SMS-code is ontvangen door de backend."
             self._remember_note(note)
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            await self._persist_state()
 
     def _device_for_fcm_token(self, fcm_token: str) -> DeviceRegistration | None:
         for device in self.state.devices:
@@ -600,6 +776,88 @@ class BackendService:
                 self.state.devices[index] = updated_device
                 return
         self.state.devices.append(updated_device)
+
+    def _save_portal(self, updated_portal: PortalDefinition) -> None:
+        for index, portal in enumerate(self.state.portals):
+            if portal.portal_id == updated_portal.portal_id:
+                self.state.portals[index] = updated_portal
+                return
+        self.state.portals.append(updated_portal)
+
+    async def _remove_device_locked(self, device: DeviceRegistration) -> DeviceRegistration:
+        self.state.devices = [item for item in self.state.devices if item.device_id != device.device_id]
+        self._connected_device_counts.pop(device.device_id, None)
+        if self.state.active_device_id == device.device_id:
+            self.state.active_device_id = self.state.devices[-1].device_id if self.state.devices else None
+
+        if not self.state.devices:
+            self._pending_challenges.clear()
+
+        self._remember_note(f"Het gekoppelde apparaat {device.device_label} is verwijderd.")
+        await self._persist_state()
+        return device
+
+    async def _persist_state(self) -> None:
+        await asyncio.to_thread(self.store.save, self.state, self.credentials)
+        await self._publish_live_update()
+
+    async def _publish_live_update(self) -> None:
+        async with self._live_condition:
+            self._live_version += 1
+            self._live_condition.notify_all()
+
+    def _resolved_credentials(self) -> LoginCredentials | None:
+        if self.credentials is None:
+            return None
+
+        selected_portal = self.selected_portal()
+        if selected_portal is not None and (
+            self.credentials.portal_id == selected_portal.portal_id
+            or self._normalize_external_url(self.credentials.login_url) == self._normalize_external_url(selected_portal.login_url)
+        ):
+            return replace(self.credentials, login_url=selected_portal.login_url, portal_id=selected_portal.portal_id)
+
+        return replace(self.credentials, login_url=self._normalize_external_url(self.credentials.login_url))
+
+    def _ensure_default_portals(self) -> None:
+        if self.state.portals:
+            return
+
+        now = utc_now()
+        self.state.portals = [
+            PortalDefinition(
+                portal_id=DEFAULT_PORTAL_ID,
+                name=DEFAULT_PORTAL_NAME,
+                login_url=self._normalize_external_url(self.config.default_login_url),
+                logo_url=DEFAULT_PORTAL_LOGO_URL,
+                created_at=now,
+                updated_at=now,
+            )
+        ]
+
+    def _unique_portal_id(self, name: str) -> str:
+        base = self._slugify(name)
+        candidate = base
+        suffix = 2
+        existing_ids = {portal.portal_id for portal in self.state.portals}
+        while candidate in existing_ids:
+            candidate = f"{base}-{suffix}"
+            suffix += 1
+        return candidate
+
+    @staticmethod
+    def _normalize_external_url(url: str) -> str:
+        trimmed = url.strip().rstrip("/")
+        if not trimmed:
+            return ""
+        if trimmed.startswith("https://") or trimmed.startswith("http://"):
+            return trimmed
+        return f"https://{trimmed}"
+
+    @staticmethod
+    def _slugify(value: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
+        return normalized.strip("-") or "portal"
 
     @staticmethod
     def _suffix(value: str, size: int = 12) -> str:
