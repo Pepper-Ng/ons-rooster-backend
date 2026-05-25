@@ -679,9 +679,9 @@ def _render_status_page(
               <form method="post" action="/status/devices/{html.escape(device['device_id'])}/activate">
                 <button type="submit"{' disabled' if device['is_active'] else ''}>Maak actief</button>
               </form>
-                            <form method="post" action="/status/devices/{html.escape(device['device_id'])}/remove">
-                                <button type="submit" class="danger">Verwijder</button>
-                            </form>
+              <form method="post" action="/status/devices/{html.escape(device['device_id'])}/remove" onsubmit="return confirmRemoveDevice('{html.escape(device['device_label'])}');">
+                <button type="submit" class="danger">Verwijder</button>
+              </form>
             </div>
           </td>
         </tr>
@@ -713,6 +713,11 @@ def _render_status_page(
     .toolbar {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
     a {{ color: #0f766e; }}
   </style>
+  <script>
+    function confirmRemoveDevice(deviceLabel) {{
+      return confirm('Weet je zeker dat je "' + deviceLabel + '" wilt verwijderen? Dit kan niet ongedaan gemaakt worden.');
+    }}
+  </script>
 </head>
 <body>
   <h1>ONS Rooster Operatorstatus</h1>
