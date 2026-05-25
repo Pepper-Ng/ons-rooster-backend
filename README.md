@@ -2,12 +2,12 @@
 
 This repository now contains a deployable backend service for the ONS roster workflow instead of a single Raspberry Pi script.
 
-The backend is designed to run continuously as a Docker stack in Portainer. The Android app is responsible for the one-time setup flow and the SMS-based 2FA step. The backend stores the ONS login credentials securely, initiates the browser login, requests the SMS code from the phone through Firebase Cloud Messaging, and exposes operator-facing debug endpoints over HTTPS.
+The backend is designed to run continuously as a Docker stack in Portainer. The Android app is responsible for the one-time setup flow and the SMS-based 2FA step. The backend stores the ONS login credentials securely, initiates the browser login, requests the SMS code from the phone through Firebase Cloud Messaging, and exposes operator-facing debug and status endpoints over HTTPS.
 
 ## Current architecture
 
 ```text
-[Android app]
+[Android app(s)]
       │  Setup form
       │  - Backend URL
       │  - ONS login URL
@@ -16,14 +16,15 @@ The backend is designed to run continuously as a Docker stack in Portainer. The 
       ▼
 [HTTPS backend API]
       │  Stores credentials encrypted at rest
-      │  Issues device bearer token
+      │  Tracks paired devices and one active device
+      │  Issues per-device bearer tokens
       │  Starts Playwright login when setup or sync runs
       │
-      │  FCM data push: listen_sms
+      │  FCM data push: listen_sms to active device
       ▼
 [Firebase Cloud Messaging]
       ▼
-[Android phone]
+[Active Android phone]
       │  Reads incoming ONS SMS
       │  Relays the code back over HTTPS
       ▼
@@ -41,7 +42,9 @@ The backend is designed to run continuously as a Docker stack in Portainer. The 
 - The backend is now a Python package under `src/ons_backend`.
 - Credentials are stored encrypted in the persistent data directory.
 - The Android app drives the initial setup instead of editing backend source code or `.env` credentials manually.
-- The backend exposes authenticated mobile endpoints, a debug page, and a calendar endpoint.
+- The backend exposes authenticated mobile endpoints, an install page, an operator status page, a debug page, and a calendar endpoint.
+- Multiple Android devices can now be paired at once, while one device remains the active SMS/FCM target.
+- A mock HasMoves login flow is included for safe loopback testing without touching the live ONS site.
 - A Dockerfile, stack compose file, and environment template are included for Portainer.
 - Unit and end-to-end style tests are included for the backend flow without requiring real ONS credentials.
 
@@ -142,8 +145,9 @@ The backend now exposes two admin endpoints for Firebase validation:
 | Route | Purpose |
 |---|---|
 | `GET /api/v1/admin/fcm` | Returns FCM configuration diagnostics. |
-| `POST /api/v1/admin/fcm/test` | Sends a test notification to the currently paired Android device. |
+| `POST /api/v1/admin/fcm/test` | Sends a test notification to the active Android device, or to a specific paired device when `device_id` is supplied in the JSON body. |
 | `GET /install` | Shows the operator install page for uploading the Firebase admin key. |
+| `GET /status` | Shows the operator status page after admin-token login. |
 
 Both endpoints require the admin token through `?token=...` or `X-Admin-Token`.
 
@@ -163,6 +167,31 @@ curl -X POST \
 ```
 
 If the app is paired and FCM is configured correctly, the phone should receive the same lightweight notification path the backend uses after a successful login.
+
+## Operator status page
+
+The operator page is available at `/status`.
+
+It uses the same `ADMIN_TOKEN` as a lightweight web password. After login, the page stores a short-lived HTTP-only cookie and shows:
+
+- all paired devices
+- which device is currently active for SMS and auth-result pushes
+- a per-device `FCM-ping` button
+- a `Maak actief` button to switch the active device
+- a manual sync trigger
+- a mock OTP submit button for the current challenge
+- direct links to the mock HasMoves pages
+
+This page is intended for browser-based operator checks on the live HTTPS host, not for the Android app.
+
+## Mock HasMoves loopback
+
+The backend also exposes mock login pages so you can test the Playwright/login flow without hitting the real ONS website:
+
+- `/sandbox/hasmoves/login`
+- `/sandbox/hasmoves/login?mode=sms`
+
+The mock pages deliberately use generic form fields such as `username`, `password`, and `code`, so they match the existing Playwright selectors. The SMS variant accepts the fixed test code `123456` and then serves a roster page with simple date/time rows that the current fallback scraper can parse.
 
 ## Android-led setup flow
 
@@ -186,7 +215,10 @@ The app does not persist the ONS password locally after submission. The backend 
 |---|---|
 | `GET /healthz` | Basic health check. |
 | `GET /rooster.ics` | Calendar output based on the last successful scrape. |
+| `GET /status` | Operator page with paired-device overview, per-device FCM ping, and manual controls. |
 | `GET /debug` | Operator-facing HTML debug page. Optional `DEBUG_TOKEN` protection is supported. |
+| `GET /install` | Operator-facing Firebase admin key upload page. |
+| `GET /sandbox/hasmoves/login` | Mock login page for local or live loopback testing. |
 | `GET /api/v1/mobile/status` | Authenticated status endpoint for the Android app. |
 | `POST /api/v1/mobile/setup` | Android setup and credential update endpoint. |
 | `POST /api/v1/mobile/tokens/fcm` | Android FCM token refresh endpoint. |
@@ -214,9 +246,12 @@ Backend tests currently cover:
 
 - encrypted state persistence
 - snapshot and ICS persistence
+- multi-device state persistence
 - Firebase configuration diagnostics
 - authenticated mobile setup flow
 - end-to-end SMS roundtrip using fake push and fake browser clients
+- operator status-page login and per-device actions
+- mock HasMoves basic and SMS loopback flow
 - debug endpoint access control
 
 Run them with:

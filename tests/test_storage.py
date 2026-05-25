@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from ons_backend.config import AppConfig
-from ons_backend.models import AppState, LoginCredentials
+from ons_backend.models import AppState, DeviceRegistration, LoginCredentials
 from ons_backend.storage import StateStore
 
 
@@ -61,3 +61,39 @@ def test_state_store_persists_snapshot_and_ics(tmp_path):
     assert config.snapshot_file.read_text(encoding="utf-8") == "<html>snapshot</html>"
     assert store.read_ics() == b"BEGIN:VCALENDAR\nEND:VCALENDAR\n"
     assert not config.state_file.exists()
+
+
+def test_state_store_persists_multiple_devices(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    state = AppState(
+        devices=[
+            DeviceRegistration(
+                device_id="device-1",
+                device_label="Pixel",
+                fcm_token="token-1",
+                api_token_hash="hash-1",
+                created_at="2026-05-25T12:00:00Z",
+                updated_at="2026-05-25T12:00:00Z",
+                last_seen_at="2026-05-25T12:00:00Z",
+            ),
+            DeviceRegistration(
+                device_id="device-2",
+                device_label="Tablet",
+                fcm_token="token-2",
+                api_token_hash="hash-2",
+                created_at="2026-05-25T12:05:00Z",
+                updated_at="2026-05-25T12:05:00Z",
+                last_seen_at="2026-05-25T12:05:00Z",
+            ),
+        ],
+        active_device_id="device-2",
+    )
+
+    store.save(state, None)
+    loaded_state, loaded_credentials = store.load()
+
+    assert loaded_credentials is None
+    assert loaded_state.active_device_id == "device-2"
+    assert [device.device_id for device in loaded_state.devices] == ["device-1", "device-2"]
+    assert [device.device_label for device in loaded_state.devices] == ["Pixel", "Tablet"]

@@ -18,6 +18,7 @@ class FakePushClient:
     def __init__(self) -> None:
         self.listen_requests: list[str] = []
         self.auth_notifications: list[tuple[bool, str]] = []
+        self.auth_targets: list[str] = []
 
     def is_configured(self) -> bool:
         return True
@@ -26,6 +27,7 @@ class FakePushClient:
         self.listen_requests.append(challenge_id)
 
     async def send_auth_result(self, device, success: bool, message: str) -> None:
+        self.auth_targets.append(device.device_id)
         self.auth_notifications.append((success, message))
 
 
@@ -72,7 +74,7 @@ def build_config(tmp_path):
         timezone="Europe/Amsterdam",
         default_login_url="https://example.invalid/login",
         sync_interval_minutes=0,
-        sms_timeout_seconds=30,
+        sms_timeout_seconds=1,
         login_timeout_seconds=30,
         setup_secret="setup-code",
         debug_token="debug-code",
@@ -194,6 +196,114 @@ async def test_admin_fcm_status_and_test_endpoint(aiohttp_client, test_context):
     )
     assert test_response.status == 200
     assert push_client.auth_notifications[-1] == (True, "FCM testbericht")
+
+
+@pytest.mark.asyncio
+async def test_status_page_lists_devices_and_supports_actions(aiohttp_client, test_context):
+    app, service, push_client, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    first_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert first_setup.status == 200
+
+    second_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-2",
+            "device_label": "Tablet",
+        },
+    )
+    assert second_setup.status == 200
+    assert service.device_count() == 2
+
+    unauthorized = await client.get("/status")
+    assert unauthorized.status == 200
+    assert "Admin-token" in await unauthorized.text()
+
+    status_page = await client.post(
+        "/status/login",
+        data={"admin_token": "admin-code"},
+    )
+    assert status_page.status == 200
+    status_body = await status_page.text()
+    assert "ONS Rooster Operatorstatus" in status_body
+    assert "Pixel" in status_body
+    assert "Tablet" in status_body
+    assert "/sandbox/hasmoves/login?mode=sms" in status_body
+
+    devices = service.paired_devices_payload()
+    pixel_id = next(device["device_id"] for device in devices if device["device_label"] == "Pixel")
+
+    ping_response = await client.post(f"/status/devices/{pixel_id}/ping")
+    assert ping_response.status == 200
+    assert push_client.auth_targets[-1] == pixel_id
+
+    activate_response = await client.post(f"/status/devices/{pixel_id}/activate")
+    assert activate_response.status == 200
+    assert service.state.active_device_id == pixel_id
+
+
+@pytest.mark.asyncio
+async def test_mock_hasmoves_pages_cover_basic_and_sms_flow(aiohttp_client, test_context):
+    app, _, _, _ = test_context
+    client = await aiohttp_client(app)
+
+    login_page = await client.get("/sandbox/hasmoves/login?mode=sms")
+    assert login_page.status == 200
+    login_body = await login_page.text()
+    assert 'name="username"' in login_body
+    assert 'name="password"' in login_body
+
+    challenge_page = await client.post(
+        "/sandbox/hasmoves/login?mode=sms",
+        data={"username": "alice@example.invalid", "password": "secret"},
+    )
+    assert challenge_page.status == 200
+    challenge_body = await challenge_page.text()
+    assert 'name="code"' in challenge_body
+    assert "123456" in challenge_body
+
+    invalid_code = await client.post(
+        "/sandbox/hasmoves/challenge?mode=sms",
+        data={"username": "alice@example.invalid", "code": "000000"},
+    )
+    assert invalid_code.status == 400
+
+    sms_roster = await client.post(
+        "/sandbox/hasmoves/challenge?mode=sms",
+        data={"username": "alice@example.invalid", "code": "123456"},
+    )
+    assert sms_roster.status == 200
+    sms_roster_body = await sms_roster.text()
+    assert "Mock HasMoves Rooster" in sms_roster_body
+    assert "26-05-2026" in sms_roster_body
+
+    basic_roster = await client.post(
+        "/sandbox/hasmoves/login?mode=basic",
+        data={"username": "bob@example.invalid", "password": "secret"},
+    )
+    assert basic_roster.status == 200
+    basic_roster_body = await basic_roster.text()
+    assert "Mock vroege dienst voor bob@example.invalid" in basic_roster_body
 
 
 @pytest.mark.asyncio

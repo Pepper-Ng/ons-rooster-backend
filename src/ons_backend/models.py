@@ -6,6 +6,7 @@ from typing import Any
 
 @dataclass
 class DeviceRegistration:
+    device_id: str
     device_label: str
     fcm_token: str
     api_token_hash: str
@@ -15,6 +16,7 @@ class DeviceRegistration:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "device_id": self.device_id,
             "device_label": self.device_label,
             "fcm_token": self.fcm_token,
             "api_token_hash": self.api_token_hash,
@@ -26,6 +28,7 @@ class DeviceRegistration:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "DeviceRegistration":
         return cls(
+            device_id=str(data.get("device_id", "")).strip() or "legacy-device",
             device_label=data.get("device_label", ""),
             fcm_token=data.get("fcm_token", ""),
             api_token_hash=data.get("api_token_hash", ""),
@@ -154,22 +157,35 @@ class SyncState:
 
 @dataclass
 class AppState:
-    device: DeviceRegistration | None = None
+    devices: list[DeviceRegistration] = field(default_factory=list)
+    active_device_id: str | None = None
     credentials_updated_at: str | None = None
     sync: SyncState = field(default_factory=SyncState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "device": self.device.to_dict() if self.device else None,
+            "devices": [device.to_dict() for device in self.devices],
+            "active_device_id": self.active_device_id,
             "credentials_updated_at": self.credentials_updated_at,
             "sync": self.sync.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppState":
-        device_data = data.get("device")
+        devices_data = data.get("devices")
+        if devices_data is None:
+            legacy_device = data.get("device")
+            devices = [DeviceRegistration.from_dict(legacy_device)] if legacy_device else []
+        else:
+            devices = [DeviceRegistration.from_dict(device) for device in devices_data]
+
+        active_device_id = data.get("active_device_id")
+        if not active_device_id and devices:
+            active_device_id = devices[-1].device_id
+
         return cls(
-            device=DeviceRegistration.from_dict(device_data) if device_data else None,
+            devices=devices,
+            active_device_id=active_device_id,
             credentials_updated_at=data.get("credentials_updated_at"),
             sync=SyncState.from_dict(data.get("sync", {})),
         )

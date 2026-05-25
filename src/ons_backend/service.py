@@ -6,7 +6,7 @@ import hmac
 import json
 import logging
 import secrets
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -27,6 +27,7 @@ def utc_now() -> str:
 @dataclass
 class PendingChallenge:
     challenge_id: str
+    device_id: str
     created_at: str
     event: asyncio.Event
     sender: str | None = None
@@ -67,14 +68,54 @@ class BackendService:
         return self.credentials is not None
 
     def has_device(self) -> bool:
-        return self.state.device is not None
+        return bool(self.state.devices)
+
+    def device_count(self) -> int:
+        return len(self.state.devices)
+
+    def active_device(self) -> DeviceRegistration | None:
+        if not self.state.devices:
+            return None
+        if self.state.active_device_id:
+            for device in self.state.devices:
+                if device.device_id == self.state.active_device_id:
+                    return device
+        self.state.active_device_id = self.state.devices[-1].device_id
+        return self.state.devices[-1]
+
+    def device_for_mobile_token(self, token: str | None) -> DeviceRegistration | None:
+        if not token:
+            return None
+        actual = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        for device in self.state.devices:
+            if device.api_token_hash and hmac.compare_digest(device.api_token_hash, actual):
+                return device
+        return None
+
+    def device_by_id(self, device_id: str) -> DeviceRegistration | None:
+        for device in self.state.devices:
+            if device.device_id == device_id:
+                return device
+        return None
+
+    def paired_devices_payload(self) -> list[dict[str, Any]]:
+        active_device = self.active_device()
+        active_device_id = active_device.device_id if active_device else None
+        return [
+            {
+                "device_id": device.device_id,
+                "device_label": device.device_label,
+                "created_at": device.created_at,
+                "updated_at": device.updated_at,
+                "last_seen_at": device.last_seen_at,
+                "fcm_token_suffix": self._suffix(device.fcm_token),
+                "is_active": device.device_id == active_device_id,
+            }
+            for device in sorted(self.state.devices, key=lambda item: (item.updated_at, item.created_at))
+        ]
 
     def mobile_token_is_valid(self, token: str | None) -> bool:
-        if not token or not self.state.device or not self.state.device.api_token_hash:
-            return False
-        expected = self.state.device.api_token_hash
-        actual = hashlib.sha256(token.encode("utf-8")).hexdigest()
-        return hmac.compare_digest(expected, actual)
+        return self.device_for_mobile_token(token) is not None
 
     def setup_secret_is_valid(self, secret: str | None) -> bool:
         if not self.config.setup_secret:
@@ -106,27 +147,46 @@ class BackendService:
         fcm_token: str,
         device_label: str,
         rotate_api_token: bool,
+        auth_token: str | None,
     ) -> dict[str, Any]:
         issued_token: str | None = None
         now = utc_now()
+        normalized_fcm_token = fcm_token.strip()
 
         async with self._state_lock:
             # The backend issues its own bearer token so later updates do not need to resend the setup secret.
-            created = self.state.device is None
-            if created or rotate_api_token or not self.state.device or not self.state.device.api_token_hash:
+            device = self.device_for_mobile_token(auth_token)
+            if device is None:
+                device = self._device_for_fcm_token(normalized_fcm_token)
+
+            created = device is None
+            if device is None:
+                device = DeviceRegistration(
+                    device_id=secrets.token_urlsafe(10),
+                    device_label=device_label.strip() or "Android-telefoon",
+                    fcm_token=normalized_fcm_token,
+                    api_token_hash="",
+                    created_at=now,
+                    updated_at=now,
+                    last_seen_at=now,
+                )
+
+            if created or rotate_api_token or not device.api_token_hash:
                 issued_token = self._issue_mobile_token()
                 api_token_hash = hashlib.sha256(issued_token.encode("utf-8")).hexdigest()
             else:
-                api_token_hash = self.state.device.api_token_hash
+                api_token_hash = device.api_token_hash
 
-            self.state.device = DeviceRegistration(
-                device_label=device_label.strip() or "Android-telefoon",
-                fcm_token=fcm_token.strip(),
+            updated_device = replace(
+                device,
+                device_label=device_label.strip() or device.device_label or "Android-telefoon",
+                fcm_token=normalized_fcm_token,
                 api_token_hash=api_token_hash,
-                created_at=self.state.device.created_at if self.state.device else now,
                 updated_at=now,
                 last_seen_at=now,
             )
+            self._save_device(updated_device)
+            self.state.active_device_id = updated_device.device_id
             self.credentials = LoginCredentials(
                 login_url=login_url.strip() or self.config.default_login_url,
                 username=username.strip(),
@@ -148,33 +208,59 @@ class BackendService:
         }
 
     async def update_fcm_token(self, token: str, device_label: str | None = None) -> None:
+        raise RuntimeError("Gebruik update_fcm_token_for_device met een geldig app-token.")
+
+    async def update_fcm_token_for_device(
+        self,
+        auth_token: str | None,
+        token: str,
+        device_label: str | None = None,
+    ) -> None:
         async with self._state_lock:
-            if self.state.device is None:
+            device = self.device_for_mobile_token(auth_token)
+            if device is None:
                 raise RuntimeError("Er is nog geen apparaat gekoppeld.")
-            self.state.device.fcm_token = token.strip()
-            self.state.device.updated_at = utc_now()
-            self.state.device.last_seen_at = self.state.device.updated_at
+            updated_at = utc_now()
+            updated_device = replace(
+                device,
+                fcm_token=token.strip(),
+                updated_at=updated_at,
+                last_seen_at=updated_at,
+                device_label=device_label.strip() if device_label else device.device_label,
+            )
+            self._save_device(updated_device)
+            self.state.active_device_id = updated_device.device_id
             if device_label:
-                self.state.device.device_label = device_label.strip()
-            self._remember_note("De Android-app heeft het FCM-token bijgewerkt.")
+                self._remember_note(
+                    f"Het FCM-token van {updated_device.device_label} is bijgewerkt.",
+                )
+            else:
+                self._remember_note("De Android-app heeft het FCM-token bijgewerkt.")
             await asyncio.to_thread(self.store.save, self.state, self.credentials)
 
-    async def submit_sms_code(self, challenge_id: str, code: str, sender: str) -> None:
+    async def submit_sms_code(
+        self,
+        auth_token: str | None,
+        challenge_id: str,
+        code: str,
+        sender: str,
+    ) -> None:
+        device = self.device_for_mobile_token(auth_token)
+        if device is None:
+            raise RuntimeError("De app-token hoort niet bij een gekoppeld apparaat.")
+
         pending = self._pending_challenges.get(challenge_id)
         if pending is None:
             raise RuntimeError("De aangeleverde SMS-uitdaging is niet meer actief.")
+        if pending.device_id != device.device_id:
+            raise RuntimeError("Deze SMS-uitdaging hoort bij een ander gekoppeld apparaat.")
 
-        pending.sender = sender
-        pending.code = code.strip()
-        pending.event.set()
-
-        async with self._state_lock:
-            self.state.sync.last_sms_received_at = utc_now()
-            self.state.sync.last_sms_code_suffix = code.strip()[-2:] if code.strip() else None
-            self.state.sync.current_phase = "sms_received"
-            self.state.sync.last_message = "De SMS-code is ontvangen door de backend."
-            self._remember_note("De backend heeft een SMS-code van de Android-app ontvangen.")
-            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+        await self._accept_sms_code(
+            pending=pending,
+            code=code,
+            sender=sender,
+            note="De backend heeft een SMS-code van de Android-app ontvangen.",
+        )
 
     async def trigger_refresh(self, reason: str, wait: bool = False) -> dict[str, Any]:
         if self._current_sync_task is None or self._current_sync_task.done():
@@ -183,18 +269,43 @@ class BackendService:
             await self._current_sync_task
         return self.mobile_status_payload()
 
-    async def send_test_notification(self, message: str) -> None:
-        if self.state.device is None:
+    async def send_test_notification(self, message: str, device_id: str | None = None) -> None:
+        device = self.active_device() if device_id is None else self.device_by_id(device_id)
+        if device is None:
             raise RuntimeError("Er is nog geen Android-apparaat gekoppeld aan de backend.")
-        if not self.state.device.fcm_token:
+        if not device.fcm_token:
             raise RuntimeError("Er is nog geen FCM-token van de Android-app opgeslagen.")
         if not self.push_client.is_configured():
             raise RuntimeError("Firebase Cloud Messaging is nog niet correct geconfigureerd in de backend.")
 
         await self.push_client.send_auth_result(
-            self.state.device,
+            device,
             True,
             message,
+        )
+
+    async def activate_device(self, device_id: str) -> DeviceRegistration:
+        async with self._state_lock:
+            device = self.device_by_id(device_id)
+            if device is None:
+                raise RuntimeError("Het gevraagde apparaat bestaat niet meer.")
+            self.state.active_device_id = device.device_id
+            self._remember_note(f"{device.device_label} is als actief apparaat gemarkeerd.")
+            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            return device
+
+    async def submit_mock_sms_code(self, code: str = "123456", sender: str = "Mock ONS") -> None:
+        challenge_id = self.state.sync.current_challenge_id
+        if not challenge_id:
+            raise RuntimeError("Er is momenteel geen actieve SMS-uitdaging.")
+        pending = self._pending_challenges.get(challenge_id)
+        if pending is None:
+            raise RuntimeError("De actieve SMS-uitdaging is al verlopen.")
+        await self._accept_sms_code(
+            pending=pending,
+            code=code,
+            sender=sender,
+            note="De backend heeft een mock SMS-code ontvangen vanaf de statuspagina.",
         )
 
     async def install_fcm_service_account(self, raw_payload: str) -> dict[str, Any]:
@@ -216,9 +327,12 @@ class BackendService:
     def mobile_status_payload(self) -> dict[str, Any]:
         username = self.credentials.username if self.credentials else ""
         masked_username = self._mask_value(username)
+        active_device = self.active_device()
         return {
             "public_base_url": self.config.public_base_url,
-            "device_registered": self.state.device is not None,
+            "device_registered": self.has_device(),
+            "device_count": self.device_count(),
+            "active_device_label": active_device.device_label if active_device else "",
             "credentials_present": self.credentials is not None,
             "login_url": self.credentials.login_url if self.credentials else self.config.default_login_url,
             "username": masked_username,
@@ -271,9 +385,10 @@ class BackendService:
 
                 if self.credentials is None:
                     raise RuntimeError("Er zijn nog geen ONS-inloggegevens opgeslagen.")
-                if self.state.device is None:
+                active_device = self.active_device()
+                if active_device is None:
                     raise RuntimeError("Er is nog geen Android-apparaat gekoppeld.")
-                if not self.state.device.fcm_token:
+                if not active_device.fcm_token:
                     raise RuntimeError("Er is nog geen FCM-token van de Android-app bekend.")
                 if not self.push_client.is_configured():
                     raise RuntimeError(
@@ -291,13 +406,15 @@ class BackendService:
                 await self._finalize_failure(exc)
 
     async def _request_sms_code(self) -> str:
-        if self.state.device is None:
+        active_device = self.active_device()
+        if active_device is None:
             raise RuntimeError("Er is geen Android-apparaat gekoppeld voor SMS-verificatie.")
 
         # Each SMS challenge gets its own correlation identifier so retries never reuse stale codes.
         challenge_id = secrets.token_urlsafe(16)
         pending = PendingChallenge(
             challenge_id=challenge_id,
+            device_id=active_device.device_id,
             created_at=utc_now(),
             event=asyncio.Event(),
         )
@@ -313,7 +430,7 @@ class BackendService:
 
         try:
             await self.push_client.send_listen_sms(
-                self.state.device,
+                active_device,
                 challenge_id,
                 self.config.sms_timeout_seconds,
             )
@@ -373,7 +490,7 @@ class BackendService:
         while True:
             await asyncio.sleep(self.config.sync_interval_minutes * 60)
             try:
-                if self.credentials is not None and self.state.device is not None:
+                if self.credentials is not None and self.active_device() is not None:
                     await self.trigger_refresh(reason="scheduled", wait=True)
             except Exception:
                 log.exception("Scheduled sync failed.")
@@ -418,7 +535,8 @@ class BackendService:
         return secrets.token_urlsafe(32)
 
     async def _notify_auth_result(self, success: bool, message: str) -> None:
-        if self.state.device is None:
+        active_device = self.active_device()
+        if active_device is None:
             return
         if not self.push_client.is_configured():
             log.info("Skipping auth notification because Firebase Cloud Messaging is not configured.")
@@ -426,12 +544,53 @@ class BackendService:
 
         try:
             await self.push_client.send_auth_result(
-                self.state.device,
+                active_device,
                 success,
                 message,
             )
         except Exception:
             log.exception("Failed to send an auth status notification.")
+
+    async def _accept_sms_code(
+        self,
+        *,
+        pending: PendingChallenge,
+        code: str,
+        sender: str,
+        note: str,
+    ) -> None:
+        pending.sender = sender
+        pending.code = code.strip()
+        pending.event.set()
+
+        async with self._state_lock:
+            self.state.sync.last_sms_received_at = utc_now()
+            self.state.sync.last_sms_code_suffix = code.strip()[-2:] if code.strip() else None
+            self.state.sync.current_phase = "sms_received"
+            self.state.sync.last_message = "De SMS-code is ontvangen door de backend."
+            self._remember_note(note)
+            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+
+    def _device_for_fcm_token(self, fcm_token: str) -> DeviceRegistration | None:
+        for device in self.state.devices:
+            if device.fcm_token == fcm_token:
+                return device
+        return None
+
+    def _save_device(self, updated_device: DeviceRegistration) -> None:
+        for index, device in enumerate(self.state.devices):
+            if device.device_id == updated_device.device_id:
+                self.state.devices[index] = updated_device
+                return
+        self.state.devices.append(updated_device)
+
+    @staticmethod
+    def _suffix(value: str, size: int = 12) -> str:
+        if not value:
+            return ""
+        if len(value) <= size:
+            return value
+        return value[-size:]
 
     @staticmethod
     def _mask_value(value: str) -> str:
