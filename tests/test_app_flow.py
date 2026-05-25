@@ -261,6 +261,13 @@ async def test_status_page_lists_devices_and_supports_actions(aiohttp_client, te
     assert activate_response.status == 200
     assert service.state.active_device_id == pixel_id
 
+    remove_response = await client.post(f"/status/devices/{pixel_id}/remove")
+    assert remove_response.status == 200
+    assert service.device_count() == 1
+    assert service.device_by_id(pixel_id) is None
+    assert service.active_device() is not None
+    assert service.active_device().device_label == "Tablet"
+
 
 @pytest.mark.asyncio
 async def test_mock_hasmoves_pages_cover_basic_and_sms_flow(aiohttp_client, test_context):

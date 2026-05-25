@@ -54,6 +54,7 @@ def create_app(
     app.router.add_post("/status/challenges/mock-sms", handle_status_mock_sms)
     app.router.add_post("/status/devices/{device_id}/activate", handle_status_activate_device)
     app.router.add_post("/status/devices/{device_id}/ping", handle_status_ping_device)
+    app.router.add_post("/status/devices/{device_id}/remove", handle_status_remove_device)
     app.router.add_get("/sandbox/hasmoves/login", handle_mock_login_page)
     app.router.add_post("/sandbox/hasmoves/login", handle_mock_login_submit)
     app.router.add_post("/sandbox/hasmoves/challenge", handle_mock_challenge_submit)
@@ -353,6 +354,15 @@ async def handle_status_ping_device(request: web.Request) -> web.Response:
     except Exception as exc:
         raise _status_redirect(error=str(exc))
     raise _status_redirect(f"FCM-ping is verzonden naar {device.device_label}.")
+
+
+async def handle_status_remove_device(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    try:
+        device = await _service(request.app).remove_device(request.match_info["device_id"])
+    except Exception as exc:
+        raise _status_redirect(error=str(exc))
+    raise _status_redirect(f"{device.device_label} is verwijderd.")
 
 
 async def handle_mock_login_page(request: web.Request) -> web.Response:
@@ -669,6 +679,9 @@ def _render_status_page(
               <form method="post" action="/status/devices/{html.escape(device['device_id'])}/activate">
                 <button type="submit"{' disabled' if device['is_active'] else ''}>Maak actief</button>
               </form>
+                            <form method="post" action="/status/devices/{html.escape(device['device_id'])}/remove">
+                                <button type="submit" class="danger">Verwijder</button>
+                            </form>
             </div>
           </td>
         </tr>
@@ -691,6 +704,7 @@ def _render_status_page(
     form {{ display: inline; }}
     .actions {{ display: flex; gap: 0.5rem; flex-wrap: wrap; }}
     button {{ border: 0; border-radius: 999px; padding: 0.6rem 0.95rem; background: #0f766e; color: white; cursor: pointer; }}
+    button.danger {{ background: #b91c1c; }}
     button[disabled] {{ opacity: 0.55; cursor: not-allowed; }}
     .flash {{ border-radius: 10px; padding: 0.85rem 1rem; font-weight: 600; margin-bottom: 1rem; }}
     .flash-ok {{ background: #dcfce7; color: #166534; }}

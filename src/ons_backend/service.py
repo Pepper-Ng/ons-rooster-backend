@@ -238,6 +238,23 @@ class BackendService:
                 self._remember_note("De Android-app heeft het FCM-token bijgewerkt.")
             await asyncio.to_thread(self.store.save, self.state, self.credentials)
 
+    async def remove_device(self, device_id: str) -> DeviceRegistration:
+        async with self._state_lock:
+            device = self.device_by_id(device_id)
+            if device is None:
+                raise RuntimeError("Het opgegeven apparaat bestaat niet meer.")
+
+            self.state.devices = [item for item in self.state.devices if item.device_id != device_id]
+            if self.state.active_device_id == device_id:
+                self.state.active_device_id = self.state.devices[-1].device_id if self.state.devices else None
+
+            if not self.state.devices:
+                self._pending_challenges.clear()
+
+            self._remember_note(f"Het gekoppelde apparaat {device.device_label} is verwijderd.")
+            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+            return device
+
     async def submit_sms_code(
         self,
         auth_token: str | None,
