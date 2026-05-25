@@ -5,6 +5,9 @@ build/
 dist/
 *.egg-info/
 data/
+firebase_key.json
+*firebase*.json
+secrets/
 *.pyc
 *.pyo
 *.pyd

@@ -47,12 +47,24 @@ class AppConfig:
         return self.data_dir / "state.json"
 
     @property
+    def secret_key_file(self) -> Path:
+        return self.data_dir / "secret.key"
+
+    @property
     def snapshot_file(self) -> Path:
         return self.data_dir / "last-auth.html"
 
     @property
     def ics_file(self) -> Path:
         return self.data_dir / "rooster.ics"
+
+    @property
+    def managed_fcm_service_account_file(self) -> Path:
+        return self.data_dir / "firebase-adminsdk.json.enc"
+
+    @property
+    def managed_fcm_upload_enabled(self) -> bool:
+        return not self.fcm_service_account_json and self.fcm_service_account_file is None
 
     @classmethod
     def from_env(cls) -> "AppConfig":

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import secrets
 from dataclasses import asdict, dataclass
@@ -11,7 +12,7 @@ from typing import Any
 
 from icalendar import Calendar, Event
 
-from .clients import AutomationClient, PushClient
+from .clients import AutomationClient, FcmPushClient, PushClient
 from .config import AppConfig
 from .models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, RosterItem
 from .storage import StateStore
@@ -182,6 +183,36 @@ class BackendService:
             await self._current_sync_task
         return self.mobile_status_payload()
 
+    async def send_test_notification(self, message: str) -> None:
+        if self.state.device is None:
+            raise RuntimeError("Er is nog geen Android-apparaat gekoppeld aan de backend.")
+        if not self.state.device.fcm_token:
+            raise RuntimeError("Er is nog geen FCM-token van de Android-app opgeslagen.")
+        if not self.push_client.is_configured():
+            raise RuntimeError("Firebase Cloud Messaging is nog niet correct geconfigureerd in de backend.")
+
+        await self.push_client.send_auth_result(
+            self.state.device,
+            True,
+            message,
+        )
+
+    async def install_fcm_service_account(self, raw_payload: str) -> dict[str, Any]:
+        if not self.config.managed_fcm_upload_enabled:
+            raise RuntimeError(
+                "De uploadpagina is uitgeschakeld omdat Firebase al via de stack-configuratie wordt beheerd."
+            )
+
+        info = FcmPushClient.validate_service_account_json(raw_payload)
+        normalized_payload = json.dumps(info, indent=2, ensure_ascii=True)
+
+        async with self._state_lock:
+            await asyncio.to_thread(self.store.write_managed_fcm_service_account, normalized_payload)
+            self._remember_note("De Firebase-beheersleutel is via de installatiepagina bijgewerkt.")
+            await asyncio.to_thread(self.store.save, self.state, self.credentials)
+
+        return FcmPushClient(self.config).diagnostics()
+
     def mobile_status_payload(self) -> dict[str, Any]:
         username = self.credentials.username if self.credentials else ""
         masked_username = self._mask_value(username)
@@ -315,12 +346,10 @@ class BackendService:
             await asyncio.to_thread(self.store.save, self.state, self.credentials)
             await asyncio.to_thread(self.store.write_ics, self._generate_ical())
 
-        if self.state.device is not None:
-            await self.push_client.send_auth_result(
-                self.state.device,
-                True,
-                "De backend is aangemeld en klaar voor synchronisatie.",
-            )
+        await self._notify_auth_result(
+            True,
+            "De backend is aangemeld en klaar voor synchronisatie.",
+        )
 
     async def _finalize_failure(self, exc: Exception) -> None:
         log.exception("Backend sync failed.", exc_info=exc)
@@ -335,12 +364,10 @@ class BackendService:
             self._remember_note(f"De backend-synchronisatie is mislukt: {exc}")
             await asyncio.to_thread(self.store.save, self.state, self.credentials)
 
-        if self.state.device is not None:
-            await self.push_client.send_auth_result(
-                self.state.device,
-                False,
-                f"De backend kon de aanmelding niet afronden: {exc}",
-            )
+        await self._notify_auth_result(
+            False,
+            f"De backend kon de aanmelding niet afronden: {exc}",
+        )
 
     async def _scheduler_loop(self) -> None:
         while True:
@@ -389,6 +416,22 @@ class BackendService:
 
     def _issue_mobile_token(self) -> str:
         return secrets.token_urlsafe(32)
+
+    async def _notify_auth_result(self, success: bool, message: str) -> None:
+        if self.state.device is None:
+            return
+        if not self.push_client.is_configured():
+            log.info("Skipping auth notification because Firebase Cloud Messaging is not configured.")
+            return
+
+        try:
+            await self.push_client.send_auth_result(
+                self.state.device,
+                success,
+                message,
+            )
+        except Exception:
+            log.exception("Failed to send an auth status notification.")
 
     @staticmethod
     def _mask_value(value: str) -> str:

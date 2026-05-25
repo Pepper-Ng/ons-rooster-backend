@@ -6,12 +6,13 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 import google.auth.transport.requests
 import google.oauth2.service_account
 import requests
 from bs4 import BeautifulSoup
+from cryptography.fernet import Fernet, InvalidToken
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
 
@@ -57,14 +58,73 @@ class FcmPushClient:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
 
-    def is_configured(self) -> bool:
-        return bool(
-            self.config.fcm_project_id
-            and (
-                self.config.fcm_service_account_json
-                or (self.config.fcm_service_account_file and self.config.fcm_service_account_file.exists())
+    @staticmethod
+    def validate_service_account_json(raw_payload: str) -> dict[str, Any]:
+        try:
+            info = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Het geuploade Firebase-bestand is geen geldige JSON.") from exc
+
+        if not isinstance(info, dict):
+            raise RuntimeError("Het geuploade Firebase-bestand moet een JSON-object bevatten.")
+
+        if str(info.get("type", "")).strip() != "service_account":
+            raise RuntimeError("Het geuploade bestand is geen Firebase service-account JSON.")
+
+        missing = [
+            field_name
+            for field_name in ("project_id", "client_email", "private_key")
+            if not str(info.get(field_name, "")).strip()
+        ]
+        if missing:
+            raise RuntimeError(
+                "De Firebase-sleutel mist verplichte velden: " + ", ".join(missing)
             )
+
+        return info
+
+    def diagnostics(self) -> dict[str, Any]:
+        service_account_path = self._diagnostic_service_account_path()
+        file_exists = bool(
+            self.config.fcm_service_account_file and self.config.fcm_service_account_file.exists()
         )
+        if not file_exists and self.config.managed_fcm_upload_enabled:
+            file_exists = self.config.managed_fcm_service_account_file.exists()
+        using_inline_json = bool(self.config.fcm_service_account_json)
+
+        try:
+            project_id = self.project_id()
+            config_error = ""
+        except Exception as exc:
+            project_id = ""
+            config_error = str(exc)
+
+        return {
+            "configured": self.is_configured(),
+            "project_id": project_id,
+            "service_account_path": service_account_path,
+            "service_account_file_exists": file_exists,
+            "service_account_source": self._service_account_source(),
+            "using_inline_json": using_inline_json,
+            "installer_available": self.config.managed_fcm_upload_enabled,
+            "config_error": config_error,
+        }
+
+    def project_id(self) -> str:
+        if self.config.fcm_project_id:
+            return self.config.fcm_project_id
+
+        info = self._load_service_account_info()
+        project_id = str(info.get("project_id", "")).strip()
+        if not project_id:
+            raise RuntimeError("The Firebase service account does not contain a project_id.")
+        return project_id
+
+    def is_configured(self) -> bool:
+        try:
+            return bool(self.project_id() and self._has_service_account_source())
+        except Exception:
+            return False
 
     async def send_listen_sms(
         self,
@@ -116,7 +176,7 @@ class FcmPushClient:
         credentials = self._load_credentials()
         credentials.refresh(google.auth.transport.requests.Request())
         response = requests.post(
-            f"https://fcm.googleapis.com/v1/projects/{self.config.fcm_project_id}/messages:send",
+            f"https://fcm.googleapis.com/v1/projects/{self.project_id()}/messages:send",
             headers={
                 "Authorization": f"Bearer {credentials.token}",
                 "Content-Type": "application/json",
@@ -128,17 +188,63 @@ class FcmPushClient:
 
     def _load_credentials(self) -> google.oauth2.service_account.Credentials:
         scopes = ["https://www.googleapis.com/auth/firebase.messaging"]
-        if self.config.fcm_service_account_json:
-            return google.oauth2.service_account.Credentials.from_service_account_info(
-                json.loads(self.config.fcm_service_account_json),
-                scopes=scopes,
-            )
-
-        assert self.config.fcm_service_account_file is not None
-        return google.oauth2.service_account.Credentials.from_service_account_file(
-            str(self.config.fcm_service_account_file),
+        return google.oauth2.service_account.Credentials.from_service_account_info(
+            self._load_service_account_info(),
             scopes=scopes,
         )
+
+    def _has_service_account_source(self) -> bool:
+        return bool(
+            self.config.fcm_service_account_json
+            or (self.config.fcm_service_account_file and self.config.fcm_service_account_file.exists())
+            or self.config.managed_fcm_service_account_file.exists()
+        )
+
+    def _load_service_account_info(self) -> dict[str, Any]:
+        if self.config.fcm_service_account_json:
+            return self.validate_service_account_json(self.config.fcm_service_account_json)
+
+        if self.config.fcm_service_account_file:
+            if not self.config.fcm_service_account_file.exists():
+                raise RuntimeError("Het geconfigureerde Firebase service-account bestand bestaat niet.")
+            return self.validate_service_account_json(
+                self.config.fcm_service_account_file.read_text(encoding="utf-8")
+            )
+
+        if self.config.managed_fcm_service_account_file.exists():
+            encrypted_payload = self.config.managed_fcm_service_account_file.read_text(encoding="utf-8")
+            try:
+                raw_payload = Fernet(self._resolve_storage_key()).decrypt(
+                    encrypted_payload.encode("utf-8")
+                ).decode("utf-8")
+            except InvalidToken as exc:
+                raise RuntimeError("De opgeslagen Firebase-sleutel kon niet worden ontsleuteld.") from exc
+            return self.validate_service_account_json(raw_payload)
+
+        raise RuntimeError("Er is nog geen Firebase service-account bron geconfigureerd.")
+
+    def _diagnostic_service_account_path(self) -> str:
+        if self.config.fcm_service_account_json:
+            return ""
+        if self.config.fcm_service_account_file:
+            return str(self.config.fcm_service_account_file)
+        return str(self.config.managed_fcm_service_account_file)
+
+    def _service_account_source(self) -> str:
+        if self.config.fcm_service_account_json:
+            return "inline_json"
+        if self.config.fcm_service_account_file is not None:
+            return "configured_file"
+        if self.config.managed_fcm_service_account_file.exists():
+            return "uploaded_file"
+        return "none"
+
+    def _resolve_storage_key(self) -> bytes:
+        if self.config.storage_key:
+            return self.config.storage_key.encode("utf-8")
+        if self.config.secret_key_file.exists():
+            return self.config.secret_key_file.read_bytes().strip()
+        raise RuntimeError("De opslagcode voor de Firebase-sleutel ontbreekt.")
 
 
 class NoopPushClient:

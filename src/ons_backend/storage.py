@@ -58,17 +58,24 @@ class StateStore:
             return None
         return self.config.ics_file.read_bytes()
 
+    def write_managed_fcm_service_account(self, content: str) -> None:
+        encrypted = self._fernet.encrypt(content.encode("utf-8")).decode("utf-8")
+        self._write_atomic(self.config.managed_fcm_service_account_file, encrypted)
+        self._set_owner_only_permissions(self.config.managed_fcm_service_account_file)
+
     def _resolve_key(self) -> bytes:
         if self.config.storage_key:
             return self.config.storage_key.encode("utf-8")
 
-        key_path = self.config.data_dir / "secret.key"
+        key_path = self.config.secret_key_file
         if key_path.exists():
+            self._set_owner_only_permissions(key_path)
             return key_path.read_bytes().strip()
 
         # A generated key is written once when the stack starts without an injected key.
         key = Fernet.generate_key()
         key_path.write_bytes(key)
+        self._set_owner_only_permissions(key_path)
         return key
 
     @staticmethod
@@ -84,3 +91,11 @@ class StateStore:
             handle.write(content)
             temp_name = handle.name
         Path(temp_name).replace(path)
+
+    @staticmethod
+    def _set_owner_only_permissions(path: Path) -> None:
+        try:
+            path.chmod(0o600)
+        except OSError:
+            # Permission tightening is best-effort because Windows and container mounts vary.
+            pass

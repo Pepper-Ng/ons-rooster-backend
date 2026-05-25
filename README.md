@@ -60,6 +60,9 @@ On Windows PowerShell, use the virtual environment under `.venv\Scripts\Activate
 ## Docker and Portainer deployment
 
 The repository root contains `docker-compose.yml` for a Git-backed Portainer stack.
+The repository also contains `docker-compose.portainer.secrets.yml`, which is intended as an additional Portainer file when you want to bind-mount the Firebase admin key from the Docker host.
+
+For standalone installs that do not want to touch Portainer stack secrets at all, the backend also exposes an authenticated install page at `/install` that can accept a Firebase admin SDK JSON upload over HTTPS.
 
 ### Service defaults
 
@@ -85,6 +88,7 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `ADMIN_TOKEN` | Optional token for `POST /api/v1/admin/refresh`. |
 | `STORAGE_KEY` | Optional pre-generated Fernet key. If omitted, one is generated in the data volume. |
 | `FCM_PROJECT_ID` | Firebase project ID used for FCM pushes. |
+| `FCM_SERVICE_ACCOUNT_HOST_PATH` | Host path for the admin SDK JSON when using `docker-compose.portainer.secrets.yml`. |
 | `FCM_SERVICE_ACCOUNT_FILE` | Optional path to a mounted Firebase service account JSON file. |
 | `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
 | `POST_LOGIN_URL` | Optional URL to open immediately after login. |
@@ -98,6 +102,67 @@ Use either:
 
 - `FCM_SERVICE_ACCOUNT_FILE` with a mounted file on the Portainer host, or
 - `FCM_SERVICE_ACCOUNT_JSON` as a stack environment value.
+
+There is now a third option for one-off standalone installs:
+
+- upload the Firebase admin SDK JSON through `https://<your-backend>/install`
+
+The safest option on the current standalone Docker host is the mounted file approach. The backend can now derive the Firebase project id directly from the service account JSON, so the admin key file is usually the only secret you need.
+
+### Recommended Portainer workflow for the Firebase admin key
+
+1. Copy the Firebase admin SDK JSON to the Docker host, outside git, for example:
+      - `/opt/ons-rooster/secrets/firebase-adminsdk.json`
+2. Restrict its permissions on the Docker host:
+      - `chmod 600 /opt/ons-rooster/secrets/firebase-adminsdk.json`
+3. In the Portainer stack, add `docker-compose.portainer.secrets.yml` as an additional file.
+4. Set the stack environment value `FCM_SERVICE_ACCOUNT_HOST_PATH=/opt/ons-rooster/secrets/firebase-adminsdk.json`.
+5. Redeploy the stack.
+
+This keeps the private key out of git and out of the Portainer stack JSON itself.
+
+Use `FCM_SERVICE_ACCOUNT_JSON` only as a fallback when you cannot place a file on the Docker host. It works, but it is less secure because the secret is stored directly in Portainer stack configuration.
+
+### Install page upload flow
+
+The `/install` page accepts a Firebase admin SDK JSON file over HTTPS and stores it in `DATA_DIR` as an encrypted blob. The backend reuses the same `STORAGE_KEY` or generated `secret.key` that already protects the saved login credentials, so a redeploy is not required after upload.
+
+Use this when:
+
+- you want to avoid editing Portainer stack variables for the Firebase key
+- the backend already has a persistent data volume
+- you have an admin token and can open the page over HTTPS
+
+Use the bind-mounted file approach when you want the clearest operational separation between the app container and the Firebase key material.
+
+### FCM diagnostics and test endpoint
+
+The backend now exposes two admin endpoints for Firebase validation:
+
+| Route | Purpose |
+|---|---|
+| `GET /api/v1/admin/fcm` | Returns FCM configuration diagnostics. |
+| `POST /api/v1/admin/fcm/test` | Sends a test notification to the currently paired Android device. |
+| `GET /install` | Shows the operator install page for uploading the Firebase admin key. |
+
+Both endpoints require the admin token through `?token=...` or `X-Admin-Token`.
+
+Example diagnostics check:
+
+```bash
+curl "https://onsrooster.stefhermans.nl/api/v1/admin/fcm?token=<admin-token>"
+```
+
+Example test notification:
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -d '{"message":"Testmelding vanaf de backend."}' \
+  "https://onsrooster.stefhermans.nl/api/v1/admin/fcm/test?token=<admin-token>"
+```
+
+If the app is paired and FCM is configured correctly, the phone should receive the same lightweight notification path the backend uses after a successful login.
 
 ## Android-led setup flow
 
@@ -149,6 +214,7 @@ Backend tests currently cover:
 
 - encrypted state persistence
 - snapshot and ICS persistence
+- Firebase configuration diagnostics
 - authenticated mobile setup flow
 - end-to-end SMS roundtrip using fake push and fake browser clients
 - debug endpoint access control
