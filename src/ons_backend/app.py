@@ -869,7 +869,7 @@ def _render_mock_login_page(public_base_url: str, mode: str) -> str:
     <form method="post" action="/sandbox/hasmoves/login?mode={html.escape(mode)}">
       <label>
         <span>Gebruikersnaam</span>
-        <input type="email" name="username" autocomplete="username" required>
+                <input type="text" name="username" autocomplete="username" required>
       </label>
       <label>
         <span>Wachtwoord</span>

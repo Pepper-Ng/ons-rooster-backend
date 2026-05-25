@@ -270,12 +270,12 @@ async def test_mock_hasmoves_pages_cover_basic_and_sms_flow(aiohttp_client, test
     login_page = await client.get("/sandbox/hasmoves/login?mode=sms")
     assert login_page.status == 200
     login_body = await login_page.text()
-    assert 'name="username"' in login_body
+    assert 'type="text" name="username"' in login_body
     assert 'name="password"' in login_body
 
     challenge_page = await client.post(
         "/sandbox/hasmoves/login?mode=sms",
-        data={"username": "alice@example.invalid", "password": "secret"},
+        data={"username": "fcm-test", "password": "secret"},
     )
     assert challenge_page.status == 200
     challenge_body = await challenge_page.text()
@@ -284,13 +284,13 @@ async def test_mock_hasmoves_pages_cover_basic_and_sms_flow(aiohttp_client, test
 
     invalid_code = await client.post(
         "/sandbox/hasmoves/challenge?mode=sms",
-        data={"username": "alice@example.invalid", "code": "000000"},
+        data={"username": "fcm-test", "code": "000000"},
     )
     assert invalid_code.status == 400
 
     sms_roster = await client.post(
         "/sandbox/hasmoves/challenge?mode=sms",
-        data={"username": "alice@example.invalid", "code": "123456"},
+        data={"username": "fcm-test", "code": "123456"},
     )
     assert sms_roster.status == 200
     sms_roster_body = await sms_roster.text()
