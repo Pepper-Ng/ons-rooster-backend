@@ -598,8 +598,8 @@ async def handle_sms_code(request: web.Request) -> web.Response:
 async def handle_refresh(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     service = _service(request.app)
-    status = await service.trigger_refresh(reason="manual", wait=False)
-    return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": status})
+    await service.trigger_refresh(reason="manual", wait=False)
+    return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": service.operator_status_payload()})
 
 
 async def handle_admin_status(request: web.Request) -> web.Response:

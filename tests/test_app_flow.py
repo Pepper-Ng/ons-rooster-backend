@@ -270,6 +270,7 @@ async def test_status_query_token_bootstraps_cookie_for_followup_actions(aiohttp
     assert refresh_response.status == 200
     refresh_payload = await refresh_response.json()
     assert refresh_payload["message"] == "De handmatige synchronisatie is gestart."
+    assert set(["status", "devices", "portals"]).issubset(refresh_payload["status"].keys())
 
     websocket = await client.ws_connect("/status/live")
     initial_message = await websocket.receive(timeout=1.0)
