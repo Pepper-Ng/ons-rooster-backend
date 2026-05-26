@@ -253,6 +253,32 @@ async def test_status_page_embeds_parseable_initial_snapshot_json(aiohttp_client
 
 
 @pytest.mark.asyncio
+async def test_status_query_token_bootstraps_cookie_for_followup_actions(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    page_response = await client.get("/status?token=admin-code")
+    assert page_response.status == 200
+    assert page_response.cookies.get("ons_status_session") is not None
+
+    refresh_response = await client.post("/api/v1/admin/refresh")
+    assert refresh_response.status == 200
+    refresh_payload = await refresh_response.json()
+    assert refresh_payload["message"] == "De handmatige synchronisatie is gestart."
+
+    websocket = await client.ws_connect("/status/live")
+    initial_message = await websocket.receive(timeout=1.0)
+    initial_payload = json.loads(initial_message.data)
+    assert set(["status", "devices", "portals"]).issubset(initial_payload.keys())
+    await websocket.close()
+
+
+@pytest.mark.asyncio
 async def test_admin_device_actions_return_updated_status_snapshot(aiohttp_client, test_context):
     app, service, _, _ = test_context
 

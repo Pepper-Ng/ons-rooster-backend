@@ -211,7 +211,7 @@ async def handle_install_page(request: web.Request) -> web.Response:
     authorized = _ops_is_authorized(request)
     diagnostics = _fcm_diagnostics(request.app) if authorized else None
     error = request.query.get("error") if authorized else None
-    return _render_install_response(
+    response = _render_install_response(
         request.app,
         diagnostics=diagnostics,
         message=request.query.get("message"),
@@ -219,6 +219,8 @@ async def handle_install_page(request: web.Request) -> web.Response:
         status=200 if authorized else 401,
         authorized=authorized,
     )
+    _maybe_set_ops_session_cookie(request, response, authorized=authorized)
+    return response
 
 
 async def handle_install_upload(request: web.Request) -> web.Response:
@@ -292,13 +294,15 @@ async def handle_status_page(request: web.Request) -> web.Response:
             status=401 if request.query.get("error") else 200,
         )
 
-    return _render_status_page(
+    response = _render_status_page(
         request.app,
         authorized=True,
         message=request.query.get("message"),
         error=request.query.get("error"),
         status=200,
     )
+    _maybe_set_ops_session_cookie(request, response, authorized=True)
+    return response
 
 
 async def handle_status_login(request: web.Request) -> web.Response:
@@ -592,10 +596,8 @@ async def handle_sms_code(request: web.Request) -> web.Response:
 
 
 async def handle_refresh(request: web.Request) -> web.Response:
-    token = request.headers.get("X-Admin-Token") or request.query.get("token")
+    _require_ops_auth(request)
     service = _service(request.app)
-    if not service.admin_token_is_valid(token):
-        raise web.HTTPUnauthorized(text="Ongeldig admin-token.")
     status = await service.trigger_refresh(reason="manual", wait=False)
     return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": status})
 
@@ -770,6 +772,24 @@ def _ops_is_authorized(request: web.Request) -> bool:
 
 def _ops_session_value(config: AppConfig) -> str:
     return hashlib.sha256(f"ons-status-session:{config.admin_token}".encode("utf-8")).hexdigest()
+
+
+def _maybe_set_ops_session_cookie(request: web.Request, response: web.StreamResponse, *, authorized: bool) -> None:
+    if not authorized:
+        return
+
+    token = request.query.get("token")
+    if not _service(request.app).admin_token_is_valid(token):
+        return
+
+    response.set_cookie(
+        OPS_SESSION_COOKIE,
+        _ops_session_value(request.app["config"]),
+        secure=request.url.scheme == "https",
+        httponly=True,
+        samesite="Strict",
+        path="/",
+    )
 
 
 def _require_ops_auth(request: web.Request) -> None:
