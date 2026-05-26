@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 
 import pytest
 from aiohttp import FormData
@@ -231,6 +232,76 @@ async def test_mobile_config_and_admin_portals_support_portal_id_setup(aiohttp_c
     assert service.credentials is not None
     assert service.credentials.portal_id == portal_id
     assert service.mobile_status_payload()["login_url"] == "https://demo.example.invalid/login"
+
+
+@pytest.mark.asyncio
+async def test_status_page_embeds_parseable_initial_snapshot_json(aiohttp_client, test_context):
+    app, _, _, _ = test_context
+    client = await aiohttp_client(app)
+
+    response = await client.get("/status?token=admin-code")
+    assert response.status == 200
+    html = await response.text()
+
+    match = re.search(r'<script id="initial-status-json" type="application/json">(.*?)</script>', html, re.S)
+    assert match is not None
+    raw_payload = match.group(1)
+    assert "&quot;" not in raw_payload
+
+    payload = json.loads(raw_payload)
+    assert set(["status", "devices", "portals"]).issubset(payload.keys())
+
+
+@pytest.mark.asyncio
+async def test_admin_device_actions_return_updated_status_snapshot(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    first_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel A",
+        },
+    )
+    assert first_setup.status == 200
+    first_device_id = (await first_setup.json())["status"]["device_id"]
+
+    second_setup = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-2",
+            "device_label": "Pixel B",
+        },
+    )
+    assert second_setup.status == 200
+    second_device_id = (await second_setup.json())["status"]["device_id"]
+
+    activate_response = await client.post(f"/api/v1/admin/devices/{first_device_id}/activate?token=admin-code")
+    assert activate_response.status == 200
+    activate_payload = await activate_response.json()
+    devices_by_id = {item["device_id"]: item for item in activate_payload["status"]["devices"]}
+    assert devices_by_id[first_device_id]["is_active"] is True
+    assert devices_by_id[second_device_id]["is_active"] is False
+
+    remove_response = await client.delete(f"/api/v1/admin/devices/{second_device_id}?token=admin-code")
+    assert remove_response.status == 200
+    remove_payload = await remove_response.json()
+    assert remove_payload["device_id"] == second_device_id
+    assert [item["device_id"] for item in remove_payload["status"]["devices"]] == [first_device_id]
 
 
 @pytest.mark.asyncio

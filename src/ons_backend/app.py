@@ -611,7 +611,12 @@ async def handle_admin_mock_sms(request: web.Request) -> web.Response:
         await _service(request.app).submit_mock_sms_code(code=MOCK_SMS_CODE)
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
-    return web.json_response({"message": f"Mock OTP {MOCK_SMS_CODE} is ingestuurd."})
+    return web.json_response(
+        {
+            "message": f"Mock OTP {MOCK_SMS_CODE} is ingestuurd.",
+            "status": _service(request.app).operator_status_payload(),
+        }
+    )
 
 
 async def handle_admin_activate_device(request: web.Request) -> web.Response:
@@ -620,7 +625,12 @@ async def handle_admin_activate_device(request: web.Request) -> web.Response:
         device = await _service(request.app).activate_device(request.match_info["device_id"])
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
-    return web.json_response({"message": f"{device.device_label} is nu het actieve apparaat."})
+    return web.json_response(
+        {
+            "message": f"{device.device_label} is nu het actieve apparaat.",
+            "status": _service(request.app).operator_status_payload(),
+        }
+    )
 
 
 async def handle_admin_ping_device(request: web.Request) -> web.Response:
@@ -635,7 +645,12 @@ async def handle_admin_ping_device(request: web.Request) -> web.Response:
         await service.send_test_notification(message, device_id=device.device_id)
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
-    return web.json_response({"message": f"FCM-ping is verzonden naar {device.device_label}."})
+    return web.json_response(
+        {
+            "message": f"FCM-ping is verzonden naar {device.device_label}.",
+            "status": service.operator_status_payload(),
+        }
+    )
 
 
 async def handle_admin_remove_device(request: web.Request) -> web.Response:
@@ -644,7 +659,13 @@ async def handle_admin_remove_device(request: web.Request) -> web.Response:
         device = await _service(request.app).remove_device(request.match_info["device_id"])
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
-    return web.json_response({"message": f"{device.device_label} is verwijderd.", "device_id": device.device_id})
+    return web.json_response(
+        {
+            "message": f"{device.device_label} is verwijderd.",
+            "device_id": device.device_id,
+            "status": _service(request.app).operator_status_payload(),
+        }
+    )
 
 
 async def handle_admin_portal_upsert(request: web.Request) -> web.Response:
@@ -873,7 +894,7 @@ def _render_status_page(
     )
 
     selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
-    initial_snapshot_json = html.escape(json.dumps(status_snapshot, ensure_ascii=True))
+    initial_snapshot_json = json.dumps(status_snapshot, ensure_ascii=True).replace("</", "<\\/")
 
     body = f"""
 <!doctype html>
@@ -917,15 +938,20 @@ def _render_status_page(
         .status-chip {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.9rem; font-weight: 600; background: #e2e8f0; color: #0f172a; }}
         .status-chip.online {{ background: #dcfce7; color: #166534; }}
         .status-chip.paired {{ background: #dbeafe; color: #1d4ed8; }}
+        .section-note {{ margin: 0 0 0.85rem; color: #475569; max-width: 52rem; }}
+        .portal-manager {{ display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 1rem; align-items: start; }}
         .portal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.85rem; }}
         .portal-card {{ border: 1px solid #e2e8f0; border-radius: 16px; padding: 1rem; background: #fcfdfd; }}
         .portal-card-header {{ display: flex; justify-content: space-between; gap: 1rem; align-items: flex-start; margin-bottom: 0.85rem; }}
         .portal-card-header p {{ margin: 0; word-break: break-word; color: #475569; font-size: 0.92rem; }}
         .portal-card img, .portal-logo-placeholder {{ width: 64px; height: 64px; border-radius: 14px; background: #f1f5f9; object-fit: contain; padding: 0.35rem; flex: 0 0 auto; }}
         .portal-logo-placeholder {{ display: inline-flex; align-items: center; justify-content: center; font-size: 0.75rem; color: #64748b; text-align: center; }}
+        .portal-editor {{ border: 1px solid #d8e5ea; border-radius: 16px; background: #f8fbfc; padding: 1rem; }}
+        .portal-editor h3 {{ margin: 0 0 0.75rem; }}
         .portal-form-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
         .portal-form-actions {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
         .challenge-note {{ margin: 0; color: #475569; }}
+        @media (max-width: 900px) {{ .portal-manager {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
 </head>
@@ -935,7 +961,7 @@ def _render_status_page(
             <img class="brand-mark" src="{ONS_BRAND_LOGO_DATA_URI}" alt="ONS logo">
             <h1>ONS Rooster Operatorstatus</h1>
             <p>De pagina luistert live mee met backendwijzigingen. Nieuwe koppelingen, verwijderingen, statusfases en OTP-verzoeken verschijnen automatisch zonder handmatige refresh.</p>
-            <span id="live-indicator" class="live-pill">Live updates verbinden...</span>
+            <span id="live-indicator" class="live-pill">Operatorpagina verbinden...</span>
         </div>
     </div>
     <div id="flash-host">{flash}</div>
@@ -952,7 +978,7 @@ def _render_status_page(
         <div id="overview-grid" class="overview-grid">
             <div class="overview-card"><strong>Backend-URL</strong><span>{html.escape(status_payload['public_base_url'])}</span></div>
             <div class="overview-card"><strong>Inlogpagina</strong><span>{html.escape(status_payload['login_url'])}</span></div>
-            <div class="overview-card"><strong>Status badge</strong><div class="status-duo"><span class="status-chip {'online' if devices and any(device['is_connected'] for device in devices) else ''}">{'Verbonden' if devices and any(device['is_connected'] for device in devices) else 'Niet live verbonden'}</span><span class="status-chip {'paired' if status_payload['device_registered'] else ''}">{'Gekoppeld' if status_payload['device_registered'] else 'Niet gekoppeld'}</span></div></div>
+            <div class="overview-card"><strong>Appstatus</strong><div class="status-duo"><span class="status-chip {'online' if devices and any(device['is_connected'] for device in devices) else ''}">{'Verbonden' if devices and any(device['is_connected'] for device in devices) else 'Geen live appverbinding'}</span><span class="status-chip {'paired' if status_payload['device_registered'] else ''}">{'Gekoppeld' if status_payload['device_registered'] else 'Niet gekoppeld'}</span></div></div>
             <div class="overview-card"><strong>Actief apparaat</strong><span>{html.escape(status_payload['active_device_label'] or '-')}</span></div>
             <div class="overview-card"><strong>Aantal apparaten</strong><span>{status_payload['device_count']}</span></div>
             <div class="overview-card"><strong>FCM geconfigureerd</strong><span>{diagnostics['configured']}</span></div>
@@ -964,6 +990,7 @@ def _render_status_page(
   </section>
   <section>
     <h2>Gekoppelde apparaten</h2>
+        <p class="section-note">Het actieve apparaat ontvangt de eerstvolgende verificatievraag wanneer meerdere gekoppelde apparaten beschikbaar zijn.</p>
     <table>
       <thead>
                 <tr><th>Label</th><th>Device-ID</th><th>FCM suffix</th><th>Laatst gezien</th><th>Verbonden</th><th>Actief</th><th>Acties</th></tr>
@@ -978,33 +1005,33 @@ def _render_status_page(
         <div class="actions"><button type="button" id="btn-mock-sms">Vul mock OTP {MOCK_SMS_CODE} in</button></div>
     </section>
     <section>
-        <h2>Portalen</h2>
-        <p>Deze portalen worden centraal beheerd door de backend. De Android-app toont alleen de naam en het logo; de URL blijft daar buiten beeld.</p>
-        <div id="portal-list" class="portal-grid">{portal_cards}</div>
-    </section>
-    <section>
-        <h2>Portaal wijzigen of toevoegen</h2>
-        <form id="portal-form" action="/api/v1/admin/portals" method="post">
-            <input type="hidden" id="portal_id" name="portal_id" value="{html.escape(selected_portal['portal_id'] if selected_portal else '')}">
-            <div class="portal-form-grid">
-                <label>
-                    <span>Naam</span>
-                    <input type="text" id="portal_name" name="name" value="{html.escape(selected_portal['name'] if selected_portal else '')}" required>
-                </label>
-                <label>
-                    <span>Login-URL</span>
-                    <input type="url" id="portal_login_url" name="login_url" value="{html.escape(selected_portal['login_url'] if selected_portal else '')}" required>
-                </label>
-                <label>
-                    <span>Logo-URL</span>
-                    <input type="url" id="portal_logo_url" name="logo_url" value="{html.escape(selected_portal['logo_url'] if selected_portal else '')}">
-                </label>
-            </div>
-            <div class="portal-form-actions">
-                <button type="submit">Portaal opslaan</button>
-                <button type="button" id="btn-portal-reset">Nieuw portaal</button>
-            </div>
-        </form>
+        <h2>Portalen beheren</h2>
+        <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
+        <div class="portal-manager">
+            <form id="portal-form" class="portal-editor" action="/api/v1/admin/portals" method="post">
+                <h3 id="portal-form-heading">{'Portaal wijzigen' if selected_portal else 'Nieuw portaal toevoegen'}</h3>
+                <input type="hidden" id="portal_id" name="portal_id" value="{html.escape(selected_portal['portal_id'] if selected_portal else '')}">
+                <div class="portal-form-grid">
+                    <label>
+                        <span>Naam</span>
+                        <input type="text" id="portal_name" name="name" value="{html.escape(selected_portal['name'] if selected_portal else '')}" required>
+                    </label>
+                    <label>
+                        <span>Login-URL</span>
+                        <input type="url" id="portal_login_url" name="login_url" value="{html.escape(selected_portal['login_url'] if selected_portal else '')}" required>
+                    </label>
+                    <label>
+                        <span>Logo-URL</span>
+                        <input type="url" id="portal_logo_url" name="logo_url" value="{html.escape(selected_portal['logo_url'] if selected_portal else '')}">
+                    </label>
+                </div>
+                <div class="portal-form-actions">
+                    <button type="submit">Portaal opslaan</button>
+                    <button type="button" id="btn-portal-reset">Nieuw portaal</button>
+                </div>
+            </form>
+            <div id="portal-list" class="portal-grid">{portal_cards}</div>
+        </div>
     </section>
   <section>
     <h2>Mock HasMoves testflow</h2>
@@ -1024,6 +1051,7 @@ def _render_status_page(
         const challengeIdLine = document.getElementById('challenge-id-line');
         const portalList = document.getElementById('portal-list');
         const portalForm = document.getElementById('portal-form');
+        const portalFormHeading = document.getElementById('portal-form-heading');
         const portalIdInput = document.getElementById('portal_id');
         const portalNameInput = document.getElementById('portal_name');
         const portalLoginUrlInput = document.getElementById('portal_login_url');
@@ -1056,6 +1084,7 @@ def _render_status_page(
             portalNameInput.value = '';
             portalLoginUrlInput.value = '';
             portalLogoUrlInput.value = '';
+            portalFormHeading.textContent = 'Nieuw portaal toevoegen';
         }}
 
         function fillPortalForm(portal) {{
@@ -1063,6 +1092,22 @@ def _render_status_page(
             portalNameInput.value = portal.name || '';
             portalLoginUrlInput.value = portal.login_url || '';
             portalLogoUrlInput.value = portal.logo_url || '';
+            portalFormHeading.textContent = portal.name ? `Portaal wijzigen: ${{portal.name}}` : 'Portaal wijzigen';
+        }}
+
+        function syncPortalForm(snapshot) {{
+            if (!portalIdInput.value) {{
+                portalFormHeading.textContent = 'Nieuw portaal toevoegen';
+                return;
+            }}
+
+            const currentPortal = snapshot.portals.find((portal) => portal.portal_id === portalIdInput.value);
+            if (currentPortal) {{
+                fillPortalForm(currentPortal);
+                return;
+            }}
+
+            clearPortalForm();
         }}
 
         function renderOverview(snapshot) {{
@@ -1071,7 +1116,7 @@ def _render_status_page(
             overviewGrid.innerHTML = `
                 <div class="overview-card"><strong>Backend-URL</strong><span>${{escapeHtml(status.public_base_url)}}</span></div>
                 <div class="overview-card"><strong>Inlogpagina</strong><span>${{escapeHtml(status.login_url)}}</span></div>
-                <div class="overview-card"><strong>Status badge</strong><div class="status-duo"><span class="status-chip ${{anyConnected ? 'online' : ''}}">${{anyConnected ? 'Verbonden' : 'Niet live verbonden'}}</span><span class="status-chip ${{status.device_registered ? 'paired' : ''}}">${{status.device_registered ? 'Gekoppeld' : 'Niet gekoppeld'}}</span></div></div>
+                <div class="overview-card"><strong>Appstatus</strong><div class="status-duo"><span class="status-chip ${{anyConnected ? 'online' : ''}}">${{anyConnected ? 'Verbonden' : 'Geen live appverbinding'}}</span><span class="status-chip ${{status.device_registered ? 'paired' : ''}}">${{status.device_registered ? 'Gekoppeld' : 'Niet gekoppeld'}}</span></div></div>
                 <div class="overview-card"><strong>Actief apparaat</strong><span>${{escapeHtml(status.active_device_label || '-')}}</span></div>
                 <div class="overview-card"><strong>Aantal apparaten</strong><span>${{snapshot.devices.length}}</span></div>
                 <div class="overview-card"><strong>FCM geconfigureerd</strong><span>${{snapshot.fcm_configured ? 'Ja' : 'Nee'}}</span></div>
@@ -1145,10 +1190,18 @@ def _render_status_page(
             renderDevices(snapshot);
             renderChallenge(snapshot);
             renderPortals(snapshot);
+            syncPortalForm(snapshot);
+        }}
+
+        function applyStatusPayload(response) {{
+            if (response?.status) {{
+                render(response.status);
+            }}
         }}
 
         async function callJson(url, options = {{}}) {{
             const response = await fetch(url, {{
+                credentials: 'same-origin',
                 headers: {{ 'Accept': 'application/json', ...(options.body ? {{ 'Content-Type': 'application/json' }} : {{}}) }},
                 ...options,
             }});
@@ -1172,18 +1225,18 @@ def _render_status_page(
                 return;
             }}
 
-            liveIndicator.textContent = 'Live updates verbinden...';
+            liveIndicator.textContent = 'Operatorpagina verbinden...';
             liveIndicator.className = 'live-pill retrying';
             socket = new WebSocket(liveUrl);
             socket.addEventListener('open', () => {{
-                liveIndicator.textContent = 'Live updates actief';
+                liveIndicator.textContent = 'Operatorpagina live';
                 liveIndicator.className = 'live-pill live';
             }});
             socket.addEventListener('message', (event) => {{
                 render(JSON.parse(event.data));
             }});
             socket.addEventListener('close', () => {{
-                liveIndicator.textContent = 'Live updates onderbroken, opnieuw verbinden...';
+                liveIndicator.textContent = 'Operatorpagina tijdelijk onderbroken, opnieuw verbinden...';
                 liveIndicator.className = 'live-pill retrying';
                 reconnectHandle = window.setTimeout(connectLive, 2000);
             }});
@@ -1195,6 +1248,7 @@ def _render_status_page(
         document.getElementById('btn-refresh-sync').addEventListener('click', async () => {{
             try {{
                 const response = await callJson('/api/v1/admin/refresh', {{ method: 'POST' }});
+                applyStatusPayload(response);
                 setFlash('ok', response.message || 'Synchronisatie gestart.');
             }} catch (error) {{
                 setFlash('error', error.message);
@@ -1204,6 +1258,7 @@ def _render_status_page(
         document.getElementById('btn-mock-sms').addEventListener('click', async () => {{
             try {{
                 const response = await callJson('/api/v1/admin/challenges/mock-sms', {{ method: 'POST' }});
+                applyStatusPayload(response);
                 setFlash('ok', response.message || 'Mock OTP ingestuurd.');
             }} catch (error) {{
                 setFlash('error', error.message);
@@ -1233,6 +1288,7 @@ def _render_status_page(
 
             try {{
                 const response = await callJson(url, {{ method }});
+                applyStatusPayload(response);
                 setFlash('ok', response.message || 'Actie uitgevoerd.');
             }} catch (error) {{
                 setFlash('error', error.message);
@@ -1260,9 +1316,7 @@ def _render_status_page(
 
             try {{
                 const response = await callJson('/api/v1/admin/portals/' + portalId, {{ method: 'DELETE' }});
-                if (portalIdInput.value === portalId) {{
-                    clearPortalForm();
-                }}
+                applyStatusPayload(response);
                 setFlash('ok', response.message || 'Portaal verwijderd.');
             }} catch (error) {{
                 setFlash('error', error.message);
@@ -1281,6 +1335,10 @@ def _render_status_page(
                         logo_url: portalLogoUrlInput.value,
                     }}),
                 }});
+                if (response.portal) {{
+                    fillPortalForm(response.portal);
+                }}
+                applyStatusPayload(response);
                 setFlash('ok', response.message || 'Portaal opgeslagen.');
             }} catch (error) {{
                 setFlash('error', error.message);
