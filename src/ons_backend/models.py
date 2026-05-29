@@ -142,6 +142,8 @@ class SyncState:
     html_snapshot_path: str | None = None
     roster_items: list[RosterItem] = field(default_factory=list)
     debug_notes: list[str] = field(default_factory=list)
+    auth_trace_run_id: str | None = None
+    auth_trace: list[dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,6 +165,8 @@ class SyncState:
             "html_snapshot_path": self.html_snapshot_path,
             "roster_items": [item.to_dict() for item in self.roster_items],
             "debug_notes": list(self.debug_notes),
+            "auth_trace_run_id": self.auth_trace_run_id,
+            "auth_trace": list(self.auth_trace),
         }
 
     @classmethod
@@ -186,6 +190,8 @@ class SyncState:
             html_snapshot_path=data.get("html_snapshot_path"),
             roster_items=[RosterItem.from_dict(item) for item in data.get("roster_items", [])],
             debug_notes=list(data.get("debug_notes", [])),
+            auth_trace_run_id=data.get("auth_trace_run_id"),
+            auth_trace=list(data.get("auth_trace", [])),
         )
 
 

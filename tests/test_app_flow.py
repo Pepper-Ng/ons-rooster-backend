@@ -36,7 +36,20 @@ class FakeAutomationClient:
     def __init__(self) -> None:
         self.received_codes: list[str] = []
 
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config):
+    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
+        if report_progress is not None:
+            await report_progress(
+                {
+                    "entry_id": "step-001",
+                    "created_at": "2026-05-30T00:00:00Z",
+                    "label": "Fake auth start",
+                    "message": "De fake client is gestart.",
+                    "phase": "fake_start",
+                    "url": credentials.login_url,
+                    "page_title": "Fake Login",
+                    "snapshot_name": "001-fake-auth-start.html",
+                }
+            )
         code = await request_sms_code()
         self.received_codes.append(code)
         snapshot_path.write_text("<html>ok</html>", encoding="utf-8")
@@ -57,8 +70,21 @@ class FakeAutomationClient:
 
 
 class FakeCheckpointAutomationClient:
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config):
+    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
         del credentials, request_sms_code, config
+        if report_progress is not None:
+            await report_progress(
+                {
+                    "entry_id": "step-001",
+                    "created_at": "2026-05-30T00:00:00Z",
+                    "label": "OTP challenge detected",
+                    "message": "De fake checkpoint client heeft een OTP-pagina gevonden.",
+                    "phase": "otp_detected",
+                    "url": "https://example.invalid/two_factor",
+                    "page_title": "OTP",
+                    "snapshot_name": "001-otp-challenge-detected.html",
+                }
+            )
         snapshot_path.write_text(
             "<html><head><title>OTP</title></head><body><form action='/verify_token' method='post'><input type='hidden' name='_csrf_token' value='otp-csrf'><input type='text' name='token'></form></body></html>",
             encoding="utf-8",
@@ -440,6 +466,7 @@ async def test_http_login_automation_client_captures_otp_checkpoint(aiohttp_clie
     client = await aiohttp_client(app)
     automation_client = HttpLoginAutomationClient()
     snapshot_path = tmp_path / "otp-snapshot.html"
+    progress_events: list[dict[str, object]] = []
 
     result = await automation_client.authenticate_and_scrape(
         credentials=LoginCredentials(
@@ -450,6 +477,7 @@ async def test_http_login_automation_client_captures_otp_checkpoint(aiohttp_clie
         request_sms_code=unexpected_sms_request,
         snapshot_path=snapshot_path,
         config=build_config(tmp_path),
+        report_progress=lambda event: asyncio.sleep(0, result=progress_events.append(event)),
     )
 
     assert result.auth_ready is False
@@ -459,6 +487,9 @@ async def test_http_login_automation_client_captures_otp_checkpoint(aiohttp_clie
         "/sandbox/hasmoves/challenge?mode=sms"
     )
     assert "Mock HasMoves OTP" in snapshot_path.read_text(encoding="utf-8")
+    assert any(event["phase"] == "credential_response" for event in progress_events)
+    assert any(event["phase"] == "otp_detected" for event in progress_events)
+    assert sorted(path.name for path in (tmp_path / "auth-trace").glob("*.html"))
 
 
 @pytest.mark.asyncio
@@ -467,6 +498,7 @@ async def test_http_login_automation_client_scrapes_basic_roster(aiohttp_client,
     client = await aiohttp_client(app)
     automation_client = HttpLoginAutomationClient()
     snapshot_path = tmp_path / "basic-roster.html"
+    progress_events: list[dict[str, object]] = []
 
     result = await automation_client.authenticate_and_scrape(
         credentials=LoginCredentials(
@@ -477,12 +509,52 @@ async def test_http_login_automation_client_scrapes_basic_roster(aiohttp_client,
         request_sms_code=unexpected_sms_request,
         snapshot_path=snapshot_path,
         config=build_config(tmp_path),
+        report_progress=lambda event: asyncio.sleep(0, result=progress_events.append(event)),
     )
 
     assert result.auth_ready is True
     assert result.session_checkpoint is None
     assert any("bob@example.invalid" in item.description for item in result.roster_items)
     assert "Mock HasMoves Rooster" in snapshot_path.read_text(encoding="utf-8")
+    assert any(event["phase"] == "ready" for event in progress_events)
+
+
+@pytest.mark.asyncio
+async def test_status_page_renders_auth_console(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=FakeCheckpointAutomationClient(),
+    )
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert response.status == 200
+
+    await wait_for(lambda: service.mobile_status_payload()["sync"]["current_phase"] == "otp_required")
+
+    status_page = await client.post(
+        "/status/login",
+        data={"admin_token": "admin-code"},
+    )
+    assert status_page.status == 200
+    body = await status_page.text()
+    assert "Authenticatieconsole" in body
+    assert "Bekijk HTML" in body
 
 
 @pytest.mark.asyncio

@@ -55,6 +55,10 @@ class AppConfig:
         return self.data_dir / "last-auth.html"
 
     @property
+    def auth_trace_dir(self) -> Path:
+        return self.data_dir / "auth-trace"
+
+    @property
     def auth_session_file(self) -> Path:
         return self.data_dir / "auth-session.json.enc"
 

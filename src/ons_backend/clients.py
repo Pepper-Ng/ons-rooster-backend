@@ -52,6 +52,7 @@ class AutomationClient(Protocol):
         request_sms_code: Callable[[], Awaitable[str]],
         snapshot_path: Path,
         config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AuthenticationResult:
         ...
 
@@ -300,7 +301,9 @@ class PlaywrightAutomationClient:
         request_sms_code: Callable[[], Awaitable[str]],
         snapshot_path: Path,
         config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AuthenticationResult:
+        del report_progress
         debug_notes: list[str] = []
         login_url = credentials.login_url or config.default_login_url
 
@@ -328,6 +331,8 @@ class PlaywrightAutomationClient:
                 if not await self._wait_for_ready_state(page, login_url, config.login_timeout_seconds):
                     body_text = await page.locator("body").inner_text()
                     snippet = " ".join(body_text.split())[:240]
+                    html = await page.content()
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
                     raise RuntimeError(
                         "The backend could not confirm a successful ONS login. "
                         f"Last page snippet: {snippet}"
@@ -474,13 +479,23 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         request_sms_code: Callable[[], Awaitable[str]],
         snapshot_path: Path,
         config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
     ) -> AuthenticationResult:
         del request_sms_code
+        loop = asyncio.get_running_loop()
+
+        def sync_progress(event: dict[str, Any]) -> None:
+            if report_progress is None:
+                return
+            future = asyncio.run_coroutine_threadsafe(report_progress(event), loop)
+            future.result(timeout=max(config.login_timeout_seconds, 5))
+
         return await asyncio.to_thread(
             self._authenticate_sync,
             credentials,
             snapshot_path,
             config,
+            sync_progress,
         )
 
     def _authenticate_sync(
@@ -488,9 +503,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         credentials: LoginCredentials,
         snapshot_path: Path,
         config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
     ) -> AuthenticationResult:
         debug_notes: list[str] = []
         login_url = credentials.login_url or config.default_login_url
+        trace_index = 1
 
         with requests.Session() as session:
             session.headers.update(
@@ -507,6 +524,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             )
             login_response.raise_for_status()
             debug_notes.append(f"Opened login page {login_response.url}.")
+            trace_index = self._record_response_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="Open login page",
+                message=f"De backend heeft de inlogpagina geopend op {login_response.url}.",
+                phase="login_opened",
+                response=login_response,
+            )
 
             csrf_token = self._resolve_csrf_token(
                 session,
@@ -514,6 +541,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 config.login_timeout_seconds,
                 debug_notes,
             )
+            if csrf_token:
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Resolve CSRF",
+                    message="De backend heeft een CSRF-token voor de eerste loginstap opgehaald.",
+                    phase="csrf_resolved",
+                    url=login_response.url,
+                )
+                trace_index += 1
             login_form = self._extract_login_form(login_response.url, login_response.text)
             submit_url = (
                 login_form["action_url"]
@@ -526,6 +563,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             submit_payload["password"] = credentials.password
             if csrf_token:
                 submit_payload["_csrf_token"] = csrf_token
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Submit credentials",
+                message=f"De backend heeft de credential-POST voorbereid voor {submit_url}.",
+                phase="credentials_submitted",
+                url=submit_url,
+            )
+            trace_index += 1
 
             submit_response = session.post(
                 submit_url,
@@ -539,6 +585,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             )
             debug_notes.extend(self._redirect_notes(submit_response.history))
             debug_notes.append(f"Submitted credentials and landed on {submit_response.url}.")
+            trace_index = self._record_response_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="Credential response",
+                message=f"De backend heeft de antwoordpagina na credential-submit ontvangen op {submit_response.url}.",
+                phase="credential_response",
+                response=submit_response,
+            )
 
             html = submit_response.text
             page_title = self._extract_page_title(html)
@@ -548,6 +604,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 snapshot_path.write_text(html, encoding="utf-8")
                 debug_notes.append(
                     f"OTP challenge detected at {challenge['action_url']}."
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="OTP challenge detected",
+                    message=f"De backend heeft een OTP-pagina gevonden op {challenge['action_url']}.",
+                    phase="otp_detected",
+                    url=submit_response.url,
+                    page_title=page_title,
                 )
                 return AuthenticationResult(
                     final_url=submit_response.url,
@@ -566,9 +631,33 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
 
             login_error = self._extract_login_error(submit_response, html)
             if login_error:
+                snapshot_path.write_text(html, encoding="utf-8")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Login error",
+                    message=login_error,
+                    phase="login_error",
+                    url=submit_response.url,
+                    page_title=page_title,
+                    snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, "login-error", html),
+                    status_code=submit_response.status_code,
+                )
                 raise RuntimeError(login_error)
 
             if self._response_still_looks_like_login(submit_response.url, html, login_url):
+                snapshot_path.write_text(html, encoding="utf-8")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Login still pending",
+                    message="De backend kwam terug op een pagina die nog steeds op de loginflow lijkt.",
+                    phase="login_unconfirmed",
+                    url=submit_response.url,
+                    page_title=page_title,
+                    snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, "login-unconfirmed", html),
+                    status_code=submit_response.status_code,
+                )
                 raise RuntimeError(
                     "De backend kon niet bevestigen dat de ingevoerde ONS-gegevens zijn geaccepteerd. "
                     f"Laatste pagina: {self._text_snippet(html)}"
@@ -590,12 +679,31 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 debug_notes.append(
                     f"Navigated to the configured post-login page {page_response.url}."
                 )
+                trace_index = self._record_response_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Post-login navigation",
+                    message=f"De backend heeft de ingestelde post-login pagina geopend op {page_response.url}.",
+                    phase="post_login_page",
+                    response=page_response,
+                )
 
             snapshot_path.write_text(html, encoding="utf-8")
             roster_items, extraction_notes = self._extract_roster_items(html)
             debug_notes.extend(extraction_notes)
             debug_notes.append(
                 f"Detected {len(roster_items)} roster-like entries on the last page."
+            )
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Authentication ready",
+                message=f"De backend heeft de loginflow afgerond en {len(roster_items)} roosterregels gedetecteerd.",
+                phase="ready",
+                url=page_response.url,
+                page_title=page_title,
             )
 
             return AuthenticationResult(
@@ -809,6 +917,81 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     def _origin_for(url: str) -> str:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
+
+    @staticmethod
+    def _utc_timestamp() -> str:
+        return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _trace_entry_id(trace_index: int) -> str:
+        return f"step-{trace_index:03d}"
+
+    def _record_response_step(
+        self,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        *,
+        config: AppConfig,
+        snapshot_path: Path,
+        trace_index: int,
+        label: str,
+        message: str,
+        phase: str,
+        response: requests.Response,
+    ) -> int:
+        html = response.text or ""
+        snapshot_path.write_text(html, encoding="utf-8")
+        self._record_event(
+            report_progress,
+            trace_index=trace_index,
+            label=label,
+            message=message,
+            phase=phase,
+            url=response.url,
+            page_title=self._extract_page_title(html),
+            snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, label, html),
+            status_code=response.status_code,
+        )
+        return trace_index + 1
+
+    def _record_event(
+        self,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        *,
+        trace_index: int,
+        label: str,
+        message: str,
+        phase: str,
+        url: str,
+        page_title: str = "",
+        snapshot_name: str = "",
+        status_code: int | None = None,
+    ) -> None:
+        if report_progress is None:
+            return
+        report_progress(
+            {
+                "entry_id": self._trace_entry_id(trace_index),
+                "created_at": self._utc_timestamp(),
+                "label": label,
+                "message": message,
+                "phase": phase,
+                "url": url,
+                "page_title": page_title,
+                "snapshot_name": snapshot_name,
+                "status_code": status_code,
+            }
+        )
+
+    @staticmethod
+    def _slugify_trace_label(label: str) -> str:
+        normalized = re.sub(r"[^a-z0-9]+", "-", label.strip().lower())
+        return normalized.strip("-") or "step"
+
+    def _write_trace_snapshot(self, trace_dir: Path, trace_index: int, label: str, html: str) -> str:
+        trace_dir.mkdir(parents=True, exist_ok=True)
+        file_name = f"{trace_index:03d}-{self._slugify_trace_label(label)}.html"
+        (trace_dir / file_name).write_text(html, encoding="utf-8")
+        return file_name
 
     @staticmethod
     def _text_snippet(html: str, limit: int = 240) -> str:

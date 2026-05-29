@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import secrets
+import shutil
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -444,8 +445,11 @@ class BackendService:
                 "last_sms_code_suffix": self.state.sync.last_sms_code_suffix,
                 "last_final_url": self.state.sync.last_final_url,
                 "last_page_title": self.state.sync.last_page_title,
+                "html_snapshot_path": self.state.sync.html_snapshot_path,
                 "roster_count": len(self.state.sync.roster_items),
                 "debug_notes": list(self.state.sync.debug_notes),
+                "auth_trace_run_id": self.state.sync.auth_trace_run_id,
+                "auth_trace": self.auth_trace_payload(),
             },
         }
 
@@ -561,6 +565,38 @@ class BackendService:
             return None
         return await asyncio.to_thread(self.config.snapshot_file.read_text, encoding="utf-8")
 
+    async def auth_trace_snapshot_html(self, entry_id: str) -> str | None:
+        entry = next((item for item in self.state.sync.auth_trace if item.get("entry_id") == entry_id), None)
+        if entry is None:
+            return None
+        snapshot_name = str(entry.get("snapshot_name", "")).strip()
+        if not snapshot_name:
+            return None
+        snapshot_path = self.config.auth_trace_dir / snapshot_name
+        if not snapshot_path.exists():
+            return None
+        return await asyncio.to_thread(snapshot_path.read_text, encoding="utf-8")
+
+    def auth_trace_payload(self) -> list[dict[str, Any]]:
+        payload: list[dict[str, Any]] = []
+        for item in self.state.sync.auth_trace:
+            payload.append(
+                {
+                    "entry_id": item.get("entry_id", ""),
+                    "created_at": item.get("created_at", ""),
+                    "label": item.get("label", ""),
+                    "message": item.get("message", ""),
+                    "phase": item.get("phase", ""),
+                    "url": item.get("url", ""),
+                    "page_title": item.get("page_title", ""),
+                    "status_code": item.get("status_code"),
+                    "has_snapshot": bool(item.get("snapshot_name")),
+                    "snapshot_path": f"/status/auth-trace/{item.get('entry_id', '')}" if item.get("snapshot_name") else "",
+                    "debug_snapshot_path": f"/debug/auth-trace/{item.get('entry_id', '')}" if item.get("snapshot_name") else "",
+                }
+            )
+        return payload
+
     async def _run_sync(self, reason: str) -> None:
         async with self._sync_lock:
             try:
@@ -572,8 +608,12 @@ class BackendService:
                     self.state.sync.last_attempt_at = utc_now()
                     self.state.sync.last_error = None
                     self.state.sync.last_message = "De backend is gestart met een nieuwe aanmeldpoging."
+                    self.state.sync.auth_trace_run_id = secrets.token_urlsafe(8)
+                    self.state.sync.auth_trace = []
                     self._remember_note("Er is een nieuwe backend-synchronisatie gestart.")
                     await self._persist_state()
+
+                await asyncio.to_thread(self._reset_auth_trace_dir)
 
                 if self.credentials is None:
                     raise RuntimeError("Er zijn nog geen ONS-inloggegevens opgeslagen.")
@@ -594,10 +634,37 @@ class BackendService:
                     request_sms_code=self._request_sms_code,
                     snapshot_path=self.config.snapshot_file,
                     config=self.config,
+                    report_progress=self._record_auth_trace_event,
                 )
                 await self._finalize_success(result)
             except Exception as exc:
                 await self._finalize_failure(exc)
+
+    async def _record_auth_trace_event(self, event: dict[str, Any]) -> None:
+        entry = {
+            "entry_id": str(event.get("entry_id", "")).strip(),
+            "created_at": str(event.get("created_at", utc_now())),
+            "label": str(event.get("label", "")).strip(),
+            "message": str(event.get("message", "")).strip(),
+            "phase": str(event.get("phase", "")).strip(),
+            "url": str(event.get("url", "")).strip(),
+            "page_title": str(event.get("page_title", "")).strip(),
+            "snapshot_name": str(event.get("snapshot_name", "")).strip(),
+            "status_code": event.get("status_code"),
+        }
+
+        async with self._state_lock:
+            self.state.sync.auth_trace.append(entry)
+            self.state.sync.auth_trace = self.state.sync.auth_trace[-80:]
+            if entry["message"]:
+                self.state.sync.last_message = entry["message"]
+            if entry["phase"]:
+                self.state.sync.current_phase = entry["phase"]
+            if entry["url"]:
+                self.state.sync.last_final_url = entry["url"]
+            if entry["page_title"]:
+                self.state.sync.last_page_title = entry["page_title"]
+            await self._persist_state()
 
     async def _request_sms_code(self) -> str:
         active_device = self.active_device()
@@ -821,6 +888,11 @@ class BackendService:
     async def _persist_state(self) -> None:
         await asyncio.to_thread(self.store.save, self.state, self.credentials)
         await self._publish_live_update()
+
+    def _reset_auth_trace_dir(self) -> None:
+        if self.config.auth_trace_dir.exists():
+            shutil.rmtree(self.config.auth_trace_dir)
+        self.config.auth_trace_dir.mkdir(parents=True, exist_ok=True)
 
     async def _publish_live_update(self) -> None:
         async with self._live_condition:

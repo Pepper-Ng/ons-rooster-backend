@@ -53,6 +53,7 @@ def create_app(
     app.router.add_get("/status", handle_status_page)
     app.router.add_post("/status/login", handle_status_login)
     app.router.add_post("/status/logout", handle_status_logout)
+    app.router.add_get("/status/auth-trace/{entry_id}", handle_status_auth_trace)
     app.router.add_post("/status/refresh", handle_status_refresh)
     app.router.add_post("/status/challenges/mock-sms", handle_status_mock_sms)
     app.router.add_post("/status/devices/{device_id}/activate", handle_status_activate_device)
@@ -333,6 +334,24 @@ async def handle_status_logout(request: web.Request) -> web.Response:
     response = web.HTTPSeeOther(location="/status")
     response.del_cookie(OPS_SESSION_COOKIE, path="/")
     raise response
+
+
+async def handle_status_auth_trace(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    snapshot = await _service(request.app).auth_trace_snapshot_html(request.match_info["entry_id"])
+    if snapshot is None:
+        raise web.HTTPNotFound(text="Er is geen HTML-snapshot voor deze authenticatiestap opgeslagen.")
+
+    return web.Response(
+        text=(
+            "<!doctype html><html lang='nl'><head><meta charset='utf-8'><title>Authenticatiesnapshot</title>"
+            "<style>body { font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; } "
+            "pre { white-space: pre-wrap; word-break: break-word; background: #0f172a; color: white; padding: 1rem; border-radius: 10px; }</style>"
+            "</head><body><p><a href='/status'>Terug naar operatorstatus</a></p>"
+            f"<pre>{html.escape(snapshot[:12000])}</pre></body></html>"
+        ),
+        content_type="text/html",
+    )
 
 
 async def handle_status_refresh(request: web.Request) -> web.Response:
@@ -971,6 +990,11 @@ def _render_status_page(
         .portal-form-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
         .portal-form-actions {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
         .challenge-note {{ margin: 0; color: #475569; }}
+        .console-shell {{ background: #0f172a; color: #e2e8f0; border-radius: 16px; padding: 1rem; font: 0.92rem/1.55 Consolas, "Courier New", monospace; max-height: 420px; overflow: auto; margin-bottom: 1rem; }}
+        .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
+        .console-line:last-child {{ border-bottom: 0; }}
+        .console-meta {{ color: #93c5fd; margin-right: 0.5rem; }}
+        .trace-table a {{ color: #0f766e; }}
         @media (max-width: 900px) {{ .portal-manager {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
@@ -1025,6 +1049,17 @@ def _render_status_page(
         <div class="actions"><button type="button" id="btn-mock-sms">Vul mock OTP {MOCK_SMS_CODE} in</button></div>
     </section>
     <section>
+        <h2>Authenticatieconsole</h2>
+        <p class="section-note">Deze live console toont iedere backend-stap tijdens de aanmeldflow. HTML-snapshots van individuele stappen zijn direct te openen.</p>
+        <div id="auth-console" class="console-shell"></div>
+        <table class="trace-table">
+            <thead>
+                <tr><th>Tijd</th><th>Fase</th><th>Stap</th><th>URL</th><th>Snapshot</th></tr>
+            </thead>
+            <tbody id="auth-trace-body"><tr><td colspan="5">Nog geen authenticatiestappen vastgelegd.</td></tr></tbody>
+        </table>
+    </section>
+    <section>
         <h2>Portalen beheren</h2>
         <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
         <div class="portal-manager">
@@ -1070,6 +1105,8 @@ def _render_status_page(
         const challengeSection = document.getElementById('challenge-section');
         const challengeIdLine = document.getElementById('challenge-id-line');
         const portalList = document.getElementById('portal-list');
+        const authConsole = document.getElementById('auth-console');
+        const authTraceBody = document.getElementById('auth-trace-body');
         const portalForm = document.getElementById('portal-form');
         const portalFormHeading = document.getElementById('portal-form-heading');
         const portalIdInput = document.getElementById('portal_id');
@@ -1204,11 +1241,38 @@ def _render_status_page(
                 </article>`).join('');
         }}
 
+        function renderAuthTrace(snapshot) {{
+            const entries = snapshot.status.sync.auth_trace || [];
+            if (!entries.length) {{
+                authConsole.innerHTML = '<div class="console-line">Nog geen authenticatiestappen vastgelegd.</div>';
+                authTraceBody.innerHTML = '<tr><td colspan="5">Nog geen authenticatiestappen vastgelegd.</td></tr>';
+                return;
+            }}
+
+            authConsole.innerHTML = entries.map((entry) => `
+                <div class="console-line">
+                    <span class="console-meta">[${{escapeHtml(formatTimestamp(entry.created_at))}}] ${{escapeHtml(entry.phase || '-')}}</span>
+                    <strong>${{escapeHtml(entry.label || '-')}}</strong>
+                    <span> - ${{escapeHtml(entry.message || '-')}}</span>
+                </div>`).join('');
+            authConsole.scrollTop = authConsole.scrollHeight;
+
+            authTraceBody.innerHTML = entries.map((entry) => `
+                <tr>
+                    <td>${{escapeHtml(formatTimestamp(entry.created_at))}}</td>
+                    <td>${{escapeHtml(entry.phase || '-')}}</td>
+                    <td>${{escapeHtml(entry.label || '-')}}</td>
+                    <td>${{entry.url ? `<a href="${{escapeHtml(entry.url)}}" target="_blank" rel="noreferrer">${{escapeHtml(entry.url)}}</a>` : '-'}}</td>
+                    <td>${{entry.snapshot_path ? `<a href="${{escapeHtml(entry.snapshot_path)}}" target="_blank" rel="noreferrer">Bekijk HTML</a>` : '-'}}</td>
+                </tr>`).join('');
+        }}
+
         function render(snapshot) {{
             statusSnapshot = snapshot;
             renderOverview(snapshot);
             renderDevices(snapshot);
             renderChallenge(snapshot);
+            renderAuthTrace(snapshot);
             renderPortals(snapshot);
             syncPortalForm(snapshot);
         }}
