@@ -2,7 +2,7 @@
 
 This repository now contains a deployable backend service for the ONS roster workflow instead of a single Raspberry Pi script.
 
-The backend is designed to run continuously as a Docker stack in Portainer. The Android app is responsible for the one-time setup flow and the SMS-based 2FA step. The backend stores the ONS login credentials securely, initiates the browser login, requests the SMS code from the phone through Firebase Cloud Messaging, and exposes operator-facing debug and status endpoints over HTTPS.
+The backend is designed to run continuously as a Docker stack in Portainer. The Android app is responsible for the one-time setup flow and the SMS-based 2FA step. The backend stores the ONS login credentials securely, submits the username/password step over a server-side HTTP session, checkpoints the OTP page session for the follow-up step, requests the SMS code from the phone through Firebase Cloud Messaging, and exposes operator-facing debug and status endpoints over HTTPS.
 
 ## Current architecture
 
@@ -18,7 +18,8 @@ The backend is designed to run continuously as a Docker stack in Portainer. The 
       │  Stores credentials encrypted at rest
       │  Tracks paired devices and one active device
       │  Issues per-device bearer tokens
-      │  Starts Playwright login when setup or sync runs
+      │  Starts the HTTP login session when setup or sync runs
+      │  Stores the OTP checkpoint session for the next step
       │
       │  FCM data push: listen_sms to active device
       ▼
@@ -82,10 +83,10 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | Variable | Purpose |
 |---|---|
 | `PUBLIC_BASE_URL` | Public HTTPS base URL used by the app and debug links. |
-| `DEFAULT_LOGIN_URL` | Default ONS login page shown in the app. |
+| `DEFAULT_LOGIN_URL` | Default StartMetOns login page shown in the app. |
 | `SYNC_INTERVAL_MINUTES` | Automatic sync interval. Set `0` to disable the scheduler. |
 | `SMS_TIMEOUT_SECONDS` | How long the backend waits for the Android app to return a code. |
-| `LOGIN_TIMEOUT_SECONDS` | How long the Playwright login heuristics may wait for state changes. |
+| `LOGIN_TIMEOUT_SECONDS` | How long the server-side login step may wait for state changes. |
 | `SETUP_SECRET` | Optional setup code for first-time pairing or credential rotation. |
 | `DEBUG_TOKEN` | Optional token for the HTTPS debug page. |
 | `ADMIN_TOKEN` | Optional token for `POST /api/v1/admin/refresh`. |
@@ -96,6 +97,10 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
 | `POST_LOGIN_URL` | Optional URL to open immediately after login. |
 | `ROSTER_URL` | Optional explicit roster page URL. |
+
+The current Land van Horne default is:
+
+`https://landvanhorne.startmetons.nl/?jump=https%3A%2F%2Flandvanhorne.hasmoves.com%2F`
 
 ### Important note about Firebase
 

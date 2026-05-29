@@ -58,6 +58,31 @@ class StateStore:
             return None
         return self.config.ics_file.read_bytes()
 
+    def write_auth_session(self, payload: dict[str, object] | None) -> None:
+        if payload is None:
+            self.clear_auth_session()
+            return
+
+        serialized = json.dumps(payload, ensure_ascii=True)
+        encrypted = self._fernet.encrypt(serialized.encode("utf-8")).decode("utf-8")
+        self._write_atomic(self.config.auth_session_file, encrypted)
+        self._set_owner_only_permissions(self.config.auth_session_file)
+
+    def read_auth_session(self) -> dict[str, object] | None:
+        if not self.config.auth_session_file.exists():
+            return None
+
+        encrypted = self.config.auth_session_file.read_text(encoding="utf-8")
+        decrypted = self._fernet.decrypt(encrypted.encode("utf-8")).decode("utf-8")
+        payload = json.loads(decrypted)
+        if not isinstance(payload, dict):
+            raise RuntimeError("Het opgeslagen authenticatiesessie-bestand bevat geen JSON-object.")
+        return payload
+
+    def clear_auth_session(self) -> None:
+        if self.config.auth_session_file.exists():
+            self.config.auth_session_file.unlink()
+
     def write_managed_fcm_service_account(self, content: str) -> None:
         encrypted = self._fernet.encrypt(content.encode("utf-8")).decode("utf-8")
         self._write_atomic(self.config.managed_fcm_service_account_file, encrypted)

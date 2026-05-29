@@ -5,8 +5,10 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol
+from urllib.parse import urljoin, urlparse
 
 import google.auth.transport.requests
 import google.oauth2.service_account
@@ -454,3 +456,362 @@ class PlaywrightAutomationClient:
             notes.append("No roster-like rows were detected with the fallback HTML heuristics.")
 
         return items, notes
+
+
+class HttpLoginAutomationClient(PlaywrightAutomationClient):
+    LOGIN_ERROR_MARKERS = (
+        "gebruikersnaam/wachtwoord combinatie is onjuist",
+        "username/password combination you entered is not correct",
+        "didn't enter a username or password",
+        "geen wachtwoord of gebruikersnaam hebt ingevuld",
+        "verify_credentials_error",
+        "incorrect_credentials",
+    )
+
+    async def authenticate_and_scrape(
+        self,
+        credentials: LoginCredentials,
+        request_sms_code: Callable[[], Awaitable[str]],
+        snapshot_path: Path,
+        config: AppConfig,
+    ) -> AuthenticationResult:
+        del request_sms_code
+        return await asyncio.to_thread(
+            self._authenticate_sync,
+            credentials,
+            snapshot_path,
+            config,
+        )
+
+    def _authenticate_sync(
+        self,
+        credentials: LoginCredentials,
+        snapshot_path: Path,
+        config: AppConfig,
+    ) -> AuthenticationResult:
+        debug_notes: list[str] = []
+        login_url = credentials.login_url or config.default_login_url
+
+        with requests.Session() as session:
+            session.headers.update(
+                {
+                    "User-Agent": "ons-rooster-backend/0.1",
+                    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+                }
+            )
+
+            login_response = session.get(
+                login_url,
+                allow_redirects=True,
+                timeout=config.login_timeout_seconds,
+            )
+            login_response.raise_for_status()
+            debug_notes.append(f"Opened login page {login_response.url}.")
+
+            csrf_token = self._resolve_csrf_token(
+                session,
+                login_response,
+                config.login_timeout_seconds,
+                debug_notes,
+            )
+            login_form = self._extract_login_form(login_response.url, login_response.text)
+            submit_url = (
+                login_form["action_url"]
+                if login_form is not None
+                else urljoin(login_response.url, "/verify_credentials")
+            )
+            submit_payload = dict(login_form["hidden_fields"]) if login_form is not None else {}
+            submit_payload["_utf8"] = submit_payload.get("_utf8", "✓")
+            submit_payload["username"] = credentials.username
+            submit_payload["password"] = credentials.password
+            if csrf_token:
+                submit_payload["_csrf_token"] = csrf_token
+
+            submit_response = session.post(
+                submit_url,
+                data=submit_payload,
+                headers={
+                    "Origin": self._origin_for(submit_url),
+                    "Referer": login_response.url,
+                },
+                allow_redirects=True,
+                timeout=config.login_timeout_seconds,
+            )
+            debug_notes.extend(self._redirect_notes(submit_response.history))
+            debug_notes.append(f"Submitted credentials and landed on {submit_response.url}.")
+
+            html = submit_response.text
+            page_title = self._extract_page_title(html)
+
+            challenge = self._extract_otp_checkpoint(submit_response.url, html)
+            if challenge is not None:
+                snapshot_path.write_text(html, encoding="utf-8")
+                debug_notes.append(
+                    f"OTP challenge detected at {challenge['action_url']}."
+                )
+                return AuthenticationResult(
+                    final_url=submit_response.url,
+                    page_title=page_title,
+                    roster_items=[],
+                    debug_notes=debug_notes,
+                    auth_ready=False,
+                    session_checkpoint=self._build_session_checkpoint(
+                        session=session,
+                        login_url=login_url,
+                        current_url=submit_response.url,
+                        page_title=page_title,
+                        challenge=challenge,
+                    ),
+                )
+
+            login_error = self._extract_login_error(submit_response, html)
+            if login_error:
+                raise RuntimeError(login_error)
+
+            if self._response_still_looks_like_login(submit_response.url, html, login_url):
+                raise RuntimeError(
+                    "De backend kon niet bevestigen dat de ingevoerde ONS-gegevens zijn geaccepteerd. "
+                    f"Laatste pagina: {self._text_snippet(html)}"
+                )
+
+            page_response = submit_response
+            target_url = config.roster_url or config.post_login_url
+            if target_url:
+                resolved_target_url = urljoin(page_response.url, target_url)
+                page_response = session.get(
+                    resolved_target_url,
+                    allow_redirects=True,
+                    timeout=config.login_timeout_seconds,
+                )
+                page_response.raise_for_status()
+                html = page_response.text
+                page_title = self._extract_page_title(html)
+                debug_notes.extend(self._redirect_notes(page_response.history))
+                debug_notes.append(
+                    f"Navigated to the configured post-login page {page_response.url}."
+                )
+
+            snapshot_path.write_text(html, encoding="utf-8")
+            roster_items, extraction_notes = self._extract_roster_items(html)
+            debug_notes.extend(extraction_notes)
+            debug_notes.append(
+                f"Detected {len(roster_items)} roster-like entries on the last page."
+            )
+
+            return AuthenticationResult(
+                final_url=page_response.url,
+                page_title=page_title,
+                roster_items=roster_items,
+                debug_notes=debug_notes,
+                auth_ready=True,
+            )
+
+    def _resolve_csrf_token(
+        self,
+        session: requests.Session,
+        login_response: requests.Response,
+        timeout_seconds: int,
+        debug_notes: list[str],
+    ) -> str:
+        inline_token = self._extract_hidden_input(login_response.text, "_csrf_token")
+        if inline_token:
+            debug_notes.append("Found a CSRF token in the login page HTML.")
+            return inline_token
+
+        csrf_url = urljoin(login_response.url, "/csrf")
+        csrf_response = session.get(
+            csrf_url,
+            headers={"Referer": login_response.url},
+            timeout=timeout_seconds,
+        )
+        if csrf_response.ok:
+            try:
+                token = str(csrf_response.json().get("token", "")).strip()
+            except ValueError:
+                token = ""
+            if token:
+                debug_notes.append(f"Fetched a CSRF token from {csrf_url}.")
+                return token
+
+        debug_notes.append("No CSRF token was exposed; continuing with a plain form submit.")
+        return ""
+
+    def _extract_hidden_input(self, html: str, name: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        element = soup.select_one(f'input[name="{name}"]')
+        if element is None:
+            return ""
+        return str(element.get("value", "")).strip()
+
+    def _extract_login_form(self, current_url: str, html: str) -> dict[str, Any] | None:
+        soup = BeautifulSoup(html, "html.parser")
+        for form in soup.find_all("form"):
+            username_input = form.select_one('input[name="username"], input[autocomplete="username"]')
+            password_input = form.select_one('input[name="password"], input[type="password"]')
+            action = str(form.get("action", "")).strip()
+            if username_input is None or password_input is None:
+                if "verify_credentials" not in action:
+                    continue
+
+            hidden_fields: dict[str, str] = {}
+            for input_element in form.find_all("input", {"type": "hidden"}):
+                name = str(input_element.get("name", "")).strip()
+                if not name:
+                    continue
+                hidden_fields[name] = str(input_element.get("value", ""))
+
+            return {
+                "action_url": urljoin(current_url, action or current_url),
+                "hidden_fields": hidden_fields,
+            }
+
+        return None
+
+    def _extract_page_title(self, html: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title is None or soup.title.string is None:
+            return ""
+        return soup.title.string.strip()
+
+    def _extract_otp_checkpoint(self, current_url: str, html: str) -> dict[str, Any] | None:
+        soup = BeautifulSoup(html, "html.parser")
+        current_path = urlparse(current_url).path.rstrip("/")
+
+        for form in soup.find_all("form"):
+            action = str(form.get("action", "")).strip()
+            action_url = urljoin(current_url, action or current_url)
+            visible_inputs: list[tuple[str, str]] = []
+            hidden_fields: dict[str, str] = {}
+
+            for input_element in form.find_all("input"):
+                name = str(input_element.get("name", "")).strip()
+                if not name:
+                    continue
+                input_type = str(input_element.get("type", "text")).strip().lower() or "text"
+                if input_type == "hidden":
+                    hidden_fields[name] = str(input_element.get("value", ""))
+                    continue
+                visible_inputs.append((name, input_type))
+
+            otp_input_name = next(
+                (name for name, _ in visible_inputs if name in {"code", "otp", "token"}),
+                "",
+            )
+            looks_like_otp = bool(otp_input_name)
+            looks_like_otp = looks_like_otp or "verify_token" in action_url
+            looks_like_otp = looks_like_otp or current_path.endswith("/two_factor")
+            looks_like_otp = looks_like_otp or current_path.endswith("/app_setup")
+            if not looks_like_otp:
+                continue
+
+            if not otp_input_name:
+                otp_input_name = next(
+                    (
+                        name
+                        for name, input_type in visible_inputs
+                        if input_type not in {"submit", "button"}
+                    ),
+                    "",
+                )
+
+            return {
+                "challenge_kind": "otp",
+                "action_url": action_url,
+                "method": str(form.get("method", "post")).strip().lower() or "post",
+                "otp_input_name": otp_input_name,
+                "hidden_fields": hidden_fields,
+            }
+
+        return None
+
+    def _extract_login_error(self, response: requests.Response, html: str) -> str:
+        if response.status_code >= 500:
+            return f"De ONS-login gaf HTTP {response.status_code} terug."
+
+        soup = BeautifulSoup(html, "html.parser")
+        messages: list[str] = []
+        for selector in (".notice", ".error", ".errors", ".flash", '[role="alert"]'):
+            for element in soup.select(selector):
+                text = " ".join(fragment.strip() for fragment in element.stripped_strings)
+                if text:
+                    messages.append(text)
+
+        combined = " ".join(messages) if messages else self._text_snippet(html)
+        normalized = combined.lower()
+        if any(marker in normalized for marker in self.LOGIN_ERROR_MARKERS):
+            return combined
+        if response.status_code >= 400:
+            return f"De ONS-login gaf HTTP {response.status_code} terug."
+        return ""
+
+    def _response_still_looks_like_login(self, current_url: str, html: str, login_url: str) -> bool:
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.select_one('form[action*="verify_credentials"]') is not None:
+            return True
+        if soup.select_one('input[name="username"]') and soup.select_one('input[name="password"]'):
+            return True
+
+        current_parts = urlparse(current_url)
+        login_parts = urlparse(login_url)
+        return (
+            current_parts.scheme,
+            current_parts.netloc,
+            current_parts.path.rstrip("/"),
+        ) == (
+            login_parts.scheme,
+            login_parts.netloc,
+            login_parts.path.rstrip("/"),
+        )
+
+    def _build_session_checkpoint(
+        self,
+        *,
+        session: requests.Session,
+        login_url: str,
+        current_url: str,
+        page_title: str,
+        challenge: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "saved_at": datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "login_url": login_url,
+            "current_url": current_url,
+            "page_title": page_title,
+            "challenge": challenge,
+            "cookies": self._serialize_cookies(session.cookies),
+        }
+
+    def _serialize_cookies(self, cookie_jar) -> list[dict[str, Any]]:
+        cookies: list[dict[str, Any]] = []
+        for cookie in cookie_jar:
+            cookies.append(
+                {
+                    "name": cookie.name,
+                    "value": cookie.value,
+                    "domain": cookie.domain,
+                    "path": cookie.path,
+                    "secure": bool(cookie.secure),
+                    "expires": cookie.expires,
+                }
+            )
+        return cookies
+
+    @staticmethod
+    def _redirect_notes(history: list[requests.Response]) -> list[str]:
+        notes: list[str] = []
+        for response in history:
+            location = response.headers.get("Location", "")
+            notes.append(f"Redirect {response.status_code} to {location}.")
+        return notes
+
+    @staticmethod
+    def _origin_for(url: str) -> str:
+        parsed = urlparse(url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    @staticmethod
+    def _text_snippet(html: str, limit: int = 240) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        text = " ".join(fragment.strip() for fragment in soup.stripped_strings)
+        return text[:limit]

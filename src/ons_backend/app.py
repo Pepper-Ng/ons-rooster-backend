@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 from aiohttp import web
 
-from .clients import FcmPushClient, PlaywrightAutomationClient
+from .clients import FcmPushClient, HttpLoginAutomationClient
 from .config import AppConfig
 from .service import BackendService
 from .storage import StateStore
@@ -37,7 +37,7 @@ def create_app(
             config=config,
             store=store,
             push_client=push_client,
-            automation_client=PlaywrightAutomationClient(),
+            automation_client=HttpLoginAutomationClient(),
         )
 
     app = web.Application()

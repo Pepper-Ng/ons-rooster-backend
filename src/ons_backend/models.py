@@ -235,3 +235,4 @@ class AuthenticationResult:
     roster_items: list[RosterItem]
     debug_notes: list[str]
     auth_ready: bool = True
+    session_checkpoint: dict[str, Any] | None = None

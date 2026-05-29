@@ -55,6 +55,10 @@ class AppConfig:
         return self.data_dir / "last-auth.html"
 
     @property
+    def auth_session_file(self) -> Path:
+        return self.data_dir / "auth-session.json.enc"
+
+    @property
     def ics_file(self) -> Path:
         return self.data_dir / "rooster.ics"
 
@@ -84,7 +88,7 @@ class AppConfig:
             timezone=os.getenv("TZ", "Europe/Amsterdam"),
             default_login_url=os.getenv(
                 "DEFAULT_LOGIN_URL",
-                "https://landvanhorne.hasmoves.com",
+                "https://landvanhorne.startmetons.nl/?jump=https%3A%2F%2Flandvanhorne.hasmoves.com%2F",
             ).strip(),
             sync_interval_minutes=_read_int("SYNC_INTERVAL_MINUTES", 360),
             sms_timeout_seconds=_read_int("SMS_TIMEOUT_SECONDS", 150),

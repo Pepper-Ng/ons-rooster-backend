@@ -254,6 +254,7 @@ class BackendService:
             )
             await self._persist_state()
 
+        await asyncio.to_thread(self.store.clear_auth_session)
         await self.trigger_refresh(reason="setup", wait=False)
 
         return {
@@ -637,14 +638,27 @@ class BackendService:
         return pending.code
 
     async def _finalize_success(self, result: AuthenticationResult) -> None:
+        if result.auth_ready:
+            await asyncio.to_thread(self.store.clear_auth_session)
+        else:
+            if result.session_checkpoint is None:
+                raise RuntimeError(
+                    "De OTP-pagina is bereikt, maar de vervolgsessie kon niet worden opgeslagen."
+                )
+            await asyncio.to_thread(self.store.write_auth_session, result.session_checkpoint)
+
         async with self._state_lock:
             # The latest successful page snapshot and roster payload become the operator-facing debug baseline.
-            self.state.sync.status = "success"
-            self.state.sync.current_phase = "ready"
+            self.state.sync.status = "success" if result.auth_ready else "partial"
+            self.state.sync.current_phase = "ready" if result.auth_ready else "otp_required"
             self.state.sync.auth_ready = result.auth_ready
             self.state.sync.last_success_at = utc_now()
             self.state.sync.last_error = None
-            self.state.sync.last_message = "De backend is succesvol aangemeld en klaar om te synchroniseren."
+            self.state.sync.last_message = (
+                "De backend is succesvol aangemeld en klaar om te synchroniseren."
+                if result.auth_ready
+                else "Gebruikersnaam en wachtwoord zijn geaccepteerd. De OTP-pagina is vastgelegd voor de vervolgstap."
+            )
             self.state.sync.current_challenge_id = None
             self.state.sync.challenge_created_at = None
             self.state.sync.last_final_url = result.final_url
@@ -652,17 +666,24 @@ class BackendService:
             self.state.sync.html_snapshot_path = str(self.config.snapshot_file)
             self.state.sync.roster_items = result.roster_items
             self.state.sync.debug_notes = list(result.debug_notes[-25:])
-            self._remember_note("De backend heeft de ONS-aanmelding succesvol afgerond.")
+            self._remember_note(
+                "De backend heeft de ONS-aanmelding succesvol afgerond."
+                if result.auth_ready
+                else "De backend heeft de eerste ONS-loginstap afgerond en wacht op OTP-afhandeling."
+            )
             await self._persist_state()
-            await asyncio.to_thread(self.store.write_ics, self._generate_ical())
+            if result.auth_ready:
+                await asyncio.to_thread(self.store.write_ics, self._generate_ical())
 
-        await self._notify_auth_result(
-            True,
-            "De backend is aangemeld en klaar voor synchronisatie.",
-        )
+        if result.auth_ready:
+            await self._notify_auth_result(
+                True,
+                "De backend is aangemeld en klaar voor synchronisatie.",
+            )
 
     async def _finalize_failure(self, exc: Exception) -> None:
         log.exception("Backend sync failed.", exc_info=exc)
+        await asyncio.to_thread(self.store.clear_auth_session)
         async with self._state_lock:
             self.state.sync.status = "error"
             self.state.sync.current_phase = "error"

@@ -8,9 +8,9 @@ import pytest
 from aiohttp import FormData
 
 from ons_backend.app import create_app
-from ons_backend.clients import FcmPushClient
+from ons_backend.clients import FcmPushClient, HttpLoginAutomationClient
 from ons_backend.config import AppConfig
-from ons_backend.models import AuthenticationResult, RosterItem
+from ons_backend.models import AuthenticationResult, LoginCredentials, RosterItem
 from ons_backend.service import BackendService
 from ons_backend.storage import StateStore
 
@@ -56,6 +56,43 @@ class FakeAutomationClient:
         )
 
 
+class FakeCheckpointAutomationClient:
+    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config):
+        del credentials, request_sms_code, config
+        snapshot_path.write_text(
+            "<html><head><title>OTP</title></head><body><form action='/verify_token' method='post'><input type='hidden' name='_csrf_token' value='otp-csrf'><input type='text' name='token'></form></body></html>",
+            encoding="utf-8",
+        )
+        return AuthenticationResult(
+            final_url="https://example.invalid/two_factor",
+            page_title="OTP",
+            roster_items=[],
+            debug_notes=["OTP checkpoint saved."],
+            auth_ready=False,
+            session_checkpoint={
+                "version": 1,
+                "current_url": "https://example.invalid/two_factor",
+                "challenge": {
+                    "challenge_kind": "otp",
+                    "action_url": "https://example.invalid/verify_token",
+                    "method": "post",
+                    "otp_input_name": "token",
+                    "hidden_fields": {"_csrf_token": "otp-csrf"},
+                },
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "secret-cookie",
+                        "domain": "example.invalid",
+                        "path": "/",
+                        "secure": True,
+                        "expires": None,
+                    }
+                ],
+            },
+        )
+
+
 async def wait_for(condition, timeout: float = 1.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -63,6 +100,10 @@ async def wait_for(condition, timeout: float = 1.0):
             return
         await asyncio.sleep(0.01)
     raise AssertionError("Timed out while waiting for the expected condition.")
+
+
+async def unexpected_sms_request() -> str:
+    raise AssertionError("SMS should not be requested during the first login stage.")
 
 
 def build_config(tmp_path):
@@ -391,6 +432,97 @@ async def test_debug_endpoint_requires_token(aiohttp_client, test_context):
 
     authorized = await client.get("/debug?token=debug-code")
     assert authorized.status == 200
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_captures_otp_checkpoint(aiohttp_client, test_context, tmp_path):
+    app, _, _, _ = test_context
+    client = await aiohttp_client(app)
+    automation_client = HttpLoginAutomationClient()
+    snapshot_path = tmp_path / "otp-snapshot.html"
+
+    result = await automation_client.authenticate_and_scrape(
+        credentials=LoginCredentials(
+            login_url=str(client.make_url("/sandbox/hasmoves/login?mode=sms")),
+            username="fcm-test",
+            password="secret",
+        ),
+        request_sms_code=unexpected_sms_request,
+        snapshot_path=snapshot_path,
+        config=build_config(tmp_path),
+    )
+
+    assert result.auth_ready is False
+    assert result.session_checkpoint is not None
+    assert result.session_checkpoint["challenge"]["otp_input_name"] == "code"
+    assert result.session_checkpoint["challenge"]["action_url"].endswith(
+        "/sandbox/hasmoves/challenge?mode=sms"
+    )
+    assert "Mock HasMoves OTP" in snapshot_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_scrapes_basic_roster(aiohttp_client, test_context, tmp_path):
+    app, _, _, _ = test_context
+    client = await aiohttp_client(app)
+    automation_client = HttpLoginAutomationClient()
+    snapshot_path = tmp_path / "basic-roster.html"
+
+    result = await automation_client.authenticate_and_scrape(
+        credentials=LoginCredentials(
+            login_url=str(client.make_url("/sandbox/hasmoves/login?mode=basic")),
+            username="bob@example.invalid",
+            password="secret",
+        ),
+        request_sms_code=unexpected_sms_request,
+        snapshot_path=snapshot_path,
+        config=build_config(tmp_path),
+    )
+
+    assert result.auth_ready is True
+    assert result.session_checkpoint is None
+    assert any("bob@example.invalid" in item.description for item in result.roster_items)
+    assert "Mock HasMoves Rooster" in snapshot_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.asyncio
+async def test_partial_login_stage_persists_otp_checkpoint(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=FakeCheckpointAutomationClient(),
+    )
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert response.status == 200
+
+    await wait_for(lambda: service.mobile_status_payload()["sync"]["current_phase"] == "otp_required")
+    status = service.mobile_status_payload()
+    assert status["sync"]["status"] == "partial"
+    assert status["sync"]["auth_ready"] is False
+    assert "OTP-pagina" in status["sync"]["last_message"]
+
+    checkpoint = service.store.read_auth_session()
+    assert checkpoint is not None
+    assert checkpoint["challenge"]["otp_input_name"] == "token"
+    raw = config.auth_session_file.read_text(encoding="utf-8")
+    assert "secret-cookie" not in raw
+    assert push_client.auth_notifications == []
 
 
 @pytest.mark.asyncio
