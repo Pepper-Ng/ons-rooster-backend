@@ -37,7 +37,18 @@ class FakeAutomationClient:
     def __init__(self) -> None:
         self.received_codes: list[str] = []
 
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+    ):
+        del session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
             await report_progress(
                 {
@@ -71,8 +82,18 @@ class FakeAutomationClient:
 
 
 class FakeCheckpointAutomationClient:
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
-        del credentials, request_sms_code, config
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+    ):
+        del credentials, request_sms_code, config, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
             await report_progress(
                 {
@@ -121,8 +142,18 @@ class FakeCheckpointAutomationClient:
 
 
 class FakeMfaSelectionAutomationClient:
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
-        del credentials, request_sms_code, config
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+    ):
+        del credentials, request_sms_code, config, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
             await report_progress(
                 {
@@ -185,12 +216,78 @@ class FakeMfaSelectionAutomationClient:
         )
 
 
+class FakeResumeAutomationClient:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+    ):
+        del credentials, request_sms_code, config, report_progress
+        assert session_checkpoint is not None
+        assert prepare_sms_relay is not None
+        assert wait_for_sms_code is not None
+        assert session_checkpoint["challenge"]["challenge_kind"] == "microsoft_proof_selection"
+
+        challenge_id = await prepare_sms_relay()
+        self.events.append(("armed", challenge_id))
+        self.events.append(("clicked_sms_button", challenge_id))
+        sms_code = await wait_for_sms_code(challenge_id)
+        self.events.append(("received_code", sms_code))
+
+        snapshot_path.write_text("<html><head><title>Na OTP</title></head><body>Welkom terug in de portal.</body></html>", encoding="utf-8")
+        return AuthenticationResult(
+            final_url="https://example.invalid/post-otp",
+            page_title="Na OTP",
+            roster_items=[],
+            debug_notes=["Resumed from the stored Microsoft proof selection and submitted the OTP."],
+            auth_ready=False,
+            session_checkpoint={
+                "version": 1,
+                "current_url": "https://example.invalid/post-otp",
+                "challenge": {
+                    "challenge_kind": "post_otp_result_page",
+                    "page_summary": "Welkom terug in de portal.",
+                    "source": "microsoft_sso",
+                },
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "secret-cookie",
+                        "domain": "example.invalid",
+                        "path": "/",
+                        "secure": True,
+                        "expires": None,
+                    }
+                ],
+            },
+        )
+
+
 class CountingAutomationClient:
     def __init__(self) -> None:
         self.call_count = 0
 
-    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
-        del request_sms_code, config, report_progress
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+    ):
+        del request_sms_code, config, report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         self.call_count += 1
         snapshot_path.write_text("<html>ok</html>", encoding="utf-8")
         return AuthenticationResult(
@@ -965,6 +1062,83 @@ async def test_partial_login_stage_persists_microsoft_proof_selection_checkpoint
     assert checkpoint["challenge"]["sms_proof"]["phone_number_suffix"] == "32"
     raw = config.auth_session_file.read_text(encoding="utf-8")
     assert "secret-cookie" not in raw
+    assert push_client.auth_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_service_resumes_microsoft_proof_selection_and_arms_sms_before_waiting(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    automation_client = FakeResumeAutomationClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=automation_client,
+    )
+    await service.set_sync_enabled(False)
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+    api_token = (await setup_response.json())["api_token"]
+
+    await asyncio.to_thread(
+        service.store.write_auth_session,
+        {
+            "version": 1,
+            "current_url": "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+            "challenge": {
+                "challenge_kind": "microsoft_proof_selection",
+                "action_url": "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+                "method": "post",
+                "proof_input_name": "mfaAuthMethod",
+                "sms_proof_value": "OneWaySMS",
+                "sms_proof": {
+                    "auth_method_id": "OneWaySMS",
+                    "data": "OneWaySMS",
+                    "display": "+XX XXXXXXX32",
+                    "phone_number_suffix": "32",
+                },
+                "hidden_fields": {},
+            },
+            "cookies": [],
+        },
+    )
+
+    await service.set_sync_enabled(True)
+    await service.trigger_refresh(reason="resume-test", wait=False)
+
+    await wait_for(lambda: len(push_client.listen_requests) == 1)
+    challenge_id = push_client.listen_requests[0]
+    assert automation_client.events[:2] == [
+        ("armed", challenge_id),
+        ("clicked_sms_button", challenge_id),
+    ]
+
+    sms_response = await client.post(
+        f"/api/v1/mobile/challenges/{challenge_id}/sms-code",
+        headers={"Authorization": f"Bearer {api_token}"},
+        json={"code": "123456", "sender": "ONS"},
+    )
+    assert sms_response.status == 200
+
+    await wait_for(lambda: service.mobile_status_payload()["sync"]["current_phase"] == "post_otp_page")
+    assert automation_client.events[2] == ("received_code", "123456")
+    status = service.mobile_status_payload()
+    assert status["sync"]["status"] == "partial"
+    assert status["sync"]["last_message"].startswith("De OTP-code is ingestuurd")
     assert push_client.auth_notifications == []
 
 

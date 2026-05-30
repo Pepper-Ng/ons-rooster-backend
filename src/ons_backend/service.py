@@ -706,12 +706,17 @@ class BackendService:
                         "Firebase Cloud Messaging is nog niet geconfigureerd in de backend-stack."
                     )
 
+                session_checkpoint = await asyncio.to_thread(self.store.read_auth_session)
+
                 result = await self.automation_client.authenticate_and_scrape(
                     credentials=resolved_credentials,
                     request_sms_code=self._request_sms_code,
                     snapshot_path=self.config.snapshot_file,
                     config=self.config,
                     report_progress=self._record_auth_trace_event,
+                    session_checkpoint=session_checkpoint,
+                    prepare_sms_relay=self._prepare_sms_relay,
+                    wait_for_sms_code=self._wait_for_sms_code,
                 )
                 await self._finalize_success(result)
             except Exception as exc:
@@ -743,7 +748,7 @@ class BackendService:
                 self.state.sync.last_page_title = entry["page_title"]
             await self._persist_state()
 
-    async def _request_sms_code(self) -> str:
+    async def _prepare_sms_relay(self) -> str:
         if not self.sync_enabled():
             raise RuntimeError(SYNC_DISABLED_MESSAGE)
 
@@ -775,6 +780,18 @@ class BackendService:
                 challenge_id,
                 self.config.sms_timeout_seconds,
             )
+        except Exception:
+            self._pending_challenges.pop(challenge_id, None)
+            raise
+
+        return challenge_id
+
+    async def _wait_for_sms_code(self, challenge_id: str) -> str:
+        pending = self._pending_challenges.get(challenge_id)
+        if pending is None:
+            raise RuntimeError("De gevraagde SMS-uitdaging is niet meer actief.")
+
+        try:
             await asyncio.wait_for(pending.event.wait(), timeout=self.config.sms_timeout_seconds)
         except Exception:
             self._pending_challenges.pop(challenge_id, None)
@@ -783,6 +800,10 @@ class BackendService:
         self._pending_challenges.pop(challenge_id, None)
         assert pending.code is not None
         return pending.code
+
+    async def _request_sms_code(self) -> str:
+        challenge_id = await self._prepare_sms_relay()
+        return await self._wait_for_sms_code(challenge_id)
 
     async def _finalize_success(self, result: AuthenticationResult) -> None:
         partial_phase = "otp_required"
@@ -807,6 +828,19 @@ class BackendService:
                 partial_note = (
                     "De backend heeft de Microsoft verificatiekeuze bereikt en wacht op expliciete SMS-verzending."
                 )
+            elif isinstance(challenge, dict) and challenge.get("challenge_kind") == "post_otp_result_page":
+                partial_phase = "post_otp_page"
+                page_summary = str(challenge.get("page_summary", "")).strip()
+                partial_message = "De OTP-code is ingestuurd en de eerste vervolgpagina is vastgelegd voor inspectie."
+                if result.page_title:
+                    partial_message = (
+                        f"De OTP-code is ingestuurd en de pagina '{result.page_title}' is vastgelegd voor inspectie."
+                    )
+                if page_summary:
+                    partial_message = f"{partial_message} Inhoud: {page_summary}"
+                partial_note = (
+                    "De backend heeft de OTP-code ingestuurd en wacht op verdere afhandeling van de vervolgpagina."
+                )
 
         if result.auth_ready:
             await asyncio.to_thread(self.store.clear_auth_session)
@@ -816,6 +850,7 @@ class BackendService:
                     "De OTP-pagina is bereikt, maar de vervolgsessie kon niet worden opgeslagen."
                 )
             await asyncio.to_thread(self.store.write_auth_session, result.session_checkpoint)
+        self._pending_challenges.clear()
 
         async with self._state_lock:
             # The latest successful page snapshot and roster payload become the operator-facing debug baseline.
@@ -854,6 +889,7 @@ class BackendService:
     async def _finalize_failure(self, exc: Exception) -> None:
         log.exception("Backend sync failed.", exc_info=exc)
         await asyncio.to_thread(self.store.clear_auth_session)
+        self._pending_challenges.clear()
         async with self._state_lock:
             self.state.sync.status = "error"
             self.state.sync.current_phase = "error"

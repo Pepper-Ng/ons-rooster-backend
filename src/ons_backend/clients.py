@@ -23,6 +23,9 @@ from .models import AuthenticationResult, DeviceRegistration, LoginCredentials, 
 
 log = logging.getLogger(__name__)
 
+SmsRelayPrimer = Callable[[], Awaitable[str]]
+SmsCodeAwaiter = Callable[[str], Awaitable[str]]
+
 
 class PushClient(Protocol):
     async def send_listen_sms(
@@ -53,6 +56,9 @@ class AutomationClient(Protocol):
         snapshot_path: Path,
         config: AppConfig,
         report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        session_checkpoint: dict[str, Any] | None = None,
+        prepare_sms_relay: SmsRelayPrimer | None = None,
+        wait_for_sms_code: SmsCodeAwaiter | None = None,
     ) -> AuthenticationResult:
         ...
 
@@ -302,8 +308,11 @@ class PlaywrightAutomationClient:
         snapshot_path: Path,
         config: AppConfig,
         report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        session_checkpoint: dict[str, Any] | None = None,
+        prepare_sms_relay: SmsRelayPrimer | None = None,
+        wait_for_sms_code: SmsCodeAwaiter | None = None,
     ) -> AuthenticationResult:
-        del report_progress
+        del report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         debug_notes: list[str] = []
         login_url = credentials.login_url or config.default_login_url
 
@@ -504,6 +513,25 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         'button:has-text("Nee")',
         'button:has-text("No")',
     )
+    MICROSOFT_OTP_SELECTORS = (
+        '#idTxtBx_SAOTCC_OTC',
+        'input[name="otc"]',
+        'input[name="code"]',
+        'input[name="otp"]',
+        'input[autocomplete="one-time-code"]',
+        'input[inputmode="numeric"]',
+    )
+    MICROSOFT_OTP_SUBMIT_SELECTORS = (
+        '#idSubmit_SAOTCC_Continue',
+        '#idSIButton9',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Verify")',
+        'button:has-text("Verifiëren")',
+        'button:has-text("Continue")',
+        'button:has-text("Doorgaan")',
+        'button:has-text("Volgende")',
+    )
     MICROSOFT_PROOF_SELECTION_SELECTORS = (
         '#idDiv_SAOTCS_Title',
         '[data-value="OneWaySMS"]',
@@ -521,8 +549,10 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         snapshot_path: Path,
         config: AppConfig,
         report_progress: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        session_checkpoint: dict[str, Any] | None = None,
+        prepare_sms_relay: SmsRelayPrimer | None = None,
+        wait_for_sms_code: SmsCodeAwaiter | None = None,
     ) -> AuthenticationResult:
-        del request_sms_code
         loop = asyncio.get_running_loop()
 
         def sync_progress(event: dict[str, Any]) -> None:
@@ -534,21 +564,46 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         return await asyncio.to_thread(
             self._authenticate_sync,
             credentials,
+            request_sms_code,
             snapshot_path,
             config,
             sync_progress,
+            session_checkpoint,
+            prepare_sms_relay,
+            wait_for_sms_code,
         )
 
     def _authenticate_sync(
         self,
         credentials: LoginCredentials,
+        request_sms_code: Callable[[], Awaitable[str]],
         snapshot_path: Path,
         config: AppConfig,
         report_progress: Callable[[dict[str, Any]], None] | None,
+        session_checkpoint: dict[str, Any] | None,
+        prepare_sms_relay: SmsRelayPrimer | None,
+        wait_for_sms_code: SmsCodeAwaiter | None,
     ) -> AuthenticationResult:
         debug_notes: list[str] = []
         login_url = credentials.login_url or config.default_login_url
         trace_index = 1
+
+        if session_checkpoint is not None:
+            debug_notes.append("Continuing from the stored authentication session.")
+            return asyncio.run(
+                self._continue_from_session_checkpoint(
+                    credentials=credentials,
+                    request_sms_code=request_sms_code,
+                    snapshot_path=snapshot_path,
+                    config=config,
+                    report_progress=report_progress,
+                    trace_index=trace_index,
+                    debug_notes=debug_notes,
+                    session_checkpoint=session_checkpoint,
+                    prepare_sms_relay=prepare_sms_relay,
+                    wait_for_sms_code=wait_for_sms_code,
+                )
+            )
 
         with requests.Session() as session:
             session.headers.update(
@@ -1134,6 +1189,307 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             finally:
                 if browser is not None:
                     await browser.close()
+
+    async def _continue_from_session_checkpoint(
+        self,
+        *,
+        credentials: LoginCredentials,
+        request_sms_code: Callable[[], Awaitable[str]],
+        snapshot_path: Path,
+        config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+        session_checkpoint: dict[str, Any],
+        prepare_sms_relay: SmsRelayPrimer | None,
+        wait_for_sms_code: SmsCodeAwaiter | None,
+    ) -> AuthenticationResult:
+        challenge = session_checkpoint.get("challenge", {})
+        if not isinstance(challenge, dict):
+            raise RuntimeError("De opgeslagen authenticatiesessie bevat geen geldige vervolgstap.")
+
+        challenge_kind = str(challenge.get("challenge_kind", "")).strip().lower()
+        if challenge_kind == "microsoft_proof_selection":
+            return await self._continue_from_microsoft_proof_selection(
+                credentials=credentials,
+                request_sms_code=request_sms_code,
+                snapshot_path=snapshot_path,
+                config=config,
+                report_progress=report_progress,
+                trace_index=trace_index,
+                debug_notes=debug_notes,
+                session_checkpoint=session_checkpoint,
+                prepare_sms_relay=prepare_sms_relay,
+                wait_for_sms_code=wait_for_sms_code,
+            )
+
+        raise RuntimeError(
+            "De backend kan de opgeslagen authenticatiesessie nog niet automatisch hervatten voor "
+            f"{challenge_kind or 'deze stap'}."
+        )
+
+    async def _continue_from_microsoft_proof_selection(
+        self,
+        *,
+        credentials: LoginCredentials,
+        request_sms_code: Callable[[], Awaitable[str]],
+        snapshot_path: Path,
+        config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+        session_checkpoint: dict[str, Any],
+        prepare_sms_relay: SmsRelayPrimer | None,
+        wait_for_sms_code: SmsCodeAwaiter | None,
+    ) -> AuthenticationResult:
+        challenge = session_checkpoint.get("challenge", {})
+        if not isinstance(challenge, dict):
+            raise RuntimeError("De opgeslagen Microsoft-sessie bevat geen geldige verificatiekeuze.")
+
+        login_url = credentials.login_url or config.default_login_url
+        current_url = str(session_checkpoint.get("current_url", "")).strip() or login_url
+        stored_cookies = session_checkpoint.get("cookies", [])
+        sms_relay_task: asyncio.Task[str] | None = None
+        sms_challenge_id = ""
+
+        async with async_playwright() as playwright:
+            browser = None
+            page = None
+            try:
+                browser = await playwright.chromium.launch(headless=config.playwright_headless)
+                context = await browser.new_context(locale="nl-NL")
+                if isinstance(stored_cookies, list) and stored_cookies:
+                    await context.add_cookies(self._playwright_cookies(stored_cookies))
+                page = await context.new_page()
+                await page.goto(current_url, wait_until="domcontentloaded")
+                debug_notes.append(f"Resumed the stored Microsoft verification page on {page.url}.")
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Resume SSO session",
+                    message="De backend heeft de opgeslagen Microsoft verificatiepagina opnieuw geopend.",
+                    phase="sso_resumed",
+                    page=page,
+                )
+
+                html = await page.content()
+                proof_selection = self._extract_microsoft_proof_selection(page.url, html)
+                if proof_selection is None:
+                    raise RuntimeError(
+                        "De opgeslagen Microsoft verificatiepagina kon niet opnieuw worden geladen. "
+                        f"Laatste pagina: {self._text_snippet(html)}"
+                    )
+
+                if prepare_sms_relay is not None and wait_for_sms_code is not None:
+                    sms_challenge_id = await prepare_sms_relay()
+                else:
+                    sms_relay_task = asyncio.create_task(request_sms_code())
+                    await asyncio.sleep(0)
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Arm SMS relay",
+                    message="De backend heeft de Android-app eerst klaar gezet om de komende OTP-SMS op te vangen.",
+                    phase="sms_relay_armed",
+                    url=page.url,
+                    page_title=await page.title(),
+                )
+                trace_index += 1
+
+                await self._click_microsoft_sms_proof(
+                    page,
+                    proof_selection=proof_selection,
+                    timeout_seconds=config.login_timeout_seconds,
+                )
+                debug_notes.append("Requested the Microsoft SMS verification code after arming the Android relay.")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Request SMS code",
+                    message="De backend heeft nu de Microsoft optie gekozen om de OTP-SMS te verzenden.",
+                    phase="sms_requested",
+                    url=page.url,
+                    page_title=await page.title(),
+                )
+                trace_index += 1
+
+                await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="OTP entry page",
+                    message="De backend heeft de Microsoft OTP-invoerpagina bereikt en wacht op de code van Android.",
+                    phase="otp_page_opened",
+                    page=page,
+                )
+
+                if sms_relay_task is not None:
+                    sms_code = await sms_relay_task
+                elif wait_for_sms_code is not None and sms_challenge_id:
+                    sms_code = await wait_for_sms_code(sms_challenge_id)
+                else:
+                    sms_code = await request_sms_code()
+                debug_notes.append("Received the SMS OTP from the Android relay.")
+
+                await self._fill_first_visible(
+                    page,
+                    self.MICROSOFT_OTP_SELECTORS,
+                    sms_code,
+                    config.login_timeout_seconds,
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Submit OTP code",
+                    message="De backend heeft de door Android teruggestuurde OTP-code ingevoerd.",
+                    phase="otp_submitted",
+                    url=page.url,
+                    page_title=await page.title(),
+                )
+                trace_index += 1
+                await self._click_first_visible(
+                    page,
+                    self.MICROSOFT_OTP_SUBMIT_SELECTORS,
+                    config.login_timeout_seconds,
+                )
+
+                await self._wait_for_post_otp_page(page, config.login_timeout_seconds)
+                html = await page.content()
+                page_title = await page.title()
+                page_summary = self._text_snippet(html)
+                await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Post-OTP page detected",
+                    message=f"De backend heeft de eerste pagina na OTP-submit bereikt op {page.url}.",
+                    phase="post_otp_page_detected",
+                    url=page.url,
+                    page_title=page_title,
+                    snapshot_name=self._write_trace_snapshot(
+                        config.auth_trace_dir,
+                        trace_index,
+                        "post-otp-page",
+                        html,
+                    ),
+                )
+
+                return AuthenticationResult(
+                    final_url=page.url,
+                    page_title=page_title,
+                    roster_items=[],
+                    debug_notes=debug_notes,
+                    auth_ready=False,
+                    session_checkpoint=self._build_browser_session_checkpoint(
+                        cookies=await context.cookies(),
+                        login_url=login_url,
+                        current_url=page.url,
+                        page_title=page_title,
+                        challenge={
+                            "challenge_kind": "post_otp_result_page",
+                            "page_summary": page_summary,
+                            "source": "microsoft_sso",
+                        },
+                    ),
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                html = ""
+                page_title = ""
+                page_url = current_url
+                if page is not None:
+                    html = await page.content()
+                    page_title = await page.title()
+                    page_url = page.url
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                raise RuntimeError(
+                    "De backend kon de Microsoft SSO-vervolgstap niet afronden. "
+                    f"Laatste pagina: {self._text_snippet(html) if html else str(exc)}"
+                ) from exc
+            finally:
+                if browser is not None:
+                    await browser.close()
+
+    @staticmethod
+    def _playwright_cookies(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for cookie in cookies:
+            normalized_cookie = {
+                "name": str(cookie.get("name", "")),
+                "value": str(cookie.get("value", "")),
+                "domain": str(cookie.get("domain", "")),
+                "path": str(cookie.get("path", "/")),
+                "secure": bool(cookie.get("secure", False)),
+            }
+            expires = cookie.get("expires")
+            if expires not in {None, -1, ""}:
+                normalized_cookie["expires"] = expires
+            normalized.append(normalized_cookie)
+        return normalized
+
+    async def _click_microsoft_sms_proof(
+        self,
+        page,
+        *,
+        proof_selection: dict[str, Any],
+        timeout_seconds: int,
+    ) -> None:
+        selectors: list[str] = []
+        sms_value = str(proof_selection.get("sms_proof_value", "")).strip()
+        if sms_value:
+            selectors.extend(
+                [
+                    f'[data-value="{sms_value}"]',
+                    f'[role="button"][data-value="{sms_value}"]',
+                    f'div[data-value="{sms_value}"]',
+                ]
+            )
+        selectors.extend(
+            [
+                'div:has-text("Sms verzenden naar")',
+                '[role="button"]:has-text("Sms verzenden naar")',
+                'div:has-text("Text")',
+            ]
+        )
+        await self._click_first_visible(page, tuple(selectors), timeout_seconds)
+
+    async def _wait_for_microsoft_otp_page(self, page, timeout_seconds: int) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        otp_selectors = self.MICROSOFT_OTP_SELECTORS + self.OTP_SELECTORS
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._has_visible_selector(page, otp_selectors):
+                return
+            html = await page.content()
+            login_error = self._extract_login_error(self._synthetic_response(200), html)
+            if login_error:
+                raise RuntimeError(login_error)
+            await page.wait_for_timeout(250)
+
+        html = await page.content()
+        raise RuntimeError(
+            "De Microsoft pagina toonde geen OTP-invoerveld nadat de SMS-verzending was gestart. "
+            f"Laatste pagina: {self._text_snippet(html)}"
+        )
+
+    async def _wait_for_post_otp_page(self, page, timeout_seconds: int) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        otp_selectors = self.MICROSOFT_OTP_SELECTORS + self.OTP_SELECTORS
+        while asyncio.get_running_loop().time() < deadline:
+            if not await self._has_visible_selector(page, otp_selectors):
+                return
+            await page.wait_for_timeout(250)
+
+        html = await page.content()
+        raise RuntimeError(
+            "De backend bleef op de Microsoft OTP-invoerpagina staan nadat de code was ingestuurd. "
+            f"Laatste pagina: {self._text_snippet(html)}"
+        )
 
     async def _record_playwright_page_step(
         self,
