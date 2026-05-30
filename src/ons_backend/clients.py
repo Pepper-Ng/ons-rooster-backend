@@ -1910,8 +1910,18 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         value: str,
         timeout_seconds: int,
     ) -> None:
-        locator = await self._wait_for_first_visible_locator(page, selectors, timeout_seconds)
-        await locator.fill(value)
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250):
+                        await locator.fill(value, timeout=1_500)
+                        return
+                except Exception:
+                    continue
+            await page.wait_for_timeout(250)
+        raise RuntimeError(f"No matching selector was found for {selectors!r}.")
 
     async def _click_first_visible(
         self,
@@ -1919,8 +1929,18 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         selectors: tuple[str, ...],
         timeout_seconds: int,
     ) -> None:
-        locator = await self._wait_for_first_visible_locator(page, selectors, timeout_seconds)
-        await locator.click()
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250):
+                        await locator.click(timeout=1_500)
+                        return
+                except Exception:
+                    continue
+            await page.wait_for_timeout(250)
+        raise RuntimeError(f"No matching selector was found for {selectors!r}.")
 
     async def _wait_for_first_visible_locator(self, page, selectors: tuple[str, ...], timeout_seconds: int):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
