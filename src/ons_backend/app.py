@@ -62,6 +62,8 @@ def create_app(
     app.router.add_post("/status/devices/{device_id}/remove", handle_status_remove_device)
     app.router.add_get("/sandbox/hasmoves/login", handle_mock_login_page)
     app.router.add_post("/sandbox/hasmoves/login", handle_mock_login_submit)
+    app.router.add_get("/sandbox/hasmoves/auth/oidc/mock-microsoft", handle_mock_sso_provider_page)
+    app.router.add_post("/sandbox/hasmoves/auth/oidc/mock-microsoft", handle_mock_sso_provider_submit)
     app.router.add_post("/sandbox/hasmoves/challenge", handle_mock_challenge_submit)
     app.router.add_get("/sandbox/hasmoves/rooster", handle_mock_rooster_page)
     app.router.add_get("/status/live", handle_status_live)
@@ -110,6 +112,7 @@ async def handle_root(request: web.Request) -> web.Response:
             "status": "/status",
             "mock_login_basic": f"{config.public_base_url}/sandbox/hasmoves/login",
             "mock_login_sms": f"{config.public_base_url}/sandbox/hasmoves/login?mode=sms",
+            "mock_login_sso": f"{config.public_base_url}/sandbox/hasmoves/login?mode=sso",
         }
     )
 
@@ -433,8 +436,13 @@ async def handle_status_remove_device(request: web.Request) -> web.Response:
 
 
 async def handle_mock_login_page(request: web.Request) -> web.Response:
+    mode = request.query.get("mode", "basic")
+    if mode == "sso":
+        body = _render_mock_sso_login_page(request.app["config"].public_base_url)
+    else:
+        body = _render_mock_login_page(request.app["config"].public_base_url, mode)
     return web.Response(
-        text=_render_mock_login_page(request.app["config"].public_base_url, request.query.get("mode", "basic")),
+        text=body,
         content_type="text/html",
     )
 
@@ -448,23 +456,55 @@ async def handle_mock_login_submit(request: web.Request) -> web.Response:
             text=_render_mock_challenge_page(username=username, error=None),
             content_type="text/html",
         )
+    if mode == "sso":
+        return web.Response(
+            text=_render_mock_sso_login_page(
+                request.app["config"].public_base_url,
+                native_error_code="sso_required_error",
+            ),
+            content_type="text/html",
+        )
     raise web.HTTPSeeOther(location=f"/sandbox/hasmoves/rooster?{urlencode({'user': username, 'mode': mode})}")
+
+
+async def handle_mock_sso_provider_page(request: web.Request) -> web.Response:
+    return web.Response(
+        text=_render_mock_sso_provider_page(),
+        content_type="text/html",
+    )
+
+
+async def handle_mock_sso_provider_submit(request: web.Request) -> web.Response:
+    form = await request.post()
+    username = str(form.get("loginfmt", form.get("username", "demo"))).strip() or "demo"
+    password = str(form.get("passwd", "")).strip()
+    if password:
+        return web.Response(
+            text=_render_mock_challenge_page(username=username, error=None, mode="sso"),
+            content_type="text/html",
+        )
+    return web.Response(
+        text=_render_mock_sso_provider_page(username=username, stage="password"),
+        content_type="text/html",
+    )
 
 
 async def handle_mock_challenge_submit(request: web.Request) -> web.Response:
     form = await request.post()
     username = str(form.get("username", "demo")).strip() or "demo"
     code = str(form.get("code", "")).strip()
+    mode = request.query.get("mode", "sms")
     if code != MOCK_SMS_CODE:
         return web.Response(
             text=_render_mock_challenge_page(
                 username=username,
                 error=f"Gebruik voor deze test de mock code {MOCK_SMS_CODE}.",
+                mode=mode,
             ),
             content_type="text/html",
             status=400,
         )
-    raise web.HTTPSeeOther(location=f"/sandbox/hasmoves/rooster?{urlencode({'user': username, 'mode': 'sms'})}")
+    raise web.HTTPSeeOther(location=f"/sandbox/hasmoves/rooster?{urlencode({'user': username, 'mode': mode})}")
 
 
 async def handle_mock_rooster_page(request: web.Request) -> web.Response:
@@ -959,6 +999,7 @@ def _render_status_page(
     sync_enabled_class = "online" if status_payload["sync"]["sync_enabled"] else "disabled"
     mock_basic_url = f"{config.public_base_url}/sandbox/hasmoves/login"
     mock_sms_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sms"
+    mock_sso_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sso"
     challenge_controls = "hidden"
     if status_payload["sync"]["current_challenge_id"]:
         challenge_controls = ""
@@ -1194,6 +1235,7 @@ def _render_status_page(
     <p>Gebruik deze URL als ONS-inlog-URL in de app of in backend-tests om de live HasMoves-site te omzeilen.</p>
     <p><strong>Basisflow:</strong> <a href="{html.escape(mock_basic_url)}">{html.escape(mock_basic_url)}</a></p>
     <p><strong>SMS-flow:</strong> <a href="{html.escape(mock_sms_url)}">{html.escape(mock_sms_url)}</a></p>
+        <p><strong>SSO-flow:</strong> <a href="{html.escape(mock_sso_url)}">{html.escape(mock_sso_url)}</a></p>
     <p>Voor de SMS-flow accepteert de mock challenge code <code>{MOCK_SMS_CODE}</code>. Je kunt die via de knop hierboven in de actieve uitdaging injecteren.</p>
   </section>
     <script id="initial-status-json" type="application/json">{initial_snapshot_json}</script>
@@ -1713,7 +1755,142 @@ def _render_mock_login_page(public_base_url: str, mode: str) -> str:
 """
 
 
-def _render_mock_challenge_page(username: str, error: str | None) -> str:
+def _render_mock_sso_login_page(public_base_url: str, native_error_code: str | None = None) -> str:
+        sso_providers = json.dumps(
+                [
+                        {
+                                "id": "mock-microsoft",
+                                "title": "Microsoft SSO",
+                                "button_text": "Aanmelden met SSO",
+                                "button_color": "blue",
+                                "ready": True,
+                                "default": True,
+                                "hidden": False,
+                                "jump_url": "/sandbox/hasmoves/auth/oidc/mock-microsoft",
+                        }
+                ],
+                ensure_ascii=True,
+        )
+        flash_error = "null"
+        if native_error_code:
+                flash_error = json.dumps({"debug": "", "error": native_error_code}, ensure_ascii=True)
+
+        return f"""
+<!doctype html>
+<html lang="nl">
+<head>
+    <meta charset="utf-8">
+    <title>Mock HasMoves SSO Login</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; }}
+        section {{ max-width: 36rem; background: white; border-radius: 12px; padding: 1.25rem; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }}
+        form {{ display: grid; gap: 0.9rem; }}
+        label {{ display: grid; gap: 0.35rem; font-weight: 600; }}
+        input, button {{ font: inherit; }}
+        input {{ padding: 0.65rem 0.8rem; border: 1px solid #cbd5e1; border-radius: 10px; }}
+        button {{ width: fit-content; border: 0; border-radius: 999px; padding: 0.7rem 1.1rem; background: #0f766e; color: white; cursor: pointer; }}
+        .divider {{ margin: 1rem 0; color: #64748b; font-weight: 600; }}
+        .native-note {{ margin-top: 1rem; color: #475569; }}
+    </style>
+    <script>
+        window.sso_enabled = true;
+        window.sso_providers = {sso_providers};
+        window.flash_error = {flash_error};
+    </script>
+</head>
+<body>
+    <section>
+        <h1>Mock HasMoves SSO Login</h1>
+        <p>Deze sandbox bootst de StartMetOns landingspagina na met zowel traditionele login als een Microsoft SSO-knop.</p>
+        <p><strong>Publieke backend-URL:</strong> {html.escape(public_base_url)}</p>
+        <p><a href="/sandbox/hasmoves/auth/oidc/mock-microsoft">Aanmelden met SSO</a></p>
+        <p class="divider">Inloggen met gebruikersnaam</p>
+        <form method="post" action="/sandbox/hasmoves/login?mode=sso">
+            <label>
+                <span>Gebruikersnaam</span>
+                <input type="text" name="username" autocomplete="username" required>
+            </label>
+            <label>
+                <span>Wachtwoord</span>
+                <input type="password" name="password" autocomplete="current-password" required>
+            </label>
+            <button type="submit">Inloggen</button>
+        </form>
+        <p class="native-note">De native submit op deze sandbox geeft bewust <code>sso_required_error</code> terug zodat de backend kan overschakelen naar de browsergestuurde flow.</p>
+    </section>
+</body>
+</html>
+"""
+
+
+def _render_mock_sso_provider_page(username: str = "", stage: str = "email") -> str:
+        if stage == "password":
+                return f"""
+<!doctype html>
+<html lang="nl">
+<head>
+    <meta charset="utf-8">
+    <title>Mock Microsoft Password</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; }}
+        section {{ max-width: 32rem; background: white; border-radius: 12px; padding: 1.25rem; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }}
+        form {{ display: grid; gap: 0.9rem; }}
+        label {{ display: grid; gap: 0.35rem; font-weight: 600; }}
+        input, button {{ font: inherit; }}
+        input {{ padding: 0.65rem 0.8rem; border: 1px solid #cbd5e1; border-radius: 10px; }}
+        button {{ width: fit-content; border: 0; border-radius: 999px; padding: 0.7rem 1.1rem; background: #2563eb; color: white; cursor: pointer; }}
+    </style>
+</head>
+<body>
+    <section>
+        <h1>Mock Microsoft Password</h1>
+        <p>Aangemeld als {html.escape(username)}.</p>
+        <form method="post" action="/sandbox/hasmoves/auth/oidc/mock-microsoft">
+            <input type="hidden" name="username" value="{html.escape(username)}">
+            <label>
+                <span>Wachtwoord</span>
+                <input type="password" name="passwd" autocomplete="current-password" required>
+            </label>
+            <button type="submit" id="idSIButton9">Aanmelden</button>
+        </form>
+    </section>
+</body>
+</html>
+"""
+
+        return """
+<!doctype html>
+<html lang="nl">
+<head>
+    <meta charset="utf-8">
+    <title>Mock Microsoft Sign In</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; }
+        section { max-width: 32rem; background: white; border-radius: 12px; padding: 1.25rem; box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08); }
+        form { display: grid; gap: 0.9rem; }
+        label { display: grid; gap: 0.35rem; font-weight: 600; }
+        input, button { font: inherit; }
+        input { padding: 0.65rem 0.8rem; border: 1px solid #cbd5e1; border-radius: 10px; }
+        button { width: fit-content; border: 0; border-radius: 999px; padding: 0.7rem 1.1rem; background: #2563eb; color: white; cursor: pointer; }
+    </style>
+</head>
+<body>
+    <section>
+        <h1>Mock Microsoft Sign In</h1>
+        <form method="post" action="/sandbox/hasmoves/auth/oidc/mock-microsoft">
+            <label>
+                <span>E-mailadres</span>
+                <input type="email" name="loginfmt" autocomplete="username" required>
+            </label>
+            <button type="submit" id="idSIButton9">Volgende</button>
+        </form>
+    </section>
+</body>
+</html>
+"""
+
+
+def _render_mock_challenge_page(username: str, error: str | None, mode: str = "sms") -> str:
     flash = ""
     if error:
         flash = f'<p style="background:#fee2e2;color:#991b1b;padding:0.8rem 1rem;border-radius:10px;font-weight:600;">{html.escape(error)}</p>'
@@ -1739,7 +1916,7 @@ def _render_mock_challenge_page(username: str, error: str | None) -> str:
     <h1>Mock HasMoves OTP</h1>
     <p>Gebruik voor deze test de vaste mock code <code>{MOCK_SMS_CODE}</code>.</p>
     {flash}
-    <form method="post" action="/sandbox/hasmoves/challenge?mode=sms">
+        <form method="post" action="/sandbox/hasmoves/challenge?mode={html.escape(mode)}">
       <input type="hidden" name="username" value="{html.escape(username)}">
       <label>
         <span>SMS-code</span>

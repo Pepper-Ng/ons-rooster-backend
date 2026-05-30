@@ -471,11 +471,48 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         "geen wachtwoord of gebruikersnaam hebt ingevuld",
         "verify_credentials_error",
         "incorrect_credentials",
+        "sso_required_error",
     )
     LOGIN_ERROR_CODE_MESSAGES = {
         "incorrect_credentials": "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is.",
         "verify_credentials_error": "De ONS-site heeft de ingevoerde gebruikersnaam of het wachtwoord afgekeurd.",
+        "sso_required_error": "De ONS-site vereist aanmelden via de aangeboden SSO-provider.",
     }
+    MICROSOFT_USERNAME_SELECTORS = (
+        'input[name="loginfmt"]',
+        'input[type="email"]',
+        'input[autocomplete="username"]',
+    )
+    MICROSOFT_PASSWORD_SELECTORS = (
+        'input[name="passwd"]',
+        'input[type="password"]',
+        'input[autocomplete="current-password"]',
+    )
+    MICROSOFT_PRIMARY_BUTTON_SELECTORS = (
+        '#idSIButton9',
+        'button[type="submit"]',
+        'input[type="submit"]',
+        'button:has-text("Volgende")',
+        'button:has-text("Next")',
+        'button:has-text("Aanmelden")',
+        'button:has-text("Sign in")',
+        'button:has-text("Inloggen")',
+        'button:has-text("Login")',
+    )
+    MICROSOFT_DECLINE_BUTTON_SELECTORS = (
+        '#idBtn_Back',
+        'button:has-text("Nee")',
+        'button:has-text("No")',
+    )
+    MICROSOFT_PROOF_SELECTION_SELECTORS = (
+        '#idDiv_SAOTCS_Title',
+        '[data-value="OneWaySMS"]',
+        '[data-value="TwoWaySMS"]',
+        'div:has-text("Bevestig uw identiteit")',
+        'div:has-text("Confirm your identity")',
+    )
+    SSO_REQUIRED_ERROR_CODE = "sso_required_error"
+    SSO_PROVIDER_TITLE_MARKERS = ("microsoft", "entra", "azure", "office")
 
     async def authenticate_and_scrape(
         self,
@@ -539,6 +576,48 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 response=login_response,
             )
 
+            login_form = self._extract_login_form(login_response.url, login_response.text)
+            sso_providers = self._extract_sso_providers(login_response.url, login_response.text)
+            preferred_sso_provider, sso_reason = self._select_sso_provider(
+                credentials.username,
+                sso_providers,
+                login_form,
+            )
+            if preferred_sso_provider is not None:
+                provider_label = self._sso_provider_label(preferred_sso_provider)
+                debug_notes.append(
+                    f"Selected SSO provider {provider_label} ({sso_reason}) from {login_response.url}."
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Select SSO provider",
+                    message=f"De backend heeft {provider_label} geselecteerd voor de SSO-flow.",
+                    phase="sso_selected",
+                    url=login_response.url,
+                    page_title=self._extract_page_title(login_response.text),
+                    snapshot_name=self._write_trace_snapshot(
+                        config.auth_trace_dir,
+                        trace_index,
+                        "sso-provider-selection",
+                        login_response.text,
+                    ),
+                    status_code=login_response.status_code,
+                )
+                trace_index += 1
+                return asyncio.run(
+                    self._authenticate_with_sso_playwright(
+                        credentials=credentials,
+                        login_url=login_url,
+                        sso_provider=preferred_sso_provider,
+                        snapshot_path=snapshot_path,
+                        config=config,
+                        report_progress=report_progress,
+                        trace_index=trace_index,
+                        debug_notes=debug_notes,
+                    )
+                )
+
             csrf_token = self._resolve_csrf_token(
                 session,
                 login_response,
@@ -555,7 +634,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     url=login_response.url,
                 )
                 trace_index += 1
-            login_form = self._extract_login_form(login_response.url, login_response.text)
             submit_url = (
                 login_form["action_url"]
                 if login_form is not None
@@ -632,6 +710,52 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         challenge=challenge,
                     ),
                 )
+
+            login_error_code = self._extract_login_error_code(html)
+            if login_error_code == self.SSO_REQUIRED_ERROR_CODE:
+                fallback_sso_provider, fallback_reason = self._select_sso_provider(
+                    credentials.username,
+                    sso_providers,
+                    login_form,
+                    force=True,
+                )
+                if fallback_sso_provider is not None:
+                    provider_label = self._sso_provider_label(fallback_sso_provider)
+                    snapshot_path.write_text(html, encoding="utf-8")
+                    debug_notes.append(
+                        f"Native login returned {self.SSO_REQUIRED_ERROR_CODE}; switching to {provider_label} ({fallback_reason})."
+                    )
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="Switch to SSO",
+                        message=(
+                            f"De backend schakelt over op {provider_label} nadat de ONS-site aangaf dat SSO verplicht is."
+                        ),
+                        phase="sso_selected",
+                        url=submit_response.url,
+                        page_title=page_title,
+                        snapshot_name=self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "sso-required",
+                            html,
+                        ),
+                        status_code=submit_response.status_code,
+                    )
+                    trace_index += 1
+                    return asyncio.run(
+                        self._authenticate_with_sso_playwright(
+                            credentials=credentials,
+                            login_url=login_url,
+                            sso_provider=fallback_sso_provider,
+                            snapshot_path=snapshot_path,
+                            config=config,
+                            report_progress=report_progress,
+                            trace_index=trace_index,
+                            debug_notes=debug_notes,
+                        )
+                    )
 
             login_error = self._extract_login_error(submit_response, html)
             if login_error:
@@ -718,6 +842,550 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 auth_ready=True,
             )
 
+    async def _authenticate_with_sso_playwright(
+        self,
+        *,
+        credentials: LoginCredentials,
+        login_url: str,
+        sso_provider: dict[str, Any],
+        snapshot_path: Path,
+        config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+    ) -> AuthenticationResult:
+        provider_label = self._sso_provider_label(sso_provider)
+        provider_url = str(sso_provider.get("jump_url", "")).strip() or login_url
+
+        async with async_playwright() as playwright:
+            browser = None
+            page = None
+            try:
+                browser = await playwright.chromium.launch(headless=config.playwright_headless)
+                context = await browser.new_context(locale="nl-NL")
+                page = await context.new_page()
+                await page.goto(provider_url, wait_until="domcontentloaded")
+                debug_notes.append(f"Opened SSO provider {provider_label} on {page.url}.")
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Open SSO provider",
+                    message=f"De backend heeft de {provider_label} SSO-provider geopend op {page.url}.",
+                    phase="sso_opened",
+                    page=page,
+                )
+
+                await self._fill_first_visible(
+                    page,
+                    self.MICROSOFT_USERNAME_SELECTORS,
+                    credentials.username,
+                    config.login_timeout_seconds,
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Submit SSO username",
+                    message="De backend heeft de Microsoft gebruikersnaam ingevoerd.",
+                    phase="sso_username_submitted",
+                    url=page.url,
+                )
+                trace_index += 1
+                await self._click_first_visible(
+                    page,
+                    self.MICROSOFT_PRIMARY_BUTTON_SELECTORS,
+                    config.login_timeout_seconds,
+                )
+
+                await self._fill_first_visible(
+                    page,
+                    self.MICROSOFT_PASSWORD_SELECTORS,
+                    credentials.password,
+                    config.login_timeout_seconds,
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Submit SSO password",
+                    message="De backend heeft het Microsoft wachtwoord ingevoerd.",
+                    phase="sso_password_submitted",
+                    url=page.url,
+                )
+                trace_index += 1
+                await self._click_first_visible(
+                    page,
+                    self.MICROSOFT_PRIMARY_BUTTON_SELECTORS,
+                    config.login_timeout_seconds,
+                )
+
+                if await self._maybe_dismiss_stay_signed_in_prompt(page, min(config.login_timeout_seconds, 6)):
+                    debug_notes.append("Dismissed the Microsoft 'stay signed in' prompt.")
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="Dismiss keep-signed-in prompt",
+                        message="De backend heeft de Microsoft prompt om aangemeld te blijven afgewezen.",
+                        phase="sso_prompt_handled",
+                        url=page.url,
+                    )
+                    trace_index += 1
+
+                await self._wait_for_sso_destination(page, config.login_timeout_seconds)
+
+                html = await page.content()
+                page_title = await page.title()
+                proof_selection = self._extract_microsoft_proof_selection(page.url, html)
+                if proof_selection is not None:
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    sms_proof = proof_selection.get("sms_proof")
+                    sms_display = ""
+                    if isinstance(sms_proof, dict):
+                        sms_display = str(sms_proof.get("display", "")).strip()
+                    debug_notes.append(
+                        "Microsoft verification method selection detected"
+                        f"{f' for {sms_display}' if sms_display else ''}; SMS not sent."
+                    )
+                    message = "De backend heeft de Microsoft verificatiekeuze bereikt; de SMS is nog niet verzonden."
+                    if sms_display:
+                        message = (
+                            "De backend heeft de Microsoft verificatiekeuze bereikt en kan nu een SMS sturen naar "
+                            f"{sms_display}, maar heeft dat nog niet gedaan."
+                        )
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="MFA selection detected",
+                        message=message,
+                        phase="mfa_selection_detected",
+                        url=page.url,
+                        page_title=page_title,
+                        snapshot_name=self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "mfa-selection-after-sso",
+                            html,
+                        ),
+                    )
+                    return AuthenticationResult(
+                        final_url=page.url,
+                        page_title=page_title,
+                        roster_items=[],
+                        debug_notes=debug_notes,
+                        auth_ready=False,
+                        session_checkpoint=self._build_browser_session_checkpoint(
+                            cookies=await context.cookies(),
+                            login_url=login_url,
+                            current_url=page.url,
+                            page_title=page_title,
+                            challenge=proof_selection,
+                        ),
+                    )
+
+                challenge = self._extract_otp_checkpoint(page.url, html)
+                if challenge is not None:
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    debug_notes.append(f"OTP challenge detected after SSO at {challenge['action_url']}.")
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="OTP challenge detected",
+                        message=f"De backend heeft na de SSO-flow een OTP-pagina gevonden op {challenge['action_url']}.",
+                        phase="otp_detected",
+                        url=page.url,
+                        page_title=page_title,
+                        snapshot_name=self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "otp-after-sso",
+                            html,
+                        ),
+                    )
+                    return AuthenticationResult(
+                        final_url=page.url,
+                        page_title=page_title,
+                        roster_items=[],
+                        debug_notes=debug_notes,
+                        auth_ready=False,
+                        session_checkpoint=self._build_browser_session_checkpoint(
+                            cookies=await context.cookies(),
+                            login_url=login_url,
+                            current_url=page.url,
+                            page_title=page_title,
+                            challenge=challenge,
+                        ),
+                    )
+
+                login_error = self._extract_login_error(self._synthetic_response(200), html)
+                if login_error:
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="SSO login error",
+                        message=login_error,
+                        phase="login_error",
+                        url=page.url,
+                        page_title=page_title,
+                        snapshot_name=self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "sso-login-error",
+                            html,
+                        ),
+                    )
+                    raise RuntimeError(login_error)
+
+                if self._response_still_looks_like_login(page.url, html, login_url):
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    self._record_event(
+                        report_progress,
+                        trace_index=trace_index,
+                        label="SSO still pending",
+                        message="De backend kwam na de SSO-flow terug op een pagina die nog steeds op de loginflow lijkt.",
+                        phase="login_unconfirmed",
+                        url=page.url,
+                        page_title=page_title,
+                        snapshot_name=self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "sso-login-unconfirmed",
+                            html,
+                        ),
+                    )
+                    raise RuntimeError(
+                        "De backend kon niet bevestigen dat de Microsoft SSO-aanmelding is geaccepteerd. "
+                        f"Laatste pagina: {self._text_snippet(html)}"
+                    )
+
+                target_url = config.roster_url or config.post_login_url
+                if target_url:
+                    resolved_target_url = urljoin(page.url, target_url)
+                    await page.goto(resolved_target_url, wait_until="networkidle")
+                    debug_notes.append(f"Navigated to the configured post-login page {page.url}.")
+                    trace_index = await self._record_playwright_page_step(
+                        report_progress,
+                        config=config,
+                        snapshot_path=snapshot_path,
+                        trace_index=trace_index,
+                        label="Post-login navigation",
+                        message=f"De backend heeft de ingestelde post-login pagina geopend op {page.url}.",
+                        phase="post_login_page",
+                        page=page,
+                    )
+
+                html = await page.content()
+                page_title = await page.title()
+                await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                roster_items, extraction_notes = self._extract_roster_items(html)
+                debug_notes.extend(extraction_notes)
+                debug_notes.append(f"Detected {len(roster_items)} roster-like entries on the last page.")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Authentication ready",
+                    message=f"De backend heeft de SSO-flow afgerond en {len(roster_items)} roosterregels gedetecteerd.",
+                    phase="ready",
+                    url=page.url,
+                    page_title=page_title,
+                )
+
+                return AuthenticationResult(
+                    final_url=page.url,
+                    page_title=page_title,
+                    roster_items=roster_items,
+                    debug_notes=debug_notes,
+                    auth_ready=True,
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                html = ""
+                page_title = ""
+                current_url = provider_url
+                if page is not None:
+                    html = await page.content()
+                    page_title = await page.title()
+                    current_url = page.url
+                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="SSO automation error",
+                    message="De backend kon de Microsoft SSO-flow niet afronden.",
+                    phase="sso_error",
+                    url=current_url,
+                    page_title=page_title,
+                    snapshot_name=(
+                        self._write_trace_snapshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "sso-automation-error",
+                            html,
+                        )
+                        if html
+                        else ""
+                    ),
+                )
+                raise RuntimeError(
+                    "De backend kon de Microsoft SSO-flow niet afronden. "
+                    f"Laatste pagina: {self._text_snippet(html) if html else str(exc)}"
+                ) from exc
+            finally:
+                if browser is not None:
+                    await browser.close()
+
+    async def _record_playwright_page_step(
+        self,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        *,
+        config: AppConfig,
+        snapshot_path: Path,
+        trace_index: int,
+        label: str,
+        message: str,
+        phase: str,
+        page,
+    ) -> int:
+        html = await page.content()
+        await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+        self._record_event(
+            report_progress,
+            trace_index=trace_index,
+            label=label,
+            message=message,
+            phase=phase,
+            url=page.url,
+            page_title=await page.title(),
+            snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, label, html),
+        )
+        return trace_index + 1
+
+    async def _fill_first_visible(
+        self,
+        page,
+        selectors: tuple[str, ...],
+        value: str,
+        timeout_seconds: int,
+    ) -> None:
+        locator = await self._wait_for_first_visible_locator(page, selectors, timeout_seconds)
+        await locator.fill(value)
+
+    async def _click_first_visible(
+        self,
+        page,
+        selectors: tuple[str, ...],
+        timeout_seconds: int,
+    ) -> None:
+        locator = await self._wait_for_first_visible_locator(page, selectors, timeout_seconds)
+        await locator.click()
+
+    async def _wait_for_first_visible_locator(self, page, selectors: tuple[str, ...], timeout_seconds: int):
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            for selector in selectors:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250):
+                        return locator
+                except Exception:
+                    continue
+            await page.wait_for_timeout(250)
+        raise RuntimeError(f"No matching selector was found for {selectors!r}.")
+
+    async def _maybe_dismiss_stay_signed_in_prompt(self, page, timeout_seconds: int) -> bool:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if not self._looks_like_external_sso_host(page.url):
+                return False
+            if await self._has_visible_selector(page, self.MICROSOFT_PROOF_SELECTION_SELECTORS):
+                return False
+            if await self._has_visible_selector(page, self.OTP_SELECTORS):
+                return False
+            for selector in self.MICROSOFT_DECLINE_BUTTON_SELECTORS:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250):
+                        await locator.click()
+                        await page.wait_for_timeout(250)
+                        return True
+                except Exception:
+                    continue
+            await page.wait_for_timeout(250)
+        return False
+
+    async def _wait_for_sso_destination(self, page, timeout_seconds: int) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            if await self._has_visible_selector(page, self.OTP_SELECTORS):
+                return
+            if await self._has_visible_selector(page, self.MICROSOFT_PROOF_SELECTION_SELECTORS):
+                return
+            if not self._looks_like_external_sso_host(page.url):
+                return
+            await page.wait_for_timeout(250)
+
+    @staticmethod
+    def _looks_like_external_sso_host(url: str) -> bool:
+        host = urlparse(url).netloc.lower()
+        return any(
+            marker in host
+            for marker in ("microsoftonline.com", "login.live.com", "live.com")
+        )
+
+    def _build_browser_session_checkpoint(
+        self,
+        *,
+        cookies: list[dict[str, Any]],
+        login_url: str,
+        current_url: str,
+        page_title: str,
+        challenge: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "saved_at": self._utc_timestamp(),
+            "login_url": login_url,
+            "current_url": current_url,
+            "page_title": page_title,
+            "challenge": challenge,
+            "cookies": self._serialize_browser_cookies(cookies),
+        }
+
+    @staticmethod
+    def _serialize_browser_cookies(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        serialized: list[dict[str, Any]] = []
+        for cookie in cookies:
+            expires = cookie.get("expires")
+            serialized.append(
+                {
+                    "name": str(cookie.get("name", "")),
+                    "value": str(cookie.get("value", "")),
+                    "domain": str(cookie.get("domain", "")),
+                    "path": str(cookie.get("path", "/")),
+                    "secure": bool(cookie.get("secure", False)),
+                    "expires": None if expires in {None, -1} else expires,
+                }
+            )
+        return serialized
+
+    @staticmethod
+    def _synthetic_response(status_code: int) -> requests.Response:
+        response = requests.Response()
+        response.status_code = status_code
+        return response
+
+    def _extract_microsoft_proof_selection(self, current_url: str, html: str) -> dict[str, Any] | None:
+        soup = BeautifulSoup(html, "html.parser")
+        heading = ""
+        heading_element = soup.select_one("#idDiv_SAOTCS_Title")
+        if heading_element is not None:
+            heading = " ".join(fragment.strip() for fragment in heading_element.stripped_strings)
+
+        config = self._extract_script_assignment_object(html, "$Config")
+        proofs: list[dict[str, Any]] = []
+        raw_proofs = config.get("arrUserProofs") if config else None
+        if isinstance(raw_proofs, list):
+            for item in raw_proofs:
+                if not isinstance(item, dict):
+                    continue
+                auth_method_id = str(item.get("authMethodId", "")).strip()
+                data_value = str(item.get("data", "")).strip()
+                display = str(item.get("display", "")).strip()
+                if not (auth_method_id or data_value or display):
+                    continue
+                proofs.append(
+                    {
+                        "auth_method_id": auth_method_id,
+                        "data": data_value,
+                        "display": display,
+                        "is_default": bool(item.get("isDefault", False)),
+                        "is_location_aware": bool(item.get("isLocationAware", False)),
+                        "phone_number_suffix": self._masked_phone_suffix(display),
+                    }
+                )
+
+        if not proofs:
+            for element in soup.select("[data-value]"):
+                value = str(element.get("data-value", "")).strip()
+                display = " ".join(fragment.strip() for fragment in element.stripped_strings)
+                if not (value or display):
+                    continue
+                proofs.append(
+                    {
+                        "auth_method_id": value,
+                        "data": value,
+                        "display": display,
+                        "is_default": False,
+                        "is_location_aware": False,
+                        "phone_number_suffix": self._masked_phone_suffix(display),
+                    }
+                )
+
+        normalized_heading = heading.lower()
+        looks_like_selection = bool(proofs) and (
+            "bevestig uw identiteit" in normalized_heading
+            or "confirm your identity" in normalized_heading
+            or any(self._proof_looks_like_sms(proof) for proof in proofs)
+        )
+        if not looks_like_selection:
+            return None
+
+        form = soup.select_one("form")
+        action_url = current_url
+        method = "post"
+        if form is not None:
+            action = str(form.get("action", "")).strip()
+            action_url = urljoin(current_url, action or current_url)
+            method = str(form.get("method", "post")).strip().lower() or "post"
+        elif config:
+            action_url = str(config.get("urlPost", "")).strip() or current_url
+
+        proof_input_name = str(config.get("sAuthMethodInputFieldName", "mfaAuthMethod")).strip() or "mfaAuthMethod"
+        hidden_fields: dict[str, str] = {}
+        flow_token_name = str(config.get("sFTName", "flowToken")).strip() or "flowToken"
+        flow_token = str(config.get("sFT", "")).strip()
+        if flow_token:
+            hidden_fields[flow_token_name] = flow_token
+        context_value = str(config.get("sCtx", "")).strip()
+        if context_value:
+            hidden_fields["ctx"] = context_value
+        canary = str(config.get("canary", "")).strip()
+        if canary:
+            hidden_fields["canary"] = canary
+
+        sms_proof = next((proof for proof in proofs if self._proof_looks_like_sms(proof)), None)
+        sms_proof_value = ""
+        if sms_proof is not None:
+            sms_proof_value = str(sms_proof.get("data") or sms_proof.get("auth_method_id") or "").strip()
+
+        return {
+            "challenge_kind": "microsoft_proof_selection",
+            "action_url": action_url,
+            "method": method,
+            "proof_input_name": proof_input_name,
+            "sms_proof_value": sms_proof_value,
+            "sms_proof": sms_proof or {},
+            "proofs": proofs,
+            "hidden_fields": hidden_fields,
+        }
+
+    @staticmethod
+    def _proof_looks_like_sms(proof: dict[str, Any]) -> bool:
+        combined = " ".join(
+            [
+                str(proof.get("auth_method_id", "")).lower(),
+                str(proof.get("data", "")).lower(),
+                str(proof.get("display", "")).lower(),
+            ]
+        )
+        return any(marker in combined for marker in ("sms", "text", "verzenden"))
+
+    @staticmethod
+    def _masked_phone_suffix(display: str) -> str:
+        digits = re.sub(r"\D", "", display)
+        return digits[-2:] if len(digits) >= 2 else ""
+
     def _resolve_csrf_token(
         self,
         session: requests.Session,
@@ -747,6 +1415,114 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
 
         debug_notes.append("No CSRF token was exposed; continuing with a plain form submit.")
         return ""
+
+    def _extract_sso_providers(self, current_url: str, html: str) -> list[dict[str, Any]]:
+        if self._extract_window_bootstrap_value(html, "sso_enabled") is False:
+            return []
+
+        providers: list[dict[str, Any]] = []
+        raw_value = self._extract_window_bootstrap_value(html, "sso_providers")
+        if isinstance(raw_value, list):
+            for item in raw_value:
+                if not isinstance(item, dict):
+                    continue
+                jump_url = urljoin(current_url, str(item.get("jump_url", "")).strip())
+                if not jump_url:
+                    continue
+                providers.append(
+                    {
+                        "id": str(item.get("id", "")).strip(),
+                        "title": str(item.get("title", "")).strip(),
+                        "button_text": str(item.get("button_text", "")).strip(),
+                        "jump_url": jump_url,
+                        "ready": bool(item.get("ready", True)),
+                        "default": bool(item.get("default", False)),
+                        "hidden": bool(item.get("hidden", False)),
+                    }
+                )
+
+        if providers:
+            return providers
+
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.select('a[href*="/auth/oidc/"]'):
+            href = str(anchor.get("href", "")).strip()
+            if not href:
+                continue
+            text = " ".join(fragment.strip() for fragment in anchor.stripped_strings)
+            providers.append(
+                {
+                    "id": "",
+                    "title": text,
+                    "button_text": text,
+                    "jump_url": urljoin(current_url, href),
+                    "ready": True,
+                    "default": False,
+                    "hidden": False,
+                }
+            )
+
+        return providers
+
+    def _select_sso_provider(
+        self,
+        username: str,
+        providers: list[dict[str, Any]],
+        login_form: dict[str, Any] | None,
+        *,
+        force: bool = False,
+    ) -> tuple[dict[str, Any] | None, str]:
+        ready_providers = [
+            provider
+            for provider in providers
+            if provider.get("jump_url") and provider.get("ready", True) and not provider.get("hidden", False)
+        ]
+        if not ready_providers:
+            return None, ""
+
+        default_provider = next((provider for provider in ready_providers if provider.get("default")), None)
+        labelled_provider = next(
+            (
+                provider
+                for provider in ready_providers
+                if any(
+                    marker in " ".join(
+                        [
+                            str(provider.get("title", "")).lower(),
+                            str(provider.get("button_text", "")).lower(),
+                        ]
+                    )
+                    for marker in self.SSO_PROVIDER_TITLE_MARKERS
+                )
+            ),
+            None,
+        )
+        email_like_username = "@" in username
+
+        if force:
+            provider = default_provider or labelled_provider or ready_providers[0]
+            return provider, "forced_sso_fallback"
+
+        if login_form is None:
+            provider = default_provider or labelled_provider or ready_providers[0]
+            return provider, "no_native_login_form"
+
+        if email_like_username and default_provider is not None:
+            return default_provider, "default_provider_for_email_login"
+
+        if email_like_username and len(ready_providers) == 1:
+            provider = labelled_provider or ready_providers[0]
+            return provider, "single_ready_provider_for_email_login"
+
+        return None, ""
+
+    @staticmethod
+    def _sso_provider_label(provider: dict[str, Any]) -> str:
+        for field_name in ("button_text", "title", "id"):
+            value = str(provider.get(field_name, "")).strip()
+            if value:
+                return value
+        return "SSO-provider"
 
     def _extract_hidden_input(self, html: str, name: str) -> str:
         soup = BeautifulSoup(html, "html.parser")
@@ -869,27 +1645,95 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             return f"De ONS-login gaf HTTP {response.status_code} terug."
         return ""
 
+    def _extract_login_error_code(self, html: str) -> str:
+        flash_error = self._extract_window_bootstrap_object(html, "flash_error")
+        if not flash_error:
+            return ""
+        return str(flash_error.get("error", "")).strip().lower()
+
     @staticmethod
     def _extract_window_bootstrap_object(html: str, variable_name: str) -> dict[str, Any]:
-        match = re.search(
-            rf"window\.{re.escape(variable_name)}\s*=\s*(\{{.*?\}}|null)\s*;",
-            html,
-            flags=re.IGNORECASE | re.DOTALL,
-        )
-        if match is None:
-            return {}
-
-        raw_value = match.group(1).strip()
-        if raw_value.lower() == "null":
-            return {}
-
-        try:
-            payload = json.loads(raw_value)
-        except json.JSONDecodeError:
-            return {}
+        payload = HttpLoginAutomationClient._extract_window_bootstrap_value(html, variable_name)
         if not isinstance(payload, dict):
             return {}
         return payload
+
+    @staticmethod
+    def _extract_window_bootstrap_value(html: str, variable_name: str) -> Any | None:
+        return HttpLoginAutomationClient._extract_script_assignment_value(html, f"window.{variable_name}")
+
+    @staticmethod
+    def _extract_script_assignment_object(html: str, variable_name: str) -> dict[str, Any]:
+        payload = HttpLoginAutomationClient._extract_script_assignment_value(html, variable_name)
+        if not isinstance(payload, dict):
+            return {}
+        return payload
+
+    @staticmethod
+    def _extract_script_assignment_value(html: str, variable_name: str) -> Any | None:
+        match = re.search(
+            rf"{re.escape(variable_name)}\s*=\s*",
+            html,
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+
+        start = match.end()
+        while start < len(html) and html[start].isspace():
+            start += 1
+        if start >= len(html):
+            return None
+
+        if html[start] in "[{":
+            raw_value = HttpLoginAutomationClient._read_balanced_bootstrap_value(html, start)
+        else:
+            end = html.find(";", start)
+            if end == -1:
+                return None
+            raw_value = html[start:end].strip()
+
+        if not raw_value:
+            return None
+
+        try:
+            return json.loads(raw_value)
+        except json.JSONDecodeError:
+            return None
+
+    @staticmethod
+    def _read_balanced_bootstrap_value(source: str, start: int) -> str:
+        stack = [source[start]]
+        in_string = ""
+        escaped = False
+
+        for index in range(start + 1, len(source)):
+            character = source[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == in_string:
+                    in_string = ""
+                continue
+
+            if character in {'"', "'"}:
+                in_string = character
+                continue
+
+            if character in "[{":
+                stack.append(character)
+                continue
+
+            if character in "]}":
+                if not stack:
+                    return ""
+                stack.pop()
+                if not stack:
+                    return source[start : index + 1]
+
+        return ""
 
     def _response_still_looks_like_login(self, current_url: str, html: str, login_url: str) -> bool:
         soup = BeautifulSoup(html, "html.parser")

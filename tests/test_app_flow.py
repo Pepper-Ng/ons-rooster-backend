@@ -120,6 +120,71 @@ class FakeCheckpointAutomationClient:
         )
 
 
+class FakeMfaSelectionAutomationClient:
+    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
+        del credentials, request_sms_code, config
+        if report_progress is not None:
+            await report_progress(
+                {
+                    "entry_id": "step-001",
+                    "created_at": "2026-05-30T00:00:00Z",
+                    "label": "MFA selection detected",
+                    "message": "De fake SSO-client heeft de Microsoft verificatiekeuze bereikt.",
+                    "phase": "mfa_selection_detected",
+                    "url": "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+                    "page_title": "Aanmelden bij uw account",
+                    "snapshot_name": "001-mfa-selection-detected.html",
+                }
+            )
+        snapshot_path.write_text(
+            "<html><head><title>Aanmelden bij uw account</title></head><body><div id='idDiv_SAOTCS_Title'>Bevestig uw identiteit</div></body></html>",
+            encoding="utf-8",
+        )
+        return AuthenticationResult(
+            final_url="https://login.microsoftonline.com/common/SAS/ProcessAuth",
+            page_title="Aanmelden bij uw account",
+            roster_items=[],
+            debug_notes=["Microsoft proof selection checkpoint saved."],
+            auth_ready=False,
+            session_checkpoint={
+                "version": 1,
+                "current_url": "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+                "challenge": {
+                    "challenge_kind": "microsoft_proof_selection",
+                    "action_url": "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+                    "method": "post",
+                    "proof_input_name": "mfaAuthMethod",
+                    "sms_proof_value": "OneWaySMS",
+                    "sms_proof": {
+                        "auth_method_id": "OneWaySMS",
+                        "data": "OneWaySMS",
+                        "display": "+XX XXXXXXX32",
+                        "phone_number_suffix": "32",
+                    },
+                    "proofs": [
+                        {
+                            "auth_method_id": "OneWaySMS",
+                            "data": "OneWaySMS",
+                            "display": "+XX XXXXXXX32",
+                            "phone_number_suffix": "32",
+                        }
+                    ],
+                    "hidden_fields": {"flowToken": "flow-token", "ctx": "ctx-token"},
+                },
+                "cookies": [
+                    {
+                        "name": "session",
+                        "value": "secret-cookie",
+                        "domain": "login.microsoftonline.com",
+                        "path": "/",
+                        "secure": True,
+                        "expires": None,
+                    }
+                ],
+            },
+        )
+
+
 class CountingAutomationClient:
     def __init__(self) -> None:
         self.call_count = 0
@@ -616,6 +681,71 @@ def test_http_login_automation_client_reads_bootstrap_flash_error():
         assert error_message == "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is."
 
 
+def test_http_login_automation_client_extracts_sso_provider_from_bootstrap_script():
+        automation_client = HttpLoginAutomationClient()
+        html = """
+<!doctype html>
+<html lang="nl">
+    <head>
+        <script type="text/javascript">
+            window.sso_enabled = true;
+            window.sso_providers = [{"id":"mock-microsoft","title":"Microsoft SSO","button_text":"Aanmelden met SSO","jump_url":"/auth/oidc/mock-microsoft","ready":true,"default":true,"hidden":false}];
+        </script>
+    </head>
+    <body><div id="main"></div></body>
+</html>
+"""
+
+        providers = automation_client._extract_sso_providers("https://example.invalid/login", html)
+
+        assert providers == [
+            {
+                "id": "mock-microsoft",
+                "title": "Microsoft SSO",
+                "button_text": "Aanmelden met SSO",
+                "jump_url": "https://example.invalid/auth/oidc/mock-microsoft",
+                "ready": True,
+                "default": True,
+                "hidden": False,
+            }
+        ]
+
+
+def test_http_login_automation_client_extracts_microsoft_proof_selection():
+        automation_client = HttpLoginAutomationClient()
+        html = """
+<!doctype html>
+<html lang="nl">
+    <head>
+        <title>Aanmelden bij uw account</title>
+        <script type="text/javascript">
+            $Config={"arrUserProofs":[{"authMethodId":"OneWaySMS","data":"OneWaySMS","display":"+XX XXXXXXX32","isDefault":false,"isLocationAware":false},{"authMethodId":"TwoWayVoiceMobile","data":"TwoWayVoiceMobile","display":"+XX XXXXXXX32","isDefault":false,"isLocationAware":false}],"urlPost":"https://login.microsoftonline.com/common/SAS/ProcessAuth","sFT":"flow-token","sFTName":"flowToken","sCtx":"ctx-token","sAuthMethodInputFieldName":"mfaAuthMethod"};
+        </script>
+    </head>
+    <body>
+        <form method="post" action="https://login.microsoftonline.com/common/SAS/ProcessAuth">
+            <div id="idDiv_SAOTCS_Title">Bevestig uw identiteit</div>
+            <div data-value="OneWaySMS"><div>Sms verzenden naar +XX XXXXXXX32</div></div>
+        </form>
+    </body>
+</html>
+"""
+
+        challenge = automation_client._extract_microsoft_proof_selection(
+            "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+            html,
+        )
+
+        assert challenge is not None
+        assert challenge["challenge_kind"] == "microsoft_proof_selection"
+        assert challenge["proof_input_name"] == "mfaAuthMethod"
+        assert challenge["sms_proof_value"] == "OneWaySMS"
+        assert challenge["sms_proof"]["display"] == "+XX XXXXXXX32"
+        assert challenge["sms_proof"]["phone_number_suffix"] == "32"
+        assert challenge["hidden_fields"]["flowToken"] == "flow-token"
+        assert challenge["hidden_fields"]["ctx"] == "ctx-token"
+
+
 @pytest.mark.asyncio
 async def test_status_page_renders_auth_console(aiohttp_client, tmp_path):
     config = build_config(tmp_path)
@@ -797,6 +927,48 @@ async def test_partial_login_stage_persists_otp_checkpoint(aiohttp_client, tmp_p
 
 
 @pytest.mark.asyncio
+async def test_partial_login_stage_persists_microsoft_proof_selection_checkpoint(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=FakeMfaSelectionAutomationClient(),
+    )
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert response.status == 200
+
+    await wait_for(lambda: service.mobile_status_payload()["sync"]["current_phase"] == "mfa_required")
+    status = service.mobile_status_payload()
+    assert status["sync"]["status"] == "partial"
+    assert status["sync"]["auth_ready"] is False
+    assert "SMS is nog niet verzonden" in status["sync"]["last_message"]
+    assert "+XX XXXXXXX32" in status["sync"]["last_message"]
+
+    checkpoint = service.store.read_auth_session()
+    assert checkpoint is not None
+    assert checkpoint["challenge"]["challenge_kind"] == "microsoft_proof_selection"
+    assert checkpoint["challenge"]["sms_proof"]["phone_number_suffix"] == "32"
+    raw = config.auth_session_file.read_text(encoding="utf-8")
+    assert "secret-cookie" not in raw
+    assert push_client.auth_notifications == []
+
+
+@pytest.mark.asyncio
 async def test_admin_fcm_status_and_test_endpoint(aiohttp_client, test_context):
     app, _, push_client, _ = test_context
     client = await aiohttp_client(app)
@@ -943,6 +1115,43 @@ async def test_mock_hasmoves_pages_cover_basic_and_sms_flow(aiohttp_client, test
     assert basic_roster.status == 200
     basic_roster_body = await basic_roster.text()
     assert "Mock vroege dienst voor bob@example.invalid" in basic_roster_body
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_switches_to_sso_and_captures_otp_checkpoint(aiohttp_client, test_context, tmp_path):
+    app, _, _, _ = test_context
+    client = await aiohttp_client(app)
+    automation_client = HttpLoginAutomationClient()
+    snapshot_path = tmp_path / "sso-snapshot.html"
+    progress_events: list[dict[str, object]] = []
+
+    try:
+        result = await automation_client.authenticate_and_scrape(
+            credentials=LoginCredentials(
+                login_url=str(client.make_url("/sandbox/hasmoves/login?mode=sso")),
+                username="alice@example.invalid",
+                password="secret",
+            ),
+            request_sms_code=unexpected_sms_request,
+            snapshot_path=snapshot_path,
+            config=build_config(tmp_path),
+            report_progress=lambda event: asyncio.sleep(0, result=progress_events.append(event)),
+        )
+    except RuntimeError as exc:
+        if "Executable doesn't exist" in str(exc):
+            pytest.skip("Playwright browser binaries are not installed in this environment.")
+        raise
+
+    assert result.auth_ready is False
+    assert result.session_checkpoint is not None
+    assert result.session_checkpoint["challenge"]["otp_input_name"] == "code"
+    assert result.session_checkpoint["challenge"]["action_url"].endswith(
+        "/sandbox/hasmoves/challenge?mode=sso"
+    )
+    assert "Mock HasMoves OTP" in snapshot_path.read_text(encoding="utf-8")
+    assert any(event["phase"] == "sso_selected" for event in progress_events)
+    assert any(event["phase"] == "sso_opened" for event in progress_events)
+    assert any(event["phase"] == "otp_detected" for event in progress_events)
 
 
 @pytest.mark.asyncio

@@ -785,6 +785,29 @@ class BackendService:
         return pending.code
 
     async def _finalize_success(self, result: AuthenticationResult) -> None:
+        partial_phase = "otp_required"
+        partial_message = "Gebruikersnaam en wachtwoord zijn geaccepteerd. De OTP-pagina is vastgelegd voor de vervolgstap."
+        partial_note = "De backend heeft de eerste ONS-loginstap afgerond en wacht op OTP-afhandeling."
+        if not result.auth_ready and result.session_checkpoint is not None:
+            challenge = result.session_checkpoint.get("challenge", {})
+            if isinstance(challenge, dict) and challenge.get("challenge_kind") == "microsoft_proof_selection":
+                partial_phase = "mfa_required"
+                sms_proof = challenge.get("sms_proof")
+                sms_display = ""
+                if isinstance(sms_proof, dict):
+                    sms_display = str(sms_proof.get("display", "")).strip()
+                partial_message = (
+                    "Gebruikersnaam en wachtwoord zijn geaccepteerd. De Microsoft verificatiekeuze is bereikt; de SMS is nog niet verzonden."
+                )
+                if sms_display:
+                    partial_message = (
+                        "Gebruikersnaam en wachtwoord zijn geaccepteerd. "
+                        f"De Microsoft verificatiekeuze is bereikt voor {sms_display}; de SMS is nog niet verzonden."
+                    )
+                partial_note = (
+                    "De backend heeft de Microsoft verificatiekeuze bereikt en wacht op expliciete SMS-verzending."
+                )
+
         if result.auth_ready:
             await asyncio.to_thread(self.store.clear_auth_session)
         else:
@@ -797,14 +820,14 @@ class BackendService:
         async with self._state_lock:
             # The latest successful page snapshot and roster payload become the operator-facing debug baseline.
             self.state.sync.status = "success" if result.auth_ready else "partial"
-            self.state.sync.current_phase = "ready" if result.auth_ready else "otp_required"
+            self.state.sync.current_phase = "ready" if result.auth_ready else partial_phase
             self.state.sync.auth_ready = result.auth_ready
             self.state.sync.last_success_at = utc_now()
             self.state.sync.last_error = None
             self.state.sync.last_message = (
                 "De backend is succesvol aangemeld en klaar om te synchroniseren."
                 if result.auth_ready
-                else "Gebruikersnaam en wachtwoord zijn geaccepteerd. De OTP-pagina is vastgelegd voor de vervolgstap."
+                else partial_message
             )
             self.state.sync.current_challenge_id = None
             self.state.sync.challenge_created_at = None
@@ -816,7 +839,7 @@ class BackendService:
             self._remember_note(
                 "De backend heeft de ONS-aanmelding succesvol afgerond."
                 if result.auth_ready
-                else "De backend heeft de eerste ONS-loginstap afgerond en wacht op OTP-afhandeling."
+                else partial_note
             )
             await self._persist_state()
             if result.auth_ready:
