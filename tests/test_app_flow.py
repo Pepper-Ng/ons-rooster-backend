@@ -555,6 +555,109 @@ async def test_status_page_renders_auth_console(aiohttp_client, tmp_path):
     body = await status_page.text()
     assert "Authenticatieconsole" in body
     assert "Bekijk HTML" in body
+    assert "Credentialexport" in body
+    assert "python -m ons_backend.credential_export" in body
+
+
+@pytest.mark.asyncio
+async def test_status_credential_export_requires_session_and_returns_encrypted_bundle(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+
+    unauthorized = await client.post(
+        "/status/credentials/export?token=admin-code",
+        data={
+            "export_passphrase": "correct horse battery staple",
+            "confirm_export_passphrase": "correct horse battery staple",
+        },
+    )
+    assert unauthorized.status == 401
+
+    login_response = await client.post(
+        "/status/login",
+        data={"admin_token": "admin-code"},
+    )
+    assert login_response.status == 200
+
+    export_response = await client.post(
+        "/status/credentials/export",
+        data={
+            "export_passphrase": "correct horse battery staple",
+            "confirm_export_passphrase": "correct horse battery staple",
+        },
+    )
+    assert export_response.status == 200
+    assert export_response.headers["Content-Type"].startswith("application/json")
+    assert "attachment; filename=" in export_response.headers["Content-Disposition"]
+    assert export_response.headers["Cache-Control"] == "no-store, max-age=0"
+
+    raw_bundle = await export_response.text()
+    assert "alice@example.invalid" not in raw_bundle
+    assert "super-secret" not in raw_bundle
+
+    bundle = json.loads(raw_bundle)
+    decrypted = StateStore.decrypt_credentials_export(bundle, "correct horse battery staple")
+    assert decrypted.username == "alice@example.invalid"
+    assert decrypted.password == "super-secret"
+
+
+@pytest.mark.asyncio
+async def test_status_credential_export_rejects_admin_token_as_passphrase(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+
+    login_response = await client.post(
+        "/status/login",
+        data={"admin_token": "admin-code"},
+    )
+    assert login_response.status == 200
+
+    export_response = await client.post(
+        "/status/credentials/export",
+        data={
+            "export_passphrase": "admin-code",
+            "confirm_export_passphrase": "admin-code",
+        },
+    )
+    assert export_response.status == 200
+    body = await export_response.text()
+    assert "Kies een andere export-passphrase dan het admin-token." in body
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import json
+
+import pytest
+
 from ons_backend.config import AppConfig
 from ons_backend.models import AppState, DeviceRegistration, LoginCredentials
 from ons_backend.storage import StateStore
@@ -49,6 +53,41 @@ def test_state_store_encrypts_credentials(tmp_path):
     loaded_state, loaded_credentials = store.load()
     assert loaded_state.to_dict() == state.to_dict()
     assert loaded_credentials == credentials
+
+
+def test_state_store_round_trips_credentials_export(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    credentials = LoginCredentials(
+        login_url="https://example.invalid/login",
+        username="alice@example.invalid",
+        password="super-secret",
+    )
+
+    bundle = store.build_credentials_export(credentials, "correct horse battery staple")
+    raw_bundle = json.dumps(bundle, ensure_ascii=True)
+
+    assert "alice@example.invalid" not in raw_bundle
+    assert "super-secret" not in raw_bundle
+
+    decrypted = StateStore.decrypt_credentials_export(bundle, "correct horse battery staple")
+    assert decrypted == credentials
+
+
+def test_state_store_credentials_export_rejects_wrong_passphrase(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    bundle = store.build_credentials_export(
+        LoginCredentials(
+            login_url="https://example.invalid/login",
+            username="alice@example.invalid",
+            password="super-secret",
+        ),
+        "correct horse battery staple",
+    )
+
+    with pytest.raises(RuntimeError, match="export-passphrase"):
+        StateStore.decrypt_credentials_export(bundle, "wrong passphrase")
 
 
 def test_state_store_persists_snapshot_and_ics(tmp_path):

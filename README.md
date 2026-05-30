@@ -185,9 +185,27 @@ It uses the same `ADMIN_TOKEN` as a lightweight web password. After login, the p
 - a `Maak actief` button to switch the active device
 - a manual sync trigger
 - a mock OTP submit button for the current challenge
+- a credential-export form that downloads a passphrase-encrypted JSON bundle instead of showing plaintext credentials in the browser
 - direct links to the mock HasMoves pages
 
 This page is intended for browser-based operator checks on the live HTTPS host, not for the Android app.
+
+### Credential export
+
+The operator page now includes a dedicated credential-export section.
+
+Use it when you need the stored ONS credentials back in human-readable form without exposing them directly in the browser:
+
+1. Open `/status` and log in with `ADMIN_TOKEN`.
+2. Enter a separate one-time export passphrase of at least 12 characters.
+3. Download the encrypted JSON export.
+4. Decrypt it locally with:
+
+```bash
+python -m ons_backend.credential_export path/to/ons-rooster-credentials-export.json
+```
+
+The backend does not render the decrypted password on the status page. The export route also requires an existing `/status/login` session cookie, so a bare `?token=...` request is not enough to download the bundle.
 
 ## Mock HasMoves loopback
 

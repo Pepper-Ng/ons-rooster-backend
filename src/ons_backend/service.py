@@ -398,6 +398,24 @@ class BackendService:
 
         return FcmPushClient(self.config).diagnostics()
 
+    def export_credentials_bundle(self, passphrase: str) -> dict[str, Any]:
+        if not self.config.admin_token:
+            raise RuntimeError(
+                "Credentialexport is uitgeschakeld zolang er geen admin-token is geconfigureerd."
+            )
+        if hmac.compare_digest(passphrase, self.config.admin_token):
+            raise RuntimeError("Kies een andere export-passphrase dan het admin-token.")
+        if len(passphrase) < 12:
+            raise RuntimeError("Kies een export-passphrase van minimaal 12 tekens.")
+
+        resolved_credentials = self._resolved_credentials()
+        if resolved_credentials is None:
+            raise RuntimeError("Er zijn nog geen ONS-inloggegevens opgeslagen.")
+
+        bundle = self.store.build_credentials_export(resolved_credentials, passphrase)
+        bundle["created_at"] = utc_now()
+        return bundle
+
     def mobile_config_payload(self) -> dict[str, Any]:
         default_portal = self.default_portal()
         return {

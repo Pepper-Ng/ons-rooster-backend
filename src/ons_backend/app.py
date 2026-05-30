@@ -53,6 +53,7 @@ def create_app(
     app.router.add_get("/status", handle_status_page)
     app.router.add_post("/status/login", handle_status_login)
     app.router.add_post("/status/logout", handle_status_logout)
+    app.router.add_post("/status/credentials/export", handle_status_credentials_export)
     app.router.add_get("/status/auth-trace/{entry_id}", handle_status_auth_trace)
     app.router.add_post("/status/refresh", handle_status_refresh)
     app.router.add_post("/status/challenges/mock-sms", handle_status_mock_sms)
@@ -334,6 +335,35 @@ async def handle_status_logout(request: web.Request) -> web.Response:
     response = web.HTTPSeeOther(location="/status")
     response.del_cookie(OPS_SESSION_COOKIE, path="/")
     raise response
+
+
+async def handle_status_credentials_export(request: web.Request) -> web.Response:
+    _require_ops_session(request)
+    form = await request.post()
+    passphrase = str(form.get("export_passphrase", ""))
+    confirm_passphrase = str(form.get("confirm_export_passphrase", ""))
+
+    if passphrase != confirm_passphrase:
+        raise _status_redirect(error="De export-passphrases komen niet overeen.")
+
+    try:
+        bundle = _service(request.app).export_credentials_bundle(passphrase)
+    except RuntimeError as exc:
+        raise _status_redirect(error=str(exc))
+
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    return web.Response(
+        text=json.dumps(bundle, indent=2, ensure_ascii=True),
+        content_type="application/json",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="ons-rooster-credentials-export-{timestamp}.json"'
+            ),
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 async def handle_status_auth_trace(request: web.Request) -> web.Response:
@@ -785,6 +815,10 @@ def _ops_is_authorized(request: web.Request) -> bool:
         return True
     if not request.app["config"].admin_token:
         return True
+    return _ops_has_session(request)
+
+
+def _ops_has_session(request: web.Request) -> bool:
     cookie_value = request.cookies.get(OPS_SESSION_COOKIE)
     return bool(cookie_value and hmac.compare_digest(cookie_value, _ops_session_value(request.app["config"])))
 
@@ -814,6 +848,13 @@ def _maybe_set_ops_session_cookie(request: web.Request, response: web.StreamResp
 def _require_ops_auth(request: web.Request) -> None:
     if not _ops_is_authorized(request):
         raise web.HTTPUnauthorized(text="Ongeldig admin-token.")
+
+
+def _require_ops_session(request: web.Request) -> None:
+    if not _ops_has_session(request):
+        raise web.HTTPUnauthorized(
+            text="Voor credentialexport is eerst een ingelogde operatorsessie via /status/login nodig."
+        )
 
 
 def _status_redirect(message: str | None = None, error: str | None = None) -> web.HTTPSeeOther:
@@ -934,6 +975,31 @@ def _render_status_page(
 
     selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
     initial_snapshot_json = json.dumps(status_snapshot, ensure_ascii=True).replace("</", "<\\/")
+    if not config.admin_token:
+        credential_export_markup = (
+            '<p class="section-note">Credentialexport is uitgeschakeld zolang <code>ADMIN_TOKEN</code> ontbreekt.</p>'
+        )
+    elif not status_payload["credentials_present"]:
+        credential_export_markup = (
+            '<p class="section-note">Er zijn nog geen opgeslagen ONS-inloggegevens om te exporteren.</p>'
+        )
+    else:
+        credential_export_markup = """
+        <p class="section-note">Deze route toont de ONS-gegevens niet in de browser. Na het invullen van een aparte export-passphrase download je alleen een versleuteld JSON-bestand.</p>
+        <form class="credential-export-form" method="post" action="/status/credentials/export">
+            <label>
+                <span>Eenmalige export-passphrase</span>
+                <input type="password" name="export_passphrase" autocomplete="new-password" minlength="12" required>
+            </label>
+            <label>
+                <span>Bevestig export-passphrase</span>
+                <input type="password" name="confirm_export_passphrase" autocomplete="new-password" minlength="12" required>
+            </label>
+            <p class="field-help">Gebruik hier niet het admin-token. De export-passphrase blijft alleen lokaal bij deze download relevant.</p>
+            <div class="actions"><button type="submit">Download versleutelde credentialexport</button></div>
+            <p class="field-help">Lokaal ontsleutelen: <code>python -m ons_backend.credential_export pad/naar/export.json</code></p>
+        </form>
+"""
 
     body = f"""
 <!doctype html>
@@ -990,6 +1056,8 @@ def _render_status_page(
         .portal-form-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
         .portal-form-actions {{ display: flex; gap: 0.75rem; flex-wrap: wrap; }}
         .challenge-note {{ margin: 0; color: #475569; }}
+        .credential-export-form {{ display: grid; gap: 0.85rem; max-width: 42rem; }}
+        .field-help {{ margin: 0; color: #475569; }}
         .console-shell {{ background: #0f172a; color: #e2e8f0; border-radius: 16px; padding: 1rem; font: 0.92rem/1.55 Consolas, "Courier New", monospace; max-height: 420px; overflow: auto; margin-bottom: 1rem; }}
         .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
         .console-line:last-child {{ border-bottom: 0; }}
@@ -1058,6 +1126,10 @@ def _render_status_page(
             </thead>
             <tbody id="auth-trace-body"><tr><td colspan="5">Nog geen authenticatiestappen vastgelegd.</td></tr></tbody>
         </table>
+    </section>
+    <section>
+        <h2>Credentialexport</h2>
+        {credential_export_markup}
     </section>
     <section>
         <h2>Portalen beheren</h2>

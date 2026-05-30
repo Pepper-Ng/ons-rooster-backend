@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from typing import Any
 
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from .config import AppConfig
 from .models import AppState, LoginCredentials
+
+
+CREDENTIAL_EXPORT_FORMAT = "ons-rooster-credentials-export"
+CREDENTIAL_EXPORT_ITERATIONS = 600_000
 
 
 class StateStore:
@@ -88,6 +97,67 @@ class StateStore:
         self._write_atomic(self.config.managed_fcm_service_account_file, encrypted)
         self._set_owner_only_permissions(self.config.managed_fcm_service_account_file)
 
+    def build_credentials_export(self, credentials: LoginCredentials, passphrase: str) -> dict[str, Any]:
+        salt = os.urandom(16)
+        export_key = self._derive_export_key(passphrase, salt, CREDENTIAL_EXPORT_ITERATIONS)
+        payload = json.dumps(
+            {"credentials": credentials.to_dict()},
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+        ciphertext = Fernet(export_key).encrypt(payload.encode("utf-8")).decode("utf-8")
+        return {
+            "format": CREDENTIAL_EXPORT_FORMAT,
+            "version": 1,
+            "kdf": "pbkdf2-sha256",
+            "iterations": CREDENTIAL_EXPORT_ITERATIONS,
+            "salt": base64.urlsafe_b64encode(salt).decode("ascii"),
+            "ciphertext": ciphertext,
+        }
+
+    @staticmethod
+    def decrypt_credentials_export(payload: dict[str, Any], passphrase: str) -> LoginCredentials:
+        if str(payload.get("format", "")).strip() != CREDENTIAL_EXPORT_FORMAT:
+            raise RuntimeError("Het exportbestand heeft geen geldig ONS-credentialexportformaat.")
+        if int(payload.get("version", 0)) != 1:
+            raise RuntimeError("Het exportbestand gebruikt een niet-ondersteunde versie.")
+        if str(payload.get("kdf", "")).strip() != "pbkdf2-sha256":
+            raise RuntimeError("Het exportbestand gebruikt een niet-ondersteund sleutelafleidingsformaat.")
+
+        try:
+            iterations = int(payload.get("iterations", 0))
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("Het exportbestand bevat geen geldige iteratie-instelling.") from exc
+        if iterations <= 0:
+            raise RuntimeError("Het exportbestand bevat geen geldige iteratie-instelling.")
+
+        salt_value = str(payload.get("salt", "")).strip()
+        ciphertext = str(payload.get("ciphertext", "")).strip()
+        if not salt_value or not ciphertext:
+            raise RuntimeError("Het exportbestand mist verplichte encryptievelden.")
+
+        try:
+            salt = base64.urlsafe_b64decode(salt_value.encode("ascii"))
+        except Exception as exc:
+            raise RuntimeError("De salt in het exportbestand is ongeldig.") from exc
+
+        export_key = StateStore._derive_export_key(passphrase, salt, iterations)
+        try:
+            decrypted = Fernet(export_key).decrypt(ciphertext.encode("utf-8")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError(
+                "De export-passphrase is ongeldig of het exportbestand is beschadigd."
+            ) from exc
+
+        raw_payload = json.loads(decrypted)
+        if not isinstance(raw_payload, dict):
+            raise RuntimeError("Het exportbestand bevat geen geldig JSON-object.")
+
+        credentials = raw_payload.get("credentials")
+        if not isinstance(credentials, dict):
+            raise RuntimeError("Het exportbestand bevat geen geldige ONS-inloggegevens.")
+        return LoginCredentials.from_dict(credentials)
+
     def _resolve_key(self) -> bytes:
         if self.config.storage_key:
             return self.config.storage_key.encode("utf-8")
@@ -102,6 +172,16 @@ class StateStore:
         key_path.write_bytes(key)
         self._set_owner_only_permissions(key_path)
         return key
+
+    @staticmethod
+    def _derive_export_key(passphrase: str, salt: bytes, iterations: int) -> bytes:
+        kdf = PBKDF2HMAC(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=salt,
+            iterations=iterations,
+        )
+        return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
 
     @staticmethod
     def _write_atomic(path: Path, content: str) -> None:
