@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import Any
@@ -59,6 +60,14 @@ class StateStore:
     def write_snapshot(self, html: str) -> None:
         self._write_atomic(self.config.snapshot_file, html)
 
+    def write_post_otp_screenshot(self, payload: bytes) -> None:
+        self._write_atomic_bytes(self.config.post_otp_screenshot_file, payload)
+
+    def read_post_otp_screenshot(self) -> bytes | None:
+        if not self.config.post_otp_screenshot_file.exists():
+            return None
+        return self.config.post_otp_screenshot_file.read_bytes()
+
     def write_ics(self, payload: bytes) -> None:
         self._write_atomic_bytes(self.config.ics_file, payload)
 
@@ -66,6 +75,31 @@ class StateStore:
         if not self.config.ics_file.exists():
             return None
         return self.config.ics_file.read_bytes()
+
+    def clear_roster_month_exports(self) -> None:
+        if not self.config.roster_exports_dir.exists():
+            return
+        for export_file in self.config.roster_exports_dir.glob("*.json"):
+            export_file.unlink(missing_ok=True)
+
+    def write_roster_month_export(self, month_key: str, payload: dict[str, Any]) -> None:
+        self.config.roster_exports_dir.mkdir(parents=True, exist_ok=True)
+        safe_month_key = re.sub(r"[^0-9-]", "", month_key)
+        if not safe_month_key:
+            raise RuntimeError("Kan roosterexport niet opslaan zonder geldige maandsleutel.")
+        export_path = self.config.roster_exports_dir / f"{safe_month_key}.json"
+        serialized = json.dumps(payload, ensure_ascii=True, indent=2)
+        self._write_atomic(export_path, serialized)
+
+    def read_roster_month_export(self, month_key: str) -> dict[str, Any] | None:
+        safe_month_key = re.sub(r"[^0-9-]", "", month_key)
+        if not safe_month_key:
+            return None
+        export_path = self.config.roster_exports_dir / f"{safe_month_key}.json"
+        if not export_path.exists():
+            return None
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, dict) else None
 
     def write_auth_session(self, payload: dict[str, object] | None) -> None:
         if payload is None:

@@ -514,7 +514,9 @@ class BackendService:
                 "last_final_url": self.state.sync.last_final_url,
                 "last_page_title": self.state.sync.last_page_title,
                 "html_snapshot_path": self.state.sync.html_snapshot_path,
+                "post_otp_screenshot_path": self.state.sync.post_otp_screenshot_path,
                 "roster_count": len(self.state.sync.roster_items),
+                "roster_month_exports": list(self.state.sync.roster_month_exports),
                 "debug_notes": list(self.state.sync.debug_notes),
                 "auth_trace_run_id": self.state.sync.auth_trace_run_id,
                 "auth_trace": self.auth_trace_payload(),
@@ -625,6 +627,9 @@ class BackendService:
     def roster_items(self) -> list[RosterItem]:
         return list(self.state.sync.roster_items)
 
+    def roster_month_exports(self) -> list[dict[str, Any]]:
+        return list(self.state.sync.roster_month_exports)
+
     async def ics_payload(self) -> bytes | None:
         return await asyncio.to_thread(self.store.read_ics)
 
@@ -632,6 +637,12 @@ class BackendService:
         if not self.config.snapshot_file.exists():
             return None
         return await asyncio.to_thread(self.config.snapshot_file.read_text, encoding="utf-8")
+
+    async def post_otp_screenshot(self) -> bytes | None:
+        return await asyncio.to_thread(self.store.read_post_otp_screenshot)
+
+    async def roster_month_export(self, month_key: str) -> dict[str, Any] | None:
+        return await asyncio.to_thread(self.store.read_roster_month_export, month_key)
 
     async def auth_trace_snapshot_html(self, entry_id: str) -> str | None:
         entry = next((item for item in self.state.sync.auth_trace if item.get("entry_id") == entry_id), None)
@@ -707,9 +718,6 @@ class BackendService:
                     )
 
                 session_checkpoint = await asyncio.to_thread(self.store.read_auth_session)
-                if self._session_checkpoint_kind(session_checkpoint) == "post_otp_result_page":
-                    await self._preserve_post_otp_checkpoint(session_checkpoint)
-                    return
 
                 result = await self.automation_client.authenticate_and_scrape(
                     credentials=resolved_credentials,
@@ -724,44 +732,6 @@ class BackendService:
                 await self._finalize_success(result)
             except Exception as exc:
                 await self._finalize_failure(exc)
-
-    @staticmethod
-    def _session_checkpoint_kind(session_checkpoint: dict[str, Any] | None) -> str:
-        if not isinstance(session_checkpoint, dict):
-            return ""
-        challenge = session_checkpoint.get("challenge", {})
-        if not isinstance(challenge, dict):
-            return ""
-        return str(challenge.get("challenge_kind", "")).strip().lower()
-
-    async def _preserve_post_otp_checkpoint(self, session_checkpoint: dict[str, Any]) -> None:
-        challenge = session_checkpoint.get("challenge", {}) if isinstance(session_checkpoint, dict) else {}
-        page_summary = str(challenge.get("page_summary", "")).strip() if isinstance(challenge, dict) else ""
-        current_url = str(session_checkpoint.get("current_url", "")).strip() if isinstance(session_checkpoint, dict) else ""
-        page_title = str(session_checkpoint.get("page_title", "")).strip() if isinstance(session_checkpoint, dict) else ""
-
-        message = "De OTP-code is al ingestuurd en de eerste vervolgpagina blijft vastgelegd voor inspectie."
-        if page_title:
-            message = f"De OTP-code is al ingestuurd en de pagina '{page_title}' blijft vastgelegd voor inspectie."
-        if page_summary:
-            message = f"{message} Inhoud: {page_summary}"
-
-        async with self._state_lock:
-            self.state.sync.status = "partial"
-            self.state.sync.current_phase = "post_otp_page"
-            self.state.sync.auth_ready = False
-            self.state.sync.last_error = None
-            self.state.sync.last_message = message
-            self.state.sync.current_challenge_id = None
-            self.state.sync.challenge_created_at = None
-            if current_url:
-                self.state.sync.last_final_url = current_url
-            if page_title:
-                self.state.sync.last_page_title = page_title
-            self._remember_note(
-                "De backend houdt de opgeslagen vervolgpagina na OTP-submit vast; er is nog geen automatische vervolgstap."
-            )
-            await self._persist_state()
 
     async def _record_auth_trace_event(self, event: dict[str, Any]) -> None:
         entry = {
@@ -885,12 +855,37 @@ class BackendService:
 
         if result.auth_ready:
             await asyncio.to_thread(self.store.clear_auth_session)
+            await asyncio.to_thread(self.store.clear_roster_month_exports)
+            roster_export_summaries: list[dict[str, Any]] = []
+            for export_payload in result.roster_exports:
+                month_key = str(export_payload.get("month", "")).strip()
+                if not month_key:
+                    continue
+                await asyncio.to_thread(self.store.write_roster_month_export, month_key, export_payload)
+                items = export_payload.get("items", [])
+                planned_hours_count = 0
+                if isinstance(items, list):
+                    planned_hours_count = sum(
+                        1
+                        for item in items
+                        if isinstance(item, dict) and bool(item.get("is_planned_hours"))
+                    )
+                roster_export_summaries.append(
+                    {
+                        "month": month_key,
+                        "item_count": len(items) if isinstance(items, list) else 0,
+                        "planned_hours_count": planned_hours_count,
+                        "notice": str(export_payload.get("notice", "")).strip(),
+                        "download_path": f"/status/roster/{month_key}.json",
+                    }
+                )
         else:
             if result.session_checkpoint is None:
                 raise RuntimeError(
                     "De OTP-pagina is bereikt, maar de vervolgsessie kon niet worden opgeslagen."
                 )
             await asyncio.to_thread(self.store.write_auth_session, result.session_checkpoint)
+            roster_export_summaries = list(self.state.sync.roster_month_exports)
         self._pending_challenges.clear()
 
         async with self._state_lock:
@@ -910,7 +905,13 @@ class BackendService:
             self.state.sync.last_final_url = result.final_url
             self.state.sync.last_page_title = result.page_title
             self.state.sync.html_snapshot_path = str(self.config.snapshot_file)
+            self.state.sync.post_otp_screenshot_path = (
+                "/status/post-otp-screenshot"
+                if result.post_otp_screenshot_path
+                else None
+            )
             self.state.sync.roster_items = result.roster_items
+            self.state.sync.roster_month_exports = roster_export_summaries
             self.state.sync.debug_notes = list(result.debug_notes[-25:])
             self._remember_note(
                 "De backend heeft de ONS-aanmelding succesvol afgerond."

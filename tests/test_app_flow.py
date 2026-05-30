@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from datetime import date
 
 import pytest
 import requests
@@ -1148,7 +1149,7 @@ async def test_service_resumes_microsoft_proof_selection_and_arms_sms_before_wai
 
 
 @pytest.mark.asyncio
-async def test_service_preserves_post_otp_checkpoint_without_retrying_automation(aiohttp_client, tmp_path):
+async def test_service_resumes_post_otp_checkpoint_with_automation(aiohttp_client, tmp_path):
     config = build_config(tmp_path)
     push_client = FakePushClient()
     automation_client = CountingAutomationClient()
@@ -1194,11 +1195,65 @@ async def test_service_preserves_post_otp_checkpoint_without_retrying_automation
     await service.trigger_refresh(reason="post-otp-test", wait=True)
 
     status = service.mobile_status_payload()
-    assert automation_client.call_count == 0
-    assert status["sync"]["status"] == "partial"
-    assert status["sync"]["current_phase"] == "post_otp_page"
+    assert automation_client.call_count == 1
+    assert status["sync"]["status"] == "success"
+    assert status["sync"]["current_phase"] == "ready"
     assert status["sync"]["last_error"] is None
-    assert "Welkom terug in de portal." in status["sync"]["last_message"]
+
+
+def test_http_login_automation_client_extracts_month_roster_export():
+    automation_client = HttpLoginAutomationClient()
+    html = """
+<html>
+    <body>
+        <div class="publication-status">Vanaf 01 augustus kan je al je diensten inplannen.</div>
+        <table>
+            <tr>
+                <td class="week-content">
+                    <div class="roster_slot shiftassignment">
+                        <span class="slot_header">27 jun</span>
+                        <h3 class="title">Vroege dienst</h3>
+                        <span class="timepair"><span class="start">06:00</span><span class="stop">14:00</span></span>
+                    </div>
+                    <div class="roster_slot unavailability">
+                        <span class="slot_header">28 jun</span>
+                        <h3 class="title">Niet beschikbaar</h3>
+                    </div>
+                </td>
+            </tr>
+        </table>
+    </body>
+</html>
+"""
+
+    export_payload, planned_items, notes, publication_stop = automation_client._extract_month_roster_export(
+    html,
+    month_start=date(2026, 6, 1),
+    source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
+    page_title="Rooster juni 2026",
+    )
+
+    assert export_payload["month"] == "2026-06"
+    assert len(export_payload["items"]) == 2
+    assert planned_items[0].date == "2026-06-27"
+    assert planned_items[0].start == "06:00"
+    assert planned_items[0].end == "14:00"
+    assert publication_stop == (2026, 8)
+    assert any("Publication notice detected" in note for note in notes)
+
+
+def test_http_login_automation_client_resolves_month_targets_from_jump_url():
+    automation_client = HttpLoginAutomationClient()
+    targets = automation_client._resolve_month_targets(
+    "https://landvanhorne.startmetons.nl/?jump=https%3A%2F%2Flandvanhorne.hasmoves.com%2Fonsdraaiboek%2Froster%2F2026-06-01%2Fmonth",
+    "https://landvanhorne.startmetons.nl/",
+    "",
+    )
+
+    assert targets[0][0].isoformat() == "2026-06-01"
+    assert targets[0][1] == "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month"
+    assert targets[1][0].isoformat() == "2026-07-01"
+    assert targets[1][1] == "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-07-01/month"
 
 
 @pytest.mark.asyncio

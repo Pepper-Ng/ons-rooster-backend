@@ -5,10 +5,10 @@ import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import google.auth.transport.requests
 import google.oauth2.service_account
@@ -541,6 +541,31 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     )
     SSO_REQUIRED_ERROR_CODE = "sso_required_error"
     SSO_PROVIDER_TITLE_MARKERS = ("microsoft", "entra", "azure", "office")
+    DUTCH_MONTHS = {
+        "jan": 1,
+        "januari": 1,
+        "feb": 2,
+        "februari": 2,
+        "mrt": 3,
+        "maart": 3,
+        "apr": 4,
+        "april": 4,
+        "mei": 5,
+        "jun": 6,
+        "juni": 6,
+        "jul": 7,
+        "juli": 7,
+        "aug": 8,
+        "augustus": 8,
+        "sep": 9,
+        "september": 9,
+        "okt": 10,
+        "oktober": 10,
+        "nov": 11,
+        "november": 11,
+        "dec": 12,
+        "december": 12,
+    }
 
     async def authenticate_and_scrape(
         self,
@@ -1271,11 +1296,70 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 prepare_sms_relay=prepare_sms_relay,
                 wait_for_sms_code=wait_for_sms_code,
             )
+        if challenge_kind == "post_otp_result_page":
+            return await self._continue_from_post_otp_result_page(
+                credentials=credentials,
+                snapshot_path=snapshot_path,
+                config=config,
+                report_progress=report_progress,
+                trace_index=trace_index,
+                debug_notes=debug_notes,
+                session_checkpoint=session_checkpoint,
+            )
 
         raise RuntimeError(
             "De backend kan de opgeslagen authenticatiesessie nog niet automatisch hervatten voor "
             f"{challenge_kind or 'deze stap'}."
         )
+
+    async def _continue_from_post_otp_result_page(
+        self,
+        *,
+        credentials: LoginCredentials,
+        snapshot_path: Path,
+        config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+        session_checkpoint: dict[str, Any],
+    ) -> AuthenticationResult:
+        login_url = credentials.login_url or config.default_login_url
+        current_url = str(session_checkpoint.get("current_url", "")).strip() or login_url
+        stored_cookies = session_checkpoint.get("cookies", [])
+
+        async with async_playwright() as playwright:
+            browser = None
+            page = None
+            try:
+                browser = await playwright.chromium.launch(headless=config.playwright_headless)
+                context = await browser.new_context(locale="nl-NL")
+                if isinstance(stored_cookies, list) and stored_cookies:
+                    await context.add_cookies(self._playwright_cookies(stored_cookies))
+                page = await context.new_page()
+                await page.goto(current_url, wait_until="domcontentloaded")
+                debug_notes.append(f"Resumed the stored post-OTP page on {page.url}.")
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Resume post-OTP page",
+                    message="De backend heeft de opgeslagen pagina na OTP-submit opnieuw geopend.",
+                    phase="post_otp_resumed",
+                    page=page,
+                )
+                return await self._collect_roster_months_after_otp(
+                    page=page,
+                    snapshot_path=snapshot_path,
+                    config=config,
+                    report_progress=report_progress,
+                    trace_index=trace_index,
+                    debug_notes=debug_notes,
+                    login_url=login_url,
+                )
+            finally:
+                if browser is not None:
+                    await browser.close()
 
     async def _continue_from_microsoft_proof_selection(
         self,
@@ -1463,9 +1547,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         await self._wait_for_post_otp_page(page, config.login_timeout_seconds)
         html = await page.content()
         page_title = await page.title()
-        page_summary = self._text_snippet(html)
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
+        screenshot_path = str(config.post_otp_screenshot_file)
+        await page.screenshot(path=screenshot_path, full_page=True)
+        debug_notes.append(f"Saved post-OTP screenshot to {screenshot_path}.")
         self._record_event(
             report_progress,
             trace_index=trace_index,
@@ -1481,24 +1567,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 html,
             ),
         )
-
-        return AuthenticationResult(
-            final_url=page.url,
-            page_title=page_title,
-            roster_items=[],
+        return await self._collect_roster_months_after_otp(
+            page=page,
+            snapshot_path=snapshot_path,
+            config=config,
+            report_progress=report_progress,
+            trace_index=trace_index + 1,
             debug_notes=debug_notes,
-            auth_ready=False,
-            session_checkpoint=self._build_browser_session_checkpoint(
-                cookies=await context.cookies(),
-                login_url=login_url,
-                current_url=page.url,
-                page_title=page_title,
-                challenge={
-                    "challenge_kind": "post_otp_result_page",
-                    "page_summary": page_summary,
-                    "source": "microsoft_sso",
-                },
-            ),
+            login_url=login_url,
+            post_otp_screenshot_path=screenshot_path,
         )
 
     @staticmethod
@@ -1590,6 +1667,240 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             "De backend bleef op de Microsoft OTP-invoerpagina staan nadat de code was ingestuurd. "
             f"Laatste pagina: {self._text_snippet(html)}"
         )
+
+    async def _collect_roster_months_after_otp(
+        self,
+        *,
+        page,
+        snapshot_path: Path,
+        config: AppConfig,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+        login_url: str,
+        post_otp_screenshot_path: str | None = None,
+    ) -> AuthenticationResult:
+        exports: list[dict[str, Any]] = []
+        roster_items: list[RosterItem] = []
+        stop_from: tuple[int, int] | None = None
+
+        for month_start, month_url in self._resolve_month_targets(login_url, page.url, config.roster_url):
+            month_key = f"{month_start.year:04d}-{month_start.month:02d}"
+            month_tuple = (month_start.year, month_start.month)
+            if stop_from is not None and month_tuple >= stop_from:
+                debug_notes.append(
+                    f"Skipped month {month_key} because publication status blocks months from {stop_from[0]:04d}-{stop_from[1]:02d}."
+                )
+                continue
+
+            await page.goto(month_url, wait_until="domcontentloaded")
+            trace_index = await self._record_playwright_page_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label=f"Open roster month {month_key}",
+                message=f"De backend heeft roostermaand {month_key} geopend op {page.url}.",
+                phase="roster_month_opened",
+                page=page,
+            )
+
+            html = await page.content()
+            page_title = await page.title()
+            export_payload, month_items, extraction_notes, publication_stop = self._extract_month_roster_export(
+                html,
+                month_start=month_start,
+                source_url=page.url,
+                page_title=page_title,
+            )
+            debug_notes.extend(extraction_notes)
+            exports.append(export_payload)
+            roster_items.extend(month_items)
+            if publication_stop is not None and stop_from is None:
+                stop_from = publication_stop
+
+        if not exports:
+            raise RuntimeError("De backend kon geen roostermaanden ophalen na OTP-verificatie.")
+
+        await asyncio.to_thread(snapshot_path.write_text, await page.content(), encoding="utf-8")
+        return AuthenticationResult(
+            final_url=page.url,
+            page_title=await page.title(),
+            roster_items=roster_items,
+            debug_notes=debug_notes,
+            auth_ready=True,
+            roster_exports=exports,
+            post_otp_screenshot_path=post_otp_screenshot_path,
+        )
+
+    def _resolve_month_targets(
+        self,
+        login_url: str,
+        current_url: str,
+        configured_roster_url: str,
+    ) -> list[tuple[date, str]]:
+        reference_url = ""
+        parsed_login = urlparse(login_url)
+        jump_values = parse_qs(parsed_login.query).get("jump", [])
+        if jump_values:
+            reference_url = unquote(jump_values[0])
+        if not reference_url and configured_roster_url:
+            reference_url = configured_roster_url
+        if not reference_url:
+            reference_url = current_url
+
+        parsed_reference = urlparse(reference_url)
+        scheme = parsed_reference.scheme or "https"
+        host = parsed_reference.netloc
+        if not host:
+            parsed_current = urlparse(current_url)
+            host = parsed_current.netloc
+            if not parsed_reference.scheme:
+                scheme = parsed_current.scheme or scheme
+        if not host:
+            raise RuntimeError("De backend kon geen geldige HasMoves-host bepalen voor roostermaanden.")
+
+        initial_month = self._extract_month_from_roster_url(parsed_reference.path) or date.today().replace(day=1)
+        next_month = self._add_months(initial_month, 1)
+        targets: list[tuple[date, str]] = []
+        for month_start in (initial_month, next_month):
+            month_path = f"/onsdraaiboek/roster/{month_start.isoformat()}/month"
+            targets.append((month_start, f"{scheme}://{host}{month_path}"))
+        return targets
+
+    @staticmethod
+    def _extract_month_from_roster_url(path: str) -> date | None:
+        match = re.search(r"/onsdraaiboek/roster/(\d{4}-\d{2}-\d{2})/month", path)
+        if not match:
+            return None
+        try:
+            parsed = datetime.strptime(match.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+        return parsed.replace(day=1)
+
+    @staticmethod
+    def _add_months(month_start: date, offset: int) -> date:
+        total_months = month_start.year * 12 + (month_start.month - 1) + offset
+        year = total_months // 12
+        month = total_months % 12 + 1
+        return date(year=year, month=month, day=1)
+
+    def _extract_month_roster_export(
+        self,
+        html: str,
+        *,
+        month_start: date,
+        source_url: str,
+        page_title: str,
+    ) -> tuple[dict[str, Any], list[RosterItem], list[str], tuple[int, int] | None]:
+        notes: list[str] = []
+        soup = BeautifulSoup(html, "html.parser")
+        month_items: list[dict[str, Any]] = []
+        planned_entries: list[RosterItem] = []
+
+        for day_cell in soup.select("td.week-content"):
+            for slot in day_cell.select("div.roster_slot"):
+                classes = list(slot.get("class", []))
+                title = " ".join(fragment.strip() for fragment in slot.select_one("h3.title").stripped_strings) if slot.select_one("h3.title") else ""
+                start_text = slot.select_one("span.timepair .start")
+                end_text = slot.select_one("span.timepair .stop")
+                start = " ".join(start_text.stripped_strings) if start_text else ""
+                end = " ".join(end_text.stripped_strings) if end_text else ""
+                date_value = self._extract_slot_date(slot, month_start)
+                is_planned = "shiftassignment" in classes or "indirect" in classes
+                category = "planned_hours" if is_planned else "availability"
+                raw_text = " ".join(fragment.strip() for fragment in slot.stripped_strings)
+
+                month_items.append(
+                    {
+                        "date": date_value,
+                        "start": start,
+                        "end": end,
+                        "title": title,
+                        "description": raw_text[:300],
+                        "category": category,
+                        "is_planned_hours": is_planned,
+                        "classes": classes,
+                    }
+                )
+
+                if is_planned and date_value and start and end:
+                    planned_entries.append(
+                        RosterItem(
+                            date=date_value,
+                            start=start,
+                            end=end,
+                            description=title or raw_text[:120],
+                            raw={
+                                "category": category,
+                                "classes": classes,
+                            },
+                        )
+                    )
+
+        notice_text = ""
+        notice_node = soup.select_one("div.publication-status")
+        if notice_node is not None:
+            notice_text = " ".join(fragment.strip() for fragment in notice_node.stripped_strings)
+            notes.append(f"Publication notice detected: {notice_text}")
+
+        if not month_items:
+            notes.append("No roster_slot elements were detected for this month page.")
+
+        export_payload = {
+            "format": "ons-rooster-month-export",
+            "version": 1,
+            "generated_at": self._utc_timestamp(),
+            "month": f"{month_start.year:04d}-{month_start.month:02d}",
+            "source_url": source_url,
+            "page_title": page_title,
+            "notice": notice_text,
+            "items": month_items,
+        }
+        return (
+            export_payload,
+            planned_entries,
+            notes,
+            self._parse_publication_stop_month(notice_text, month_start),
+        )
+
+    def _extract_slot_date(self, slot, month_start: date) -> str:
+        header = slot.select_one("span.slot_header")
+        if header is None:
+            return ""
+        header_text = " ".join(fragment.strip() for fragment in header.stripped_strings).lower()
+        match = re.search(r"(\d{1,2})\s+([a-z]+)", header_text)
+        if not match:
+            return ""
+        day = int(match.group(1))
+        month_number = self.DUTCH_MONTHS.get(match.group(2).strip(". "))
+        if month_number is None:
+            return ""
+        year = month_start.year
+        if month_number - month_start.month > 6:
+            year -= 1
+        elif month_start.month - month_number > 6:
+            year += 1
+        try:
+            return date(year=year, month=month_number, day=day).isoformat()
+        except ValueError:
+            return ""
+
+    def _parse_publication_stop_month(self, notice_text: str, reference_month: date) -> tuple[int, int] | None:
+        if not notice_text:
+            return None
+        normalized = notice_text.lower()
+        match = re.search(r"vanaf\s+\d{1,2}\s+([a-z]+)", normalized)
+        if not match:
+            return None
+        month_number = self.DUTCH_MONTHS.get(match.group(1).strip(". "))
+        if month_number is None:
+            return None
+        year = reference_month.year
+        if month_number < reference_month.month:
+            year += 1
+        return (year, month_number)
 
     async def _record_playwright_page_step(
         self,

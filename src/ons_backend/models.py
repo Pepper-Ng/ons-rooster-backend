@@ -141,7 +141,9 @@ class SyncState:
     last_final_url: str | None = None
     last_page_title: str | None = None
     html_snapshot_path: str | None = None
+    post_otp_screenshot_path: str | None = None
     roster_items: list[RosterItem] = field(default_factory=list)
+    roster_month_exports: list[dict[str, Any]] = field(default_factory=list)
     debug_notes: list[str] = field(default_factory=list)
     auth_trace_run_id: str | None = None
     auth_trace: list[dict[str, Any]] = field(default_factory=list)
@@ -165,7 +167,9 @@ class SyncState:
             "last_final_url": self.last_final_url,
             "last_page_title": self.last_page_title,
             "html_snapshot_path": self.html_snapshot_path,
+            "post_otp_screenshot_path": self.post_otp_screenshot_path,
             "roster_items": [item.to_dict() for item in self.roster_items],
+            "roster_month_exports": list(self.roster_month_exports),
             "debug_notes": list(self.debug_notes),
             "auth_trace_run_id": self.auth_trace_run_id,
             "auth_trace": list(self.auth_trace),
@@ -191,7 +195,9 @@ class SyncState:
             last_final_url=data.get("last_final_url"),
             last_page_title=data.get("last_page_title"),
             html_snapshot_path=data.get("html_snapshot_path"),
+            post_otp_screenshot_path=data.get("post_otp_screenshot_path"),
             roster_items=[RosterItem.from_dict(item) for item in data.get("roster_items", [])],
+            roster_month_exports=list(data.get("roster_month_exports", [])),
             debug_notes=list(data.get("debug_notes", [])),
             auth_trace_run_id=data.get("auth_trace_run_id"),
             auth_trace=list(data.get("auth_trace", [])),
@@ -245,3 +251,5 @@ class AuthenticationResult:
     debug_notes: list[str]
     auth_ready: bool = True
     session_checkpoint: dict[str, Any] | None = None
+    roster_exports: list[dict[str, Any]] = field(default_factory=list)
+    post_otp_screenshot_path: str | None = None

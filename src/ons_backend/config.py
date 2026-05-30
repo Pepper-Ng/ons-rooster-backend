@@ -55,6 +55,10 @@ class AppConfig:
         return self.data_dir / "last-auth.html"
 
     @property
+    def post_otp_screenshot_file(self) -> Path:
+        return self.data_dir / "post-otp.png"
+
+    @property
     def auth_trace_dir(self) -> Path:
         return self.data_dir / "auth-trace"
 
@@ -65,6 +69,10 @@ class AppConfig:
     @property
     def ics_file(self) -> Path:
         return self.data_dir / "rooster.ics"
+
+    @property
+    def roster_exports_dir(self) -> Path:
+        return self.data_dir / "roster-exports"
 
     @property
     def managed_fcm_service_account_file(self) -> Path:

@@ -55,6 +55,8 @@ def create_app(
     app.router.add_post("/status/logout", handle_status_logout)
     app.router.add_post("/status/credentials/export", handle_status_credentials_export)
     app.router.add_get("/status/auth-trace/{entry_id}", handle_status_auth_trace)
+    app.router.add_get("/status/post-otp-screenshot", handle_status_post_otp_screenshot)
+    app.router.add_get("/status/roster/{month_key}.json", handle_status_roster_month_export)
     app.router.add_post("/status/refresh", handle_status_refresh)
     app.router.add_post("/status/challenges/mock-sms", handle_status_mock_sms)
     app.router.add_post("/status/devices/{device_id}/activate", handle_status_activate_device)
@@ -381,6 +383,39 @@ async def handle_status_auth_trace(request: web.Request) -> web.Response:
             f"<pre>{html.escape(snapshot[:12000])}</pre></body></html>"
         ),
         content_type="text/html",
+    )
+
+
+async def handle_status_post_otp_screenshot(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    screenshot = await _service(request.app).post_otp_screenshot()
+    if screenshot is None:
+        raise web.HTTPNotFound(text="Er is nog geen post-OTP screenshot beschikbaar.")
+    return web.Response(
+        body=screenshot,
+        content_type="image/png",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def handle_status_roster_month_export(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    month_key = str(request.match_info.get("month_key", "")).strip()
+    export_payload = await _service(request.app).roster_month_export(month_key)
+    if export_payload is None:
+        raise web.HTTPNotFound(text="Er is geen roosterexport voor deze maand beschikbaar.")
+    return web.Response(
+        text=json.dumps(export_payload, ensure_ascii=True, indent=2),
+        content_type="application/json",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 
@@ -1044,6 +1079,19 @@ def _render_status_page(
         for portal in portals
     )
 
+    roster_export_rows = "".join(
+        f"""
+                <tr>
+                    <td>{html.escape(str(item.get('month', '-')))}</td>
+                    <td>{int(item.get('item_count', 0))}</td>
+                    <td>{int(item.get('planned_hours_count', 0))}</td>
+                    <td>{html.escape(str(item.get('notice', '') or '-'))}</td>
+                    <td>{f'<a href="{html.escape(str(item.get("download_path", "")))}" target="_blank" rel="noreferrer">Download JSON</a>' if item.get('download_path') else '-'}</td>
+                </tr>
+"""
+        for item in status_payload["sync"].get("roster_month_exports", [])
+    )
+
     selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
     initial_snapshot_json = json.dumps(status_snapshot, ensure_ascii=True).replace("</", "<\\/")
     if not config.admin_token:
@@ -1198,6 +1246,17 @@ def _render_status_page(
         </table>
     </section>
     <section>
+        <h2>Roosterexports</h2>
+        <p class="section-note">Na OTP-submit wordt een screenshot opgeslagen en worden maandexports als JSON aangeboden.</p>
+        <p id="post-otp-screenshot-link">{f'<a href="/status/post-otp-screenshot" target="_blank" rel="noreferrer">Bekijk post-OTP screenshot</a>' if status_payload['sync'].get('post_otp_screenshot_path') else 'Nog geen post-OTP screenshot beschikbaar.'}</p>
+        <table>
+            <thead>
+                <tr><th>Maand</th><th>Totaal slots</th><th>Ingeplande uren</th><th>Publicatiestatus</th><th>Export</th></tr>
+            </thead>
+            <tbody id="roster-export-body">{roster_export_rows or '<tr><td colspan="5">Nog geen maandexports beschikbaar.</td></tr>'}</tbody>
+        </table>
+    </section>
+    <section>
         <h2>Portalen beheren</h2>
         <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
         <div class="portal-manager">
@@ -1250,6 +1309,8 @@ def _render_status_page(
         const portalList = document.getElementById('portal-list');
         const authConsole = document.getElementById('auth-console');
         const authTraceBody = document.getElementById('auth-trace-body');
+        const postOtpScreenshotLink = document.getElementById('post-otp-screenshot-link');
+        const rosterExportBody = document.getElementById('roster-export-body');
         const portalForm = document.getElementById('portal-form');
         const portalFormHeading = document.getElementById('portal-form-heading');
         const portalIdInput = document.getElementById('portal_id');
@@ -1419,12 +1480,38 @@ def _render_status_page(
                 </tr>`).join('');
         }}
 
+        function renderRosterExports(snapshot) {{
+            const sync = snapshot.status.sync;
+            const screenshotPath = sync.post_otp_screenshot_path || '';
+            if (screenshotPath) {{
+                postOtpScreenshotLink.innerHTML = `<a href="${{escapeHtml(screenshotPath)}}" target="_blank" rel="noreferrer">Bekijk post-OTP screenshot</a>`;
+            }} else {{
+                postOtpScreenshotLink.textContent = 'Nog geen post-OTP screenshot beschikbaar.';
+            }}
+
+            const exports = sync.roster_month_exports || [];
+            if (!exports.length) {{
+                rosterExportBody.innerHTML = '<tr><td colspan="5">Nog geen maandexports beschikbaar.</td></tr>';
+                return;
+            }}
+
+            rosterExportBody.innerHTML = exports.map((item) => `
+                <tr>
+                    <td>${{escapeHtml(item.month || '-')}}</td>
+                    <td>${{Number(item.item_count || 0)}}</td>
+                    <td>${{Number(item.planned_hours_count || 0)}}</td>
+                    <td>${{escapeHtml(item.notice || '-')}}</td>
+                    <td>${{item.download_path ? `<a href="${{escapeHtml(item.download_path)}}" target="_blank" rel="noreferrer">Download JSON</a>` : '-'}}</td>
+                </tr>`).join('');
+        }}
+
         function render(snapshot) {{
             statusSnapshot = snapshot;
             renderOverview(snapshot);
             renderDevices(snapshot);
             renderChallenge(snapshot);
             renderAuthTrace(snapshot);
+            renderRosterExports(snapshot);
             renderPortals(snapshot);
             syncPortalForm(snapshot);
             updateSyncControls(snapshot);
