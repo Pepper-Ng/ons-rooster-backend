@@ -5,6 +5,7 @@ import json
 import re
 
 import pytest
+import requests
 from aiohttp import FormData
 
 from ons_backend.app import create_app
@@ -517,6 +518,27 @@ async def test_http_login_automation_client_scrapes_basic_roster(aiohttp_client,
     assert any("bob@example.invalid" in item.description for item in result.roster_items)
     assert "Mock HasMoves Rooster" in snapshot_path.read_text(encoding="utf-8")
     assert any(event["phase"] == "ready" for event in progress_events)
+
+
+def test_http_login_automation_client_reads_bootstrap_flash_error():
+        automation_client = HttpLoginAutomationClient()
+        response = requests.Response()
+        response.status_code = 200
+        html = """
+<!doctype html>
+<html lang="nl">
+    <head>
+        <script type="text/javascript">
+            window.flash_error = {"debug":"","error":"incorrect_credentials"};
+        </script>
+    </head>
+    <body><div id="main"></div></body>
+</html>
+"""
+
+        error_message = automation_client._extract_login_error(response, html)
+
+        assert error_message == "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is."
 
 
 @pytest.mark.asyncio

@@ -472,6 +472,10 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         "verify_credentials_error",
         "incorrect_credentials",
     )
+    LOGIN_ERROR_CODE_MESSAGES = {
+        "incorrect_credentials": "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is.",
+        "verify_credentials_error": "De ONS-site heeft de ingevoerde gebruikersnaam of het wachtwoord afgekeurd.",
+    }
 
     async def authenticate_and_scrape(
         self,
@@ -844,6 +848,19 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 if text:
                     messages.append(text)
 
+        flash_error = self._extract_window_bootstrap_object(html, "flash_error")
+        if flash_error:
+            flash_error_code = str(flash_error.get("error", "")).strip().lower()
+            flash_debug = str(flash_error.get("debug", "")).strip()
+            if flash_error_code:
+                friendly_message = self.LOGIN_ERROR_CODE_MESSAGES.get(
+                    flash_error_code,
+                    f"De ONS-site gaf de loginfoutcode {flash_error_code} terug.",
+                )
+                if flash_debug:
+                    return f"{friendly_message} Debug: {flash_debug}"
+                return friendly_message
+
         combined = " ".join(messages) if messages else self._text_snippet(html)
         normalized = combined.lower()
         if any(marker in normalized for marker in self.LOGIN_ERROR_MARKERS):
@@ -851,6 +868,28 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         if response.status_code >= 400:
             return f"De ONS-login gaf HTTP {response.status_code} terug."
         return ""
+
+    @staticmethod
+    def _extract_window_bootstrap_object(html: str, variable_name: str) -> dict[str, Any]:
+        match = re.search(
+            rf"window\.{re.escape(variable_name)}\s*=\s*(\{{.*?\}}|null)\s*;",
+            html,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if match is None:
+            return {}
+
+        raw_value = match.group(1).strip()
+        if raw_value.lower() == "null":
+            return {}
+
+        try:
+            payload = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
 
     def _response_still_looks_like_login(self, current_url: str, html: str, login_url: str) -> bool:
         soup = BeautifulSoup(html, "html.parser")
