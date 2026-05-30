@@ -1139,7 +1139,66 @@ async def test_service_resumes_microsoft_proof_selection_and_arms_sms_before_wai
     status = service.mobile_status_payload()
     assert status["sync"]["status"] == "partial"
     assert status["sync"]["last_message"].startswith("De OTP-code is ingestuurd")
+    sms_received_entries = [
+        entry for entry in status["sync"]["auth_trace"] if entry.get("phase") == "sms_received"
+    ]
+    assert sms_received_entries
+    assert sms_received_entries[-1]["message"] == "De backend heeft OTP-code 123456 van de Android-app ontvangen."
     assert push_client.auth_notifications == []
+
+
+@pytest.mark.asyncio
+async def test_service_preserves_post_otp_checkpoint_without_retrying_automation(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    automation_client = CountingAutomationClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=automation_client,
+    )
+    await service.set_sync_enabled(False)
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+
+    await asyncio.to_thread(
+        service.store.write_auth_session,
+        {
+            "version": 1,
+            "current_url": "https://example.invalid/post-otp",
+            "page_title": "Na OTP",
+            "challenge": {
+                "challenge_kind": "post_otp_result_page",
+                "page_summary": "Welkom terug in de portal.",
+                "source": "microsoft_sso",
+            },
+            "cookies": [],
+        },
+    )
+
+    await service.set_sync_enabled(True)
+    await service.trigger_refresh(reason="post-otp-test", wait=True)
+
+    status = service.mobile_status_payload()
+    assert automation_client.call_count == 0
+    assert status["sync"]["status"] == "partial"
+    assert status["sync"]["current_phase"] == "post_otp_page"
+    assert status["sync"]["last_error"] is None
+    assert "Welkom terug in de portal." in status["sync"]["last_message"]
 
 
 @pytest.mark.asyncio

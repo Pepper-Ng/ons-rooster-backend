@@ -707,6 +707,9 @@ class BackendService:
                     )
 
                 session_checkpoint = await asyncio.to_thread(self.store.read_auth_session)
+                if self._session_checkpoint_kind(session_checkpoint) == "post_otp_result_page":
+                    await self._preserve_post_otp_checkpoint(session_checkpoint)
+                    return
 
                 result = await self.automation_client.authenticate_and_scrape(
                     credentials=resolved_credentials,
@@ -721,6 +724,44 @@ class BackendService:
                 await self._finalize_success(result)
             except Exception as exc:
                 await self._finalize_failure(exc)
+
+    @staticmethod
+    def _session_checkpoint_kind(session_checkpoint: dict[str, Any] | None) -> str:
+        if not isinstance(session_checkpoint, dict):
+            return ""
+        challenge = session_checkpoint.get("challenge", {})
+        if not isinstance(challenge, dict):
+            return ""
+        return str(challenge.get("challenge_kind", "")).strip().lower()
+
+    async def _preserve_post_otp_checkpoint(self, session_checkpoint: dict[str, Any]) -> None:
+        challenge = session_checkpoint.get("challenge", {}) if isinstance(session_checkpoint, dict) else {}
+        page_summary = str(challenge.get("page_summary", "")).strip() if isinstance(challenge, dict) else ""
+        current_url = str(session_checkpoint.get("current_url", "")).strip() if isinstance(session_checkpoint, dict) else ""
+        page_title = str(session_checkpoint.get("page_title", "")).strip() if isinstance(session_checkpoint, dict) else ""
+
+        message = "De OTP-code is al ingestuurd en de eerste vervolgpagina blijft vastgelegd voor inspectie."
+        if page_title:
+            message = f"De OTP-code is al ingestuurd en de pagina '{page_title}' blijft vastgelegd voor inspectie."
+        if page_summary:
+            message = f"{message} Inhoud: {page_summary}"
+
+        async with self._state_lock:
+            self.state.sync.status = "partial"
+            self.state.sync.current_phase = "post_otp_page"
+            self.state.sync.auth_ready = False
+            self.state.sync.last_error = None
+            self.state.sync.last_message = message
+            self.state.sync.current_challenge_id = None
+            self.state.sync.challenge_created_at = None
+            if current_url:
+                self.state.sync.last_final_url = current_url
+            if page_title:
+                self.state.sync.last_page_title = page_title
+            self._remember_note(
+                "De backend houdt de opgeslagen vervolgpagina na OTP-submit vast; er is nog geen automatische vervolgstap."
+            )
+            await self._persist_state()
 
     async def _record_auth_trace_event(self, event: dict[str, Any]) -> None:
         entry = {
@@ -982,17 +1023,38 @@ class BackendService:
         if not self.sync_enabled():
             raise RuntimeError(SYNC_DISABLED_MESSAGE)
 
+        normalized_code = code.strip()
+        received_at = utc_now()
         pending.sender = sender
-        pending.code = code.strip()
-        pending.event.set()
+        pending.code = normalized_code
+
+        auth_trace_entry: dict[str, Any] | None = None
+        receipt_message = (
+            f"De backend heeft OTP-code {normalized_code} van de Android-app ontvangen."
+            if normalized_code
+            else "De backend heeft een lege OTP-code van de Android-app ontvangen."
+        )
 
         async with self._state_lock:
-            self.state.sync.last_sms_received_at = utc_now()
-            self.state.sync.last_sms_code_suffix = code.strip()[-2:] if code.strip() else None
+            self.state.sync.last_sms_received_at = received_at
+            self.state.sync.last_sms_code_suffix = normalized_code[-2:] if normalized_code else None
             self.state.sync.current_phase = "sms_received"
-            self.state.sync.last_message = "De SMS-code is ontvangen door de backend."
-            self._remember_note(note)
+            self.state.sync.last_message = receipt_message
+            self._remember_note(receipt_message)
+            auth_trace_entry = {
+                "entry_id": f"step-{len(self.state.sync.auth_trace) + 1:03d}",
+                "created_at": received_at,
+                "label": "OTP code ontvangen",
+                "message": receipt_message,
+                "phase": "sms_received",
+                "url": self.state.sync.last_final_url,
+                "page_title": self.state.sync.last_page_title,
+            }
             await self._persist_state()
+
+        pending.event.set()
+        if auth_trace_entry is not None:
+            await self._record_auth_trace_event(auth_trace_entry)
 
     def _device_for_fcm_token(self, fcm_token: str) -> DeviceRegistration | None:
         for device in self.state.devices:
