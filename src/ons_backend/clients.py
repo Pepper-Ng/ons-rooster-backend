@@ -1625,10 +1625,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             html = await page.content()
-            if (
-                self._extract_microsoft_proof_selection(page.url, html) is None
-                and await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS)
-            ):
+            if await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
                 return
             login_error = self._extract_login_error(self._synthetic_response(200), html)
             if login_error:
@@ -1636,11 +1633,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             await page.wait_for_timeout(250)
 
         html = await page.content()
-        if self._extract_microsoft_proof_selection(page.url, html) is not None:
-            raise RuntimeError(
-                "De Microsoft pagina bleef op de verificatiekeuze staan nadat de SMS-verzending was gestart. "
-                f"Laatste pagina: {self._text_snippet(html)}"
-            )
         raise RuntimeError(
             "De Microsoft pagina toonde geen OTP-invoerveld nadat de SMS-verzending was gestart. "
             f"Laatste pagina: {self._text_snippet(html)}"
@@ -1650,19 +1642,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             html = await page.content()
-            if (
-                self._extract_microsoft_proof_selection(page.url, html) is None
-                and not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS)
-            ):
+            if not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
                 return
             await page.wait_for_timeout(250)
 
         html = await page.content()
-        if self._extract_microsoft_proof_selection(page.url, html) is not None:
-            raise RuntimeError(
-                "De backend bleef op de Microsoft verificatiekeuze staan nadat de OTP-code was ingestuurd. "
-                f"Laatste pagina: {self._text_snippet(html)}"
-            )
         raise RuntimeError(
             "De backend bleef op de Microsoft OTP-invoerpagina staan nadat de code was ingestuurd. "
             f"Laatste pagina: {self._text_snippet(html)}"
