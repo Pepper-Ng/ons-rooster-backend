@@ -39,6 +39,7 @@ class PendingChallenge:
 DEFAULT_PORTAL_ID = "land-van-horne"
 DEFAULT_PORTAL_NAME = "Land van Horne"
 DEFAULT_PORTAL_LOGO_URL = "https://aanmelden.ons-diensten.nl/api/images/a2d1a875-feed-4cc0-91d5-149c4f129db8.png"
+SYNC_DISABLED_MESSAGE = "Synchronisatie is uitgeschakeld. Schakel synchronisatie eerst weer in."
 
 
 class BackendService:
@@ -193,6 +194,34 @@ class BackendService:
             return False
         return hmac.compare_digest(token, self.config.debug_token)
 
+    def sync_enabled(self) -> bool:
+        return self.state.sync.sync_enabled
+
+    async def set_sync_enabled(self, enabled: bool) -> str:
+        async with self._state_lock:
+            if self.state.sync.sync_enabled == enabled:
+                return "Synchronisatie staat al ingeschakeld." if enabled else "Synchronisatie staat al uitgeschakeld."
+
+            self.state.sync.sync_enabled = enabled
+            self.state.sync.last_message = (
+                "Synchronisatie is ingeschakeld."
+                if enabled
+                else "Synchronisatie is uitgeschakeld. Er worden geen nieuwe aanmeldpogingen gestart."
+            )
+            if enabled:
+                if self.state.sync.current_phase == "disabled":
+                    self.state.sync.current_phase = "idle"
+                self._remember_note("Synchronisatie is opnieuw ingeschakeld vanaf de statuspagina.")
+            else:
+                self.state.sync.current_phase = "disabled"
+                self.state.sync.current_challenge_id = None
+                self.state.sync.challenge_created_at = None
+                self._pending_challenges.clear()
+                self._remember_note("Synchronisatie is uitgeschakeld vanaf de statuspagina.")
+            await self._persist_state()
+
+        return self.state.sync.last_message or ""
+
     async def upsert_mobile_setup(
         self,
         *,
@@ -256,13 +285,31 @@ class BackendService:
             await self._persist_state()
 
         await asyncio.to_thread(self.store.clear_auth_session)
-        await self.trigger_refresh(reason="setup", wait=False)
+
+        message = "De gegevens zijn opgeslagen. De eerste aanmelding is gestart."
+        if self.sync_enabled():
+            await self.trigger_refresh(reason="setup", wait=False)
+        else:
+            async with self._state_lock:
+                self.state.sync.current_phase = "disabled"
+                self.state.sync.current_challenge_id = None
+                self.state.sync.challenge_created_at = None
+                self.state.sync.last_message = (
+                    "Synchronisatie is uitgeschakeld. De nieuwe gegevens zijn wel opgeslagen."
+                )
+                self._remember_note(
+                    "De Android-app heeft nieuwe verbindingsgegevens opgeslagen terwijl synchronisatie is uitgeschakeld."
+                )
+                await self._persist_state()
+            message = (
+                "De gegevens zijn opgeslagen. Synchronisatie is uitgeschakeld; schakel die eerst in om een aanmeldpoging te starten."
+            )
 
         return {
             "created": created,
             "api_token": issued_token,
             "status": self.mobile_status_payload(),
-            "message": "De gegevens zijn opgeslagen. De eerste aanmelding is gestart.",
+            "message": message,
         }
 
     async def update_fcm_token(self, token: str, device_label: str | None = None) -> None:
@@ -337,6 +384,8 @@ class BackendService:
         )
 
     async def trigger_refresh(self, reason: str, wait: bool = False) -> dict[str, Any]:
+        if not self.sync_enabled():
+            raise RuntimeError(SYNC_DISABLED_MESSAGE)
         if self._current_sync_task is None or self._current_sync_task.done():
             self._current_sync_task = asyncio.create_task(self._run_sync(reason))
         if wait:
@@ -448,6 +497,7 @@ class BackendService:
             "connected": bool(current_device and self.device_is_connected(current_device.device_id)),
             "device_id": current_device.device_id if current_device else "",
             "sync": {
+                "sync_enabled": self.state.sync.sync_enabled,
                 "status": self.state.sync.status,
                 "current_phase": self.state.sync.current_phase,
                 "auth_ready": self.state.sync.auth_ready,
@@ -618,6 +668,15 @@ class BackendService:
     async def _run_sync(self, reason: str) -> None:
         async with self._sync_lock:
             try:
+                if not self.sync_enabled():
+                    async with self._state_lock:
+                        self.state.sync.current_phase = "disabled"
+                        self.state.sync.current_challenge_id = None
+                        self.state.sync.challenge_created_at = None
+                        self.state.sync.last_message = SYNC_DISABLED_MESSAGE
+                        await self._persist_state()
+                    return
+
                 async with self._state_lock:
                     # The sync state is mirrored to disk before work starts so the debug page always shows progress.
                     self.state.sync.status = "running"
@@ -685,6 +744,9 @@ class BackendService:
             await self._persist_state()
 
     async def _request_sms_code(self) -> str:
+        if not self.sync_enabled():
+            raise RuntimeError(SYNC_DISABLED_MESSAGE)
+
         active_device = self.active_device()
         if active_device is None:
             raise RuntimeError("Er is geen Android-apparaat gekoppeld voor SMS-verificatie.")
@@ -789,7 +851,7 @@ class BackendService:
         while True:
             await asyncio.sleep(self.config.sync_interval_minutes * 60)
             try:
-                if self.credentials is not None and self.active_device() is not None:
+                if self.sync_enabled() and self.credentials is not None and self.active_device() is not None:
                     await self.trigger_refresh(reason="scheduled", wait=True)
             except Exception:
                 log.exception("Scheduled sync failed.")
@@ -858,6 +920,9 @@ class BackendService:
         sender: str,
         note: str,
     ) -> None:
+        if not self.sync_enabled():
+            raise RuntimeError(SYNC_DISABLED_MESSAGE)
+
         pending.sender = sender
         pending.code = code.strip()
         pending.event.set()

@@ -124,6 +124,7 @@ class RosterItem:
 
 @dataclass
 class SyncState:
+    sync_enabled: bool = True
     status: str = "idle"
     current_phase: str = "idle"
     auth_ready: bool = False
@@ -147,6 +148,7 @@ class SyncState:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "sync_enabled": self.sync_enabled,
             "status": self.status,
             "current_phase": self.current_phase,
             "auth_ready": self.auth_ready,
@@ -172,6 +174,7 @@ class SyncState:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SyncState":
         return cls(
+            sync_enabled=bool(data.get("sync_enabled", True)),
             status=data.get("status", "idle"),
             current_phase=data.get("current_phase", "idle"),
             auth_ready=bool(data.get("auth_ready", False)),

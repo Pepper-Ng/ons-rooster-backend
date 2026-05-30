@@ -120,6 +120,23 @@ class FakeCheckpointAutomationClient:
         )
 
 
+class CountingAutomationClient:
+    def __init__(self) -> None:
+        self.call_count = 0
+
+    async def authenticate_and_scrape(self, credentials, request_sms_code, snapshot_path, config, report_progress=None):
+        del request_sms_code, config, report_progress
+        self.call_count += 1
+        snapshot_path.write_text("<html>ok</html>", encoding="utf-8")
+        return AuthenticationResult(
+            final_url=credentials.login_url,
+            page_title="Rooster",
+            roster_items=[],
+            debug_notes=[f"Counting attempt {self.call_count}."],
+            auth_ready=True,
+        )
+
+
 async def wait_for(condition, timeout: float = 1.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -345,6 +362,64 @@ async def test_status_query_token_bootstraps_cookie_for_followup_actions(aiohttp
     initial_payload = json.loads(initial_message.data)
     assert set(["status", "devices", "portals"]).issubset(initial_payload.keys())
     await websocket.close()
+
+
+@pytest.mark.asyncio
+async def test_sync_toggle_blocks_setup_autosync_and_manual_refresh(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    push_client = FakePushClient()
+    automation_client = CountingAutomationClient()
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=push_client,
+        automation_client=automation_client,
+    )
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    disable_response = await client.post(
+        "/api/v1/admin/sync?token=admin-code",
+        json={"enabled": False},
+    )
+    assert disable_response.status == 200
+    disable_payload = await disable_response.json()
+    assert disable_payload["status"]["status"]["sync"]["sync_enabled"] is False
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-1",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+    setup_payload = await setup_response.json()
+    assert "Synchronisatie is uitgeschakeld" in setup_payload["message"]
+    assert setup_payload["status"]["sync"]["sync_enabled"] is False
+
+    await asyncio.sleep(0)
+    assert automation_client.call_count == 0
+
+    refresh_blocked = await client.post("/api/v1/admin/refresh?token=admin-code")
+    assert refresh_blocked.status == 400
+    assert "Schakel synchronisatie eerst weer in" in await refresh_blocked.text()
+
+    enable_response = await client.post(
+        "/api/v1/admin/sync?token=admin-code",
+        json={"enabled": True},
+    )
+    assert enable_response.status == 200
+    enable_payload = await enable_response.json()
+    assert enable_payload["status"]["status"]["sync"]["sync_enabled"] is True
+
+    refresh_response = await client.post("/api/v1/admin/refresh?token=admin-code")
+    assert refresh_response.status == 200
+    await wait_for(lambda: automation_client.call_count == 1)
 
 
 @pytest.mark.asyncio
@@ -578,7 +653,9 @@ async def test_status_page_renders_auth_console(aiohttp_client, tmp_path):
     assert "Authenticatieconsole" in body
     assert "Bekijk HTML" in body
     assert "Credentialexport" in body
+    assert "Bevestig export-passphrase" not in body
     assert "python -m ons_backend.credential_export" in body
+    assert body.index("Portalen beheren") < body.index("Credentialexport") < body.index("Mock HasMoves testflow")
 
 
 @pytest.mark.asyncio
@@ -608,7 +685,6 @@ async def test_status_credential_export_requires_session_and_returns_encrypted_b
         "/status/credentials/export?token=admin-code",
         data={
             "export_passphrase": "correct horse battery staple",
-            "confirm_export_passphrase": "correct horse battery staple",
         },
     )
     assert unauthorized.status == 401
@@ -623,7 +699,6 @@ async def test_status_credential_export_requires_session_and_returns_encrypted_b
         "/status/credentials/export",
         data={
             "export_passphrase": "correct horse battery staple",
-            "confirm_export_passphrase": "correct horse battery staple",
         },
     )
     assert export_response.status == 200
@@ -674,7 +749,6 @@ async def test_status_credential_export_rejects_admin_token_as_passphrase(aiohtt
         "/status/credentials/export",
         data={
             "export_passphrase": "admin-code",
-            "confirm_export_passphrase": "admin-code",
         },
     )
     assert export_response.status == 200

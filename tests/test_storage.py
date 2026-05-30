@@ -55,6 +55,19 @@ def test_state_store_encrypts_credentials(tmp_path):
     assert loaded_credentials == credentials
 
 
+def test_state_store_persists_sync_enabled_flag(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    state = AppState()
+    state.sync.sync_enabled = False
+
+    store.save(state, None)
+    loaded_state, loaded_credentials = store.load()
+
+    assert loaded_credentials is None
+    assert loaded_state.sync.sync_enabled is False
+
+
 def test_state_store_round_trips_credentials_export(tmp_path):
     config = build_config(tmp_path)
     store = StateStore(config)

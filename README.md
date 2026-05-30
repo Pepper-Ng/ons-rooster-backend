@@ -184,6 +184,7 @@ It uses the same `ADMIN_TOKEN` as a lightweight web password. After login, the p
 - a per-device `FCM-ping` button
 - a `Maak actief` button to switch the active device
 - a manual sync trigger
+- a sync enable/disable toggle that blocks scheduled, setup-triggered, and manual login attempts while disabled
 - a mock OTP submit button for the current challenge
 - a credential-export form that downloads a passphrase-encrypted JSON bundle instead of showing plaintext credentials in the browser
 - direct links to the mock HasMoves pages
@@ -227,7 +228,7 @@ The mock pages deliberately use generic form fields such as `username`, `passwor
    - ONS password
    - optional setup code
 4. Tap the save button.
-5. The backend stores the credentials encrypted, starts a login attempt, and requests the SMS code when ONS triggers 2FA.
+5. The backend stores the credentials encrypted. If sync is enabled, it immediately starts a login attempt and requests the SMS code when ONS triggers 2FA.
 6. The phone receives the SMS, relays the code over HTTPS, and gets a small confirmation notification when the backend is ready.
 
 The app does not persist the ONS password locally after submission. The backend becomes the long-running worker and keeps the credentials for future refreshes.

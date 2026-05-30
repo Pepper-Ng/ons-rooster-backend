@@ -80,6 +80,7 @@ def create_app(
     app.router.add_delete("/api/v1/admin/devices/{device_id}", handle_admin_remove_device)
     app.router.add_post("/api/v1/admin/portals", handle_admin_portal_upsert)
     app.router.add_delete("/api/v1/admin/portals/{portal_id}", handle_admin_portal_remove)
+    app.router.add_post("/api/v1/admin/sync", handle_admin_sync_state)
     app.router.add_post("/api/v1/admin/refresh", handle_refresh)
     app.router.add_get("/api/v1/admin/fcm", handle_admin_fcm_status)
     app.router.add_post("/api/v1/admin/fcm/test", handle_admin_fcm_test)
@@ -341,10 +342,6 @@ async def handle_status_credentials_export(request: web.Request) -> web.Response
     _require_ops_session(request)
     form = await request.post()
     passphrase = str(form.get("export_passphrase", ""))
-    confirm_passphrase = str(form.get("confirm_export_passphrase", ""))
-
-    if passphrase != confirm_passphrase:
-        raise _status_redirect(error="De export-passphrases komen niet overeen.")
 
     try:
         bundle = _service(request.app).export_credentials_bundle(passphrase)
@@ -386,7 +383,10 @@ async def handle_status_auth_trace(request: web.Request) -> web.Response:
 
 async def handle_status_refresh(request: web.Request) -> web.Response:
     _require_ops_auth(request)
-    await _service(request.app).trigger_refresh(reason="manual-status", wait=False)
+    try:
+        await _service(request.app).trigger_refresh(reason="manual-status", wait=False)
+    except RuntimeError as exc:
+        raise _status_redirect(error=str(exc))
     raise _status_redirect("De handmatige synchronisatie is gestart.")
 
 
@@ -647,8 +647,34 @@ async def handle_sms_code(request: web.Request) -> web.Response:
 async def handle_refresh(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     service = _service(request.app)
-    await service.trigger_refresh(reason="manual", wait=False)
+    try:
+        await service.trigger_refresh(reason="manual", wait=False)
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
     return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": service.operator_status_payload()})
+
+
+async def handle_admin_sync_state(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    payload = await _read_request_payload(request)
+    raw_enabled = payload.get("enabled")
+
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    elif isinstance(raw_enabled, str):
+        normalized = raw_enabled.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            enabled = True
+        elif normalized in {"0", "false", "no", "off"}:
+            enabled = False
+        else:
+            raise web.HTTPBadRequest(text="Geef enabled mee als true of false.")
+    else:
+        raise web.HTTPBadRequest(text="Geef enabled mee als true of false.")
+
+    service = _service(request.app)
+    message = await service.set_sync_enabled(enabled)
+    return web.json_response({"message": message, "status": service.operator_status_payload()})
 
 
 async def handle_admin_status(request: web.Request) -> web.Response:
@@ -927,6 +953,10 @@ def _render_status_page(
     diagnostics = _fcm_diagnostics(app)
     devices = status_snapshot["devices"]
     portals = status_snapshot["portals"]
+    sync_toggle_label = "Schakel sync uit" if status_payload["sync"]["sync_enabled"] else "Schakel sync in"
+    sync_toggle_class = "danger" if status_payload["sync"]["sync_enabled"] else ""
+    sync_enabled_text = "Ingeschakeld" if status_payload["sync"]["sync_enabled"] else "Uitgeschakeld"
+    sync_enabled_class = "online" if status_payload["sync"]["sync_enabled"] else "disabled"
     mock_basic_url = f"{config.public_base_url}/sandbox/hasmoves/login"
     mock_sms_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sms"
     challenge_controls = "hidden"
@@ -991,10 +1021,6 @@ def _render_status_page(
                 <span>Eenmalige export-passphrase</span>
                 <input type="password" name="export_passphrase" autocomplete="new-password" minlength="12" required>
             </label>
-            <label>
-                <span>Bevestig export-passphrase</span>
-                <input type="password" name="confirm_export_passphrase" autocomplete="new-password" minlength="12" required>
-            </label>
             <p class="field-help">Gebruik hier niet het admin-token. De export-passphrase blijft alleen lokaal bij deze download relevant.</p>
             <div class="actions"><button type="submit">Download versleutelde credentialexport</button></div>
             <p class="field-help">Lokaal ontsleutelen: <code>python -m ons_backend.credential_export pad/naar/export.json</code></p>
@@ -1043,6 +1069,7 @@ def _render_status_page(
         .status-chip {{ display: inline-flex; align-items: center; border-radius: 999px; padding: 0.28rem 0.7rem; font-size: 0.9rem; font-weight: 600; background: #e2e8f0; color: #0f172a; }}
         .status-chip.online {{ background: #dcfce7; color: #166534; }}
         .status-chip.paired {{ background: #dbeafe; color: #1d4ed8; }}
+        .status-chip.disabled {{ background: #fee2e2; color: #991b1b; }}
         .section-note {{ margin: 0 0 0.85rem; color: #475569; max-width: 52rem; }}
         .portal-manager {{ display: grid; grid-template-columns: minmax(280px, 360px) minmax(0, 1fr); gap: 1rem; align-items: start; }}
         .portal-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 0.85rem; }}
@@ -1080,6 +1107,7 @@ def _render_status_page(
   <section>
     <div class="toolbar">
             <button type="button" id="btn-refresh-sync">Start sync nu</button>
+                        <button type="button" id="btn-toggle-sync" class="{sync_toggle_class}">{sync_toggle_label}</button>
       <form method="post" action="/status/logout"><button type="submit">Uitloggen</button></form>
       <a href="/install">Firebase-installatie</a>
       <a href="/debug?token={html.escape(config.debug_token)}">Debugpagina</a>
@@ -1093,6 +1121,7 @@ def _render_status_page(
             <div class="overview-card"><strong>Appstatus</strong><div class="status-duo"><span class="status-chip {'online' if devices and any(device['is_connected'] for device in devices) else ''}">{'Verbonden' if devices and any(device['is_connected'] for device in devices) else 'Geen live appverbinding'}</span><span class="status-chip {'paired' if status_payload['device_registered'] else ''}">{'Gekoppeld' if status_payload['device_registered'] else 'Niet gekoppeld'}</span></div></div>
             <div class="overview-card"><strong>Actief apparaat</strong><span>{html.escape(status_payload['active_device_label'] or '-')}</span></div>
             <div class="overview-card"><strong>Aantal apparaten</strong><span>{status_payload['device_count']}</span></div>
+            <div class="overview-card"><strong>Synchronisatie</strong><div class="status-duo"><span class="status-chip {sync_enabled_class}">{sync_enabled_text}</span></div></div>
             <div class="overview-card"><strong>FCM geconfigureerd</strong><span>{diagnostics['configured']}</span></div>
             <div class="overview-card"><strong>Laatste status</strong><span>{html.escape(str(status_payload['sync']['last_message'] or '-'))}</span></div>
             <div class="overview-card"><strong>Laatste fout</strong><span>{html.escape(str(status_payload['sync']['last_error'] or '-'))}</span></div>
@@ -1128,10 +1157,6 @@ def _render_status_page(
         </table>
     </section>
     <section>
-        <h2>Credentialexport</h2>
-        {credential_export_markup}
-    </section>
-    <section>
         <h2>Portalen beheren</h2>
         <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
         <div class="portal-manager">
@@ -1160,6 +1185,10 @@ def _render_status_page(
             <div id="portal-list" class="portal-grid">{portal_cards}</div>
         </div>
     </section>
+    <section>
+        <h2>Credentialexport</h2>
+        {credential_export_markup}
+    </section>
   <section>
     <h2>Mock HasMoves testflow</h2>
     <p>Gebruik deze URL als ONS-inlog-URL in de app of in backend-tests om de live HasMoves-site te omzeilen.</p>
@@ -1185,9 +1214,11 @@ def _render_status_page(
         const portalNameInput = document.getElementById('portal_name');
         const portalLoginUrlInput = document.getElementById('portal_login_url');
         const portalLogoUrlInput = document.getElementById('portal_logo_url');
+        const syncToggleButton = document.getElementById('btn-toggle-sync');
         const liveUrl = `${{window.location.protocol === 'https:' ? 'wss' : 'ws'}}://${{window.location.host}}/status/live`;
         let socket = null;
         let reconnectHandle = null;
+        let disconnectNoticeHandle = null;
         let statusSnapshot = initialStatus;
 
         function escapeHtml(value) {{
@@ -1248,11 +1279,18 @@ def _render_status_page(
                 <div class="overview-card"><strong>Appstatus</strong><div class="status-duo"><span class="status-chip ${{anyConnected ? 'online' : ''}}">${{anyConnected ? 'Verbonden' : 'Geen live appverbinding'}}</span><span class="status-chip ${{status.device_registered ? 'paired' : ''}}">${{status.device_registered ? 'Gekoppeld' : 'Niet gekoppeld'}}</span></div></div>
                 <div class="overview-card"><strong>Actief apparaat</strong><span>${{escapeHtml(status.active_device_label || '-')}}</span></div>
                 <div class="overview-card"><strong>Aantal apparaten</strong><span>${{snapshot.devices.length}}</span></div>
+                <div class="overview-card"><strong>Synchronisatie</strong><div class="status-duo"><span class="status-chip ${{status.sync.sync_enabled ? 'online' : 'disabled'}}">${{status.sync.sync_enabled ? 'Ingeschakeld' : 'Uitgeschakeld'}}</span></div></div>
                 <div class="overview-card"><strong>FCM geconfigureerd</strong><span>${{snapshot.fcm_configured ? 'Ja' : 'Nee'}}</span></div>
                 <div class="overview-card"><strong>Laatste status</strong><span>${{escapeHtml(status.sync.last_message || '-')}}</span></div>
                 <div class="overview-card"><strong>Laatste fout</strong><span>${{escapeHtml(status.sync.last_error || '-')}}</span></div>
                 <div class="overview-card"><strong>Huidige fase</strong><span>${{escapeHtml(status.sync.current_phase || '-')}}</span></div>
                 <div class="overview-card"><strong>Laatste succesvolle login</strong><span>${{escapeHtml(formatTimestamp(status.sync.last_success_at))}}</span></div>`;
+        }}
+
+        function updateSyncControls(snapshot) {{
+            const enabled = Boolean(snapshot.status.sync.sync_enabled);
+            syncToggleButton.textContent = enabled ? 'Schakel sync uit' : 'Schakel sync in';
+            syncToggleButton.className = enabled ? 'danger' : '';
         }}
 
         function renderDevices(snapshot) {{
@@ -1347,6 +1385,7 @@ def _render_status_page(
             renderAuthTrace(snapshot);
             renderPortals(snapshot);
             syncPortalForm(snapshot);
+            updateSyncControls(snapshot);
         }}
 
         function applyStatusPayload(response) {{
@@ -1381,10 +1420,10 @@ def _render_status_page(
                 return;
             }}
 
-            liveIndicator.textContent = 'Operatorpagina verbinden...';
-            liveIndicator.className = 'live-pill retrying';
+            window.clearTimeout(reconnectHandle);
             socket = new WebSocket(liveUrl);
             socket.addEventListener('open', () => {{
+                window.clearTimeout(disconnectNoticeHandle);
                 liveIndicator.textContent = 'Operatorpagina live';
                 liveIndicator.className = 'live-pill live';
             }});
@@ -1392,20 +1431,44 @@ def _render_status_page(
                 render(JSON.parse(event.data));
             }});
             socket.addEventListener('close', () => {{
-                liveIndicator.textContent = 'Operatorpagina tijdelijk onderbroken, opnieuw verbinden...';
-                liveIndicator.className = 'live-pill retrying';
-                reconnectHandle = window.setTimeout(connectLive, 2000);
+                socket = null;
+                window.clearTimeout(disconnectNoticeHandle);
+                disconnectNoticeHandle = window.setTimeout(() => {{
+                    liveIndicator.textContent = 'Operatorpagina tijdelijk onderbroken, opnieuw verbinden...';
+                    liveIndicator.className = 'live-pill retrying';
+                }}, 1500);
+                reconnectHandle = window.setTimeout(connectLive, 600);
             }});
             socket.addEventListener('error', () => {{
-                socket.close();
+                if (socket && socket.readyState < WebSocket.CLOSING) {{
+                    socket.close();
+                }}
             }});
         }}
 
         document.getElementById('btn-refresh-sync').addEventListener('click', async () => {{
+            if (!statusSnapshot.status.sync.sync_enabled) {{
+                setFlash('error', 'Synchronisatie is uitgeschakeld. Schakel synchronisatie eerst weer in.');
+                return;
+            }}
             try {{
                 const response = await callJson('/api/v1/admin/refresh', {{ method: 'POST' }});
                 applyStatusPayload(response);
                 setFlash('ok', response.message || 'Synchronisatie gestart.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        syncToggleButton.addEventListener('click', async () => {{
+            const nextEnabled = !statusSnapshot.status.sync.sync_enabled;
+            try {{
+                const response = await callJson('/api/v1/admin/sync', {{
+                    method: 'POST',
+                    body: JSON.stringify({{ enabled: nextEnabled }}),
+                }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || (nextEnabled ? 'Synchronisatie ingeschakeld.' : 'Synchronisatie uitgeschakeld.'));
             }} catch (error) {{
                 setFlash('error', error.message);
             }}
