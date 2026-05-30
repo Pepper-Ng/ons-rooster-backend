@@ -1466,14 +1466,10 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         if request_sms_code is None:
             raise RuntimeError("De backend mist de callback om de SMS-code op te vragen.")
 
-        sms_relay_task: asyncio.Task[str] | None = None
-        sms_challenge_id = ""
-
-        if prepare_sms_relay is not None and wait_for_sms_code is not None:
-            sms_challenge_id = await prepare_sms_relay()
-        else:
-            sms_relay_task = asyncio.create_task(request_sms_code())
-            await asyncio.sleep(0)
+        # Start one relay task before requesting the SMS so Android is armed first and
+        # the same challenge lifecycle is used for both arming and receiving.
+        sms_relay_task = asyncio.create_task(request_sms_code())
+        await asyncio.sleep(0)
         self._record_event(
             report_progress,
             trace_index=trace_index,
@@ -1514,12 +1510,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             page=page,
         )
 
-        if sms_relay_task is not None:
-            sms_code = await sms_relay_task
-        elif wait_for_sms_code is not None and sms_challenge_id:
-            sms_code = await wait_for_sms_code(sms_challenge_id)
-        else:
-            sms_code = await request_sms_code()
+        sms_code = await sms_relay_task
         debug_notes.append("Received the SMS OTP from the Android relay.")
 
         await self._fill_first_visible(
