@@ -1290,8 +1290,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         else ""
                     ),
                 )
+                failure_prefix = "De backend kon de Microsoft SSO-flow niet afronden."
+                if current_url and not self._looks_like_external_sso_host(current_url):
+                    failure_prefix = "De backend bereikte het medewerkerportaal, maar kon de roosterpagina nog niet openen."
                 raise RuntimeError(
-                    "De backend kon de Microsoft SSO-flow niet afronden. "
+                    f"{failure_prefix} "
                     f"Laatste pagina: {self._text_snippet(html) if html else str(exc)}"
                 ) from exc
             finally:
@@ -1919,6 +1922,31 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         stop_from: tuple[int, int] | None = None
 
         await self._attach_best_effort_dialog_dismiss_handler(page, debug_notes=debug_notes)
+        trace_index = await self._record_playwright_page_step(
+            report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
+            trace_index=trace_index,
+            label="Post-login landing page",
+            message=f"Post-login landing page reached: {page.url}.",
+            phase="post_login_landing",
+            page=page,
+        )
+
+        opened_from_dashboard = await self._open_rooster_from_dashboard(page, debug_notes=debug_notes)
+        if opened_from_dashboard:
+            trace_index = await self._record_playwright_page_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="Open rooster via dashboard",
+                message=f"Rooster opened from Medewerkerportaal: {page.url}.",
+                phase="roster_opened_from_dashboard",
+                page=page,
+            )
+        else:
+            debug_notes.append("Rooster button was not used from dashboard; continuing with direct roster URLs.")
 
         for month_start, month_url in self._resolve_month_targets(login_url, page.url, config.roster_url):
             month_key = f"{month_start.year:04d}-{month_start.month:02d}"
@@ -1994,6 +2022,37 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             roster_exports=exports,
             post_otp_screenshot_path=post_otp_screenshot_path,
         )
+
+    async def _open_rooster_from_dashboard(self, page, *, debug_notes: list[str]) -> bool:
+        current_url = page.url.lower()
+        if "mijnio.nl" not in current_url and "dashboard" not in current_url:
+            return False
+
+        for selector in (
+            'a:has-text("Rooster")',
+            'button:has-text("Rooster")',
+            '[role="link"]:has-text("Rooster")',
+            '[role="button"]:has-text("Rooster")',
+            'text=Rooster',
+        ):
+            locator = page.locator(selector).first
+            try:
+                if not await locator.is_visible(timeout=350):
+                    continue
+                await locator.click(timeout=2_000, force=True)
+                for _ in range(16):
+                    await page.wait_for_timeout(250)
+                    lowered = page.url.lower()
+                    if "onsdraaiboek/roster" in lowered or "hasmoves.com" in lowered:
+                        debug_notes.append(f"Opened roster from dashboard using selector {selector}.")
+                        return True
+                debug_notes.append(
+                    f"Clicked dashboard rooster selector {selector}, but URL stayed on {page.url}."
+                )
+                return False
+            except Exception:
+                continue
+        return False
 
     async def _attach_best_effort_dialog_dismiss_handler(self, page, *, debug_notes: list[str]) -> None:
         async def _dismiss_dialog(dialog) -> None:
