@@ -1593,7 +1593,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             page=page,
         )
 
-        await self._wait_for_post_otp_page(page, self.POST_OTP_TRANSITION_TIMEOUT)
+        try:
+            await self._wait_for_post_otp_page(page, self.POST_OTP_TRANSITION_TIMEOUT)
+        except Exception:
+            try:
+                err_screenshot = str(config.post_otp_screenshot_file)
+                await page.screenshot(path=err_screenshot, full_page=True)
+                debug_notes.append(f"Saved post-OTP error screenshot to {err_screenshot}.")
+            except Exception as _se:
+                debug_notes.append(f"Could not save post-OTP error screenshot: {_se}")
+            raise
         html, page_title = await self._stabilize_post_otp_page(page, debug_notes=debug_notes)
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
@@ -1823,27 +1832,39 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             otp_error = self._extract_microsoft_otp_error(html)
             if otp_error:
                 raise RuntimeError(otp_error)
-            if not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
-                # OTP field disappeared, but staying on Microsoft's SSO host still means
-                # the submit did not complete the handoff to the roster session.
-                if self._looks_like_external_sso_host(page.url):
-                    login_error = self._extract_login_error(self._synthetic_response(200), html)
-                    if login_error:
-                        raise RuntimeError(login_error)
-                    raise RuntimeError(
-                        "OTP submission did not leave Microsoft's SSO host. "
-                        f"Current URL: {page.url}. Last page: {self._text_snippet(html)}"
-                    )
+
+            # Success: URL has left the Microsoft SSO host.
+            if not self._looks_like_external_sso_host(page.url):
                 return
-            login_error = self._extract_login_error(self._synthetic_response(200), html)
-            if login_error:
-                raise RuntimeError(login_error)
+
+            # Proactively dismiss the "Stay signed in?" (KMSI) prompt that Microsoft
+            # may show after accepting MFA.  It has no OTP field and stays on
+            # microsoftonline.com, so it must be handled here instead of timing out.
+            for selector in self.MICROSOFT_DECLINE_BUTTON_SELECTORS:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250):
+                        await locator.click()
+                        await page.wait_for_timeout(500)
+                        break
+                except Exception:
+                    continue
+
+            # If the OTP field is still visible, check for an explicit error
+            # (wrong / expired code).  If the field is gone but we are still on
+            # the MS host, that is a normal transient state (JS XHR in flight or a
+            # new prompt loading) — just keep waiting.
+            if await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
+                login_error = self._extract_login_error(self._synthetic_response(200), html)
+                if login_error:
+                    raise RuntimeError(login_error)
+
             await page.wait_for_timeout(250)
 
         html = await page.content()
         raise RuntimeError(
-            "De backend bleef op de Microsoft OTP-invoerpagina staan nadat de code was ingestuurd. "
-            f"Laatste pagina: {self._text_snippet(html)}"
+            "De backend bleef op de Microsoft SSO-host staan nadat de OTP-code was ingestuurd. "
+            f"Laatste URL: {page.url}. Laatste pagina: {self._text_snippet(html)}"
         )
 
     async def _collect_roster_months_after_otp(
