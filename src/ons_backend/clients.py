@@ -2271,13 +2271,39 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     async def _wait_for_sso_destination(self, page, timeout_seconds: int) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
-            if await self._has_visible_selector(page, self.OTP_SELECTORS):
-                return
-            if await self._has_visible_selector(page, self.MICROSOFT_PROOF_SELECTION_SELECTORS):
-                return
+            try:
+                if await asyncio.wait_for(
+                    self._has_visible_selector(page, self.OTP_SELECTORS),
+                    timeout=2,
+                ):
+                    return
+            except Exception:
+                pass
+
+            try:
+                if await asyncio.wait_for(
+                    self._has_visible_selector(page, self.MICROSOFT_PROOF_SELECTION_SELECTORS),
+                    timeout=2,
+                ):
+                    return
+            except Exception:
+                pass
+
             if not self._looks_like_external_sso_host(page.url):
                 return
+
             await page.wait_for_timeout(250)
+
+        html = ""
+        try:
+            html = await asyncio.wait_for(page.content(), timeout=2)
+        except Exception:
+            html = ""
+
+        raise RuntimeError(
+            "De Microsoft SSO-flow bleef hangen na het insturen van het wachtwoord. "
+            f"Laatste URL: {page.url}. Laatste pagina: {self._text_snippet(html) if html else 'geen snapshot beschikbaar'}"
+        )
 
     @staticmethod
     def _looks_like_external_sso_host(url: str) -> bool:
