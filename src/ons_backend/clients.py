@@ -1857,7 +1857,13 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             if not self._looks_like_external_sso_host(page.url):
                 return
 
-            html = await page.content()
+            try:
+                html = await page.content()
+            except Exception:
+                # During redirect transitions Playwright may briefly reject content reads.
+                # Keep waiting instead of failing the whole flow.
+                await page.wait_for_timeout(250)
+                continue
 
             # Definitive rejection: Microsoft rendered an OTP-specific error message.
             otp_error = self._extract_microsoft_otp_error(html)
@@ -1887,7 +1893,10 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
 
             await page.wait_for_timeout(250)
 
-        html = await page.content()
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
         raise RuntimeError(
             "De backend bleef op de Microsoft SSO-host staan nadat de OTP-code was ingestuurd. "
             f"Laatste URL: {page.url}. Laatste pagina: {self._text_snippet(html)}"
