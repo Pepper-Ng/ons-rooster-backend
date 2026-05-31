@@ -779,6 +779,39 @@ def test_http_login_automation_client_reads_bootstrap_flash_error():
         assert error_message == "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is."
 
 
+def test_http_login_automation_client_extracts_microsoft_otp_inline_error():
+        automation_client = HttpLoginAutomationClient()
+        html = """
+<!doctype html>
+<html lang="en">
+    <body>
+        <div id="idDiv_SAOTCC_ErrorMsg_OTC">That code didn't work. Please enter a valid code.</div>
+    </body>
+</html>
+"""
+
+        error_message = automation_client._extract_microsoft_otp_error(html)
+
+        assert "Microsoft rejected the OTP code" in error_message
+        assert "That code didn't work" in error_message
+
+
+def test_http_login_automation_client_ignores_non_otp_inline_messages():
+        automation_client = HttpLoginAutomationClient()
+        html = """
+<!doctype html>
+<html lang="en">
+    <body>
+        <div id="idDiv_SAOTCC_ErrorMsg_OTC">Please complete this step to continue.</div>
+    </body>
+</html>
+"""
+
+        error_message = automation_client._extract_microsoft_otp_error(html)
+
+        assert error_message == ""
+
+
 def test_http_login_automation_client_extracts_sso_provider_from_bootstrap_script():
         automation_client = HttpLoginAutomationClient()
         html = """

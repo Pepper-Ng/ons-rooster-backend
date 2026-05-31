@@ -482,6 +482,17 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         "incorrect_credentials",
         "sso_required_error",
     )
+    MICROSOFT_OTP_ERROR_MARKERS = (
+        "that code didn't work",
+        "enter a valid code",
+        "incorrect code",
+        "invalid code",
+        "code is incorrect",
+        "deze code werkt niet",
+        "voer een geldige code in",
+        "onjuiste code",
+        "ongeldige code",
+    )
     LOGIN_ERROR_CODE_MESSAGES = {
         "incorrect_credentials": "De ONS-site meldt dat de gebruikersnaam of het wachtwoord onjuist is.",
         "verify_credentials_error": "De ONS-site heeft de ingevoerde gebruikersnaam of het wachtwoord afgekeurd.",
@@ -1677,6 +1688,9 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             html = await page.content()
+            otp_error = self._extract_microsoft_otp_error(html)
+            if otp_error:
+                raise RuntimeError(otp_error)
             for selector in self.MICROSOFT_OTP_SELECTORS:
                 locator = page.locator(selector).first
                 try:
@@ -1698,11 +1712,14 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     async def _wait_for_post_otp_page(self, page, timeout_seconds: int) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
+            html = await page.content()
+            otp_error = self._extract_microsoft_otp_error(html)
+            if otp_error:
+                raise RuntimeError(otp_error)
             if not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
                 # OTP field disappeared, but staying on Microsoft's SSO host still means
                 # the submit did not complete the handoff to the roster session.
                 if self._looks_like_external_sso_host(page.url):
-                    html = await page.content()
                     login_error = self._extract_login_error(self._synthetic_response(200), html)
                     if login_error:
                         raise RuntimeError(login_error)
@@ -1711,7 +1728,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         f"Current URL: {page.url}. Last page: {self._text_snippet(html)}"
                     )
                 return
-            html = await page.content()
             login_error = self._extract_login_error(self._synthetic_response(200), html)
             if login_error:
                 raise RuntimeError(login_error)
@@ -2508,6 +2524,27 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             return combined
         if response.status_code >= 400:
             return f"De ONS-login gaf HTTP {response.status_code} terug."
+        return ""
+
+    def _extract_microsoft_otp_error(self, html: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        messages: list[str] = []
+        for selector in (
+            "#idDiv_SAOTCC_ErrorMsg_OTC",
+            "#idSpan_SAOTCC_Error_OTC",
+            '[role="alert"]',
+            ".alert",
+            ".error",
+        ):
+            for element in soup.select(selector):
+                text = " ".join(fragment.strip() for fragment in element.stripped_strings)
+                if text:
+                    messages.append(text)
+
+        combined = " ".join(messages) if messages else self._text_snippet(html)
+        normalized = combined.lower()
+        if any(marker in normalized for marker in self.MICROSOFT_OTP_ERROR_MARKERS):
+            return f"Microsoft rejected the OTP code: {combined}"
         return ""
 
     def _extract_login_error_code(self, html: str) -> str:
