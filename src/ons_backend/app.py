@@ -56,6 +56,8 @@ def create_app(
     app.router.add_post("/status/credentials/export", handle_status_credentials_export)
     app.router.add_get("/status/auth-trace/{entry_id}", handle_status_auth_trace)
     app.router.add_get("/status/post-otp-screenshot", handle_status_post_otp_screenshot)
+    app.router.add_get("/status/screenshot/{filename}", handle_status_screenshot)
+    app.router.add_post("/status/debug-toggle", handle_status_debug_toggle)
     app.router.add_get("/status/roster/{month_key}.json", handle_status_roster_month_export)
     app.router.add_post("/status/refresh", handle_status_refresh)
     app.router.add_post("/status/challenges/mock-sms", handle_status_mock_sms)
@@ -400,6 +402,30 @@ async def handle_status_post_otp_screenshot(request: web.Request) -> web.Respons
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+async def handle_status_screenshot(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    filename = request.match_info.get("filename", "")
+    content = await _service(request.app).screenshot_content(filename)
+    if content is None:
+        raise web.HTTPNotFound(text="Screenshot niet beschikbaar.")
+    return web.Response(
+        body=content,
+        content_type="image/png",
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+async def handle_status_debug_toggle(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    new_value = await _service(request.app).toggle_debug_screenshots()
+    state_text = "ingeschakeld" if new_value else "uitgeschakeld"
+    raise _status_redirect(f"Debug-screenshots zijn nu {state_text}.")
 
 
 async def handle_status_roster_month_export(request: web.Request) -> web.Response:
@@ -1032,6 +1058,9 @@ def _render_status_page(
     sync_toggle_class = "danger" if status_payload["sync"]["sync_enabled"] else ""
     sync_enabled_text = "Ingeschakeld" if status_payload["sync"]["sync_enabled"] else "Uitgeschakeld"
     sync_enabled_class = "online" if status_payload["sync"]["sync_enabled"] else "disabled"
+    debug_screenshots_enabled = bool(status_payload["sync"].get("debug_screenshots", True))
+    debug_toggle_label = "Debug-screenshots: Aan" if debug_screenshots_enabled else "Debug-screenshots: Uit"
+    debug_toggle_class = "" if debug_screenshots_enabled else "danger"
     mock_basic_url = f"{config.public_base_url}/sandbox/hasmoves/login"
     mock_sms_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sms"
     mock_sso_url = f"{config.public_base_url}/sandbox/hasmoves/login?mode=sso"
@@ -1197,6 +1226,7 @@ def _render_status_page(
     <div class="toolbar">
             <button type="button" id="btn-refresh-sync">Start sync nu</button>
                         <button type="button" id="btn-toggle-sync" class="{sync_toggle_class}">{sync_toggle_label}</button>
+                        <button type="button" id="btn-debug-toggle" class="{debug_toggle_class}">{debug_toggle_label}</button>
       <form method="post" action="/status/logout"><button type="submit">Uitloggen</button></form>
       <a href="/install">Firebase-installatie</a>
       <a href="/debug?token={html.escape(config.debug_token)}">Debugpagina</a>
@@ -1236,13 +1266,13 @@ def _render_status_page(
     </section>
     <section>
         <h2>Authenticatieconsole</h2>
-        <p class="section-note">Deze live console toont iedere backend-stap tijdens de aanmeldflow. HTML-snapshots van individuele stappen zijn direct te openen.</p>
+        <p class="section-note">Deze live console toont iedere backend-stap tijdens de aanmeldflow. HTML-snapshots en debug-screenshots van individuele stappen zijn direct te openen.</p>
         <div id="auth-console" class="console-shell"></div>
         <table class="trace-table">
             <thead>
-                <tr><th>Tijd</th><th>Fase</th><th>Stap</th><th>URL</th><th>Snapshot</th></tr>
+                <tr><th>Tijd</th><th>Fase</th><th>Stap</th><th>URL</th><th>Snapshot</th><th>Screenshot</th></tr>
             </thead>
-            <tbody id="auth-trace-body"><tr><td colspan="5">Nog geen authenticatiestappen vastgelegd.</td></tr></tbody>
+            <tbody id="auth-trace-body"><tr><td colspan="6">Nog geen authenticatiestappen vastgelegd.</td></tr></tbody>
         </table>
     </section>
     <section>
@@ -1318,6 +1348,7 @@ def _render_status_page(
         const portalLoginUrlInput = document.getElementById('portal_login_url');
         const portalLogoUrlInput = document.getElementById('portal_logo_url');
         const syncToggleButton = document.getElementById('btn-toggle-sync');
+        const debugToggleButton = document.getElementById('btn-debug-toggle');
         const liveUrl = `${{window.location.protocol === 'https:' ? 'wss' : 'ws'}}://${{window.location.host}}/status/live`;
         let socket = null;
         let reconnectHandle = null;
@@ -1396,6 +1427,12 @@ def _render_status_page(
             syncToggleButton.className = enabled ? 'danger' : '';
         }}
 
+        function updateDebugToggle(snapshot) {{
+            const enabled = snapshot.status.sync.debug_screenshots !== false;
+            debugToggleButton.textContent = enabled ? 'Debug-screenshots: Aan' : 'Debug-screenshots: Uit';
+            debugToggleButton.className = enabled ? '' : 'danger';
+        }}
+
         function renderDevices(snapshot) {{
             if (!snapshot.devices.length) {{
                 deviceTableBody.innerHTML = '<tr><td colspan="7">Nog geen apparaten gekoppeld.</td></tr>';
@@ -1458,7 +1495,7 @@ def _render_status_page(
             const entries = snapshot.status.sync.auth_trace || [];
             if (!entries.length) {{
                 authConsole.innerHTML = '<div class="console-line">Nog geen authenticatiestappen vastgelegd.</div>';
-                authTraceBody.innerHTML = '<tr><td colspan="5">Nog geen authenticatiestappen vastgelegd.</td></tr>';
+                authTraceBody.innerHTML = '<tr><td colspan="6">Nog geen authenticatiestappen vastgelegd.</td></tr>';
                 return;
             }}
 
@@ -1477,6 +1514,7 @@ def _render_status_page(
                     <td>${{escapeHtml(entry.label || '-')}}</td>
                     <td>${{entry.url ? `<a href="${{escapeHtml(entry.url)}}" target="_blank" rel="noreferrer">${{escapeHtml(entry.url)}}</a>` : '-'}}</td>
                     <td>${{entry.snapshot_path ? `<a href="${{escapeHtml(entry.snapshot_path)}}" target="_blank" rel="noreferrer">Bekijk HTML</a>` : '-'}}</td>
+                    <td>${{entry.screenshot_path ? `<a href="${{encodeURI(entry.screenshot_path)}}" target="_blank" rel="noreferrer">Screenshot</a>` : '-'}}</td>
                 </tr>`).join('');
         }}
 
@@ -1515,6 +1553,7 @@ def _render_status_page(
             renderPortals(snapshot);
             syncPortalForm(snapshot);
             updateSyncControls(snapshot);
+            updateDebugToggle(snapshot);
         }}
 
         function applyStatusPayload(response) {{
@@ -1598,6 +1637,22 @@ def _render_status_page(
                 }});
                 applyStatusPayload(response);
                 setFlash('ok', response.message || (nextEnabled ? 'Synchronisatie ingeschakeld.' : 'Synchronisatie uitgeschakeld.'));
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        debugToggleButton.addEventListener('click', async () => {{
+            try {{
+                const response = await fetch('/status/debug-toggle', {{
+                    method: 'POST',
+                    credentials: 'same-origin',
+                }});
+                if (response.redirected || response.ok) {{
+                    window.location.reload();
+                }} else {{
+                    setFlash('error', 'Kan debug-modus niet omschakelen.');
+                }}
             }} catch (error) {{
                 setFlash('error', error.message);
             }}

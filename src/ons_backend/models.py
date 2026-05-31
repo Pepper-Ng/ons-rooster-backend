@@ -147,6 +147,7 @@ class SyncState:
     debug_notes: list[str] = field(default_factory=list)
     auth_trace_run_id: str | None = None
     auth_trace: list[dict[str, Any]] = field(default_factory=list)
+    debug_screenshots: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -173,6 +174,7 @@ class SyncState:
             "debug_notes": list(self.debug_notes),
             "auth_trace_run_id": self.auth_trace_run_id,
             "auth_trace": list(self.auth_trace),
+            "debug_screenshots": self.debug_screenshots,
         }
 
     @classmethod
@@ -201,6 +203,7 @@ class SyncState:
             debug_notes=list(data.get("debug_notes", [])),
             auth_trace_run_id=data.get("auth_trace_run_id"),
             auth_trace=list(data.get("auth_trace", [])),
+            debug_screenshots=bool(data.get("debug_screenshots", True)),
         )
 
 

@@ -597,7 +597,9 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         session_checkpoint: dict[str, Any] | None = None,
         prepare_sms_relay: SmsRelayPrimer | None = None,
         wait_for_sms_code: SmsCodeAwaiter | None = None,
+        debug_screenshots: bool = True,
     ) -> AuthenticationResult:
+        self._debug_screenshots = debug_screenshots
         loop = asyncio.get_running_loop()
 
         def sync_progress(event: dict[str, Any]) -> None:
@@ -2169,6 +2171,9 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     ) -> int:
         html = await page.content()
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+        screenshot_name = ""
+        if getattr(self, "_debug_screenshots", False):
+            screenshot_name = await self._write_trace_screenshot(config.auth_trace_dir, trace_index, phase, page)
         self._record_event(
             report_progress,
             trace_index=trace_index,
@@ -2178,6 +2183,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             url=page.url,
             page_title=await page.title(),
             snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, label, html),
+            screenshot_name=screenshot_name,
         )
         return trace_index + 1
 
@@ -2948,6 +2954,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         url: str,
         page_title: str = "",
         snapshot_name: str = "",
+        screenshot_name: str = "",
         status_code: int | None = None,
     ) -> None:
         if report_progress is None:
@@ -2962,6 +2969,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 "url": url,
                 "page_title": page_title,
                 "snapshot_name": snapshot_name,
+                "screenshot_name": screenshot_name,
                 "status_code": status_code,
             }
         )
@@ -2970,6 +2978,18 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     def _slugify_trace_label(label: str) -> str:
         normalized = re.sub(r"[^a-z0-9]+", "-", label.strip().lower())
         return normalized.strip("-") or "step"
+
+    async def _write_trace_screenshot(self, trace_dir: Path, trace_index: int, phase: str, page) -> str:
+        """Capture a full-page screenshot for the current trace step. Returns the filename or '' on failure."""
+        safe_phase = re.sub(r"[^a-z0-9_-]", "-", phase.lower())[:32].strip("-")
+        filename = f"{trace_index:03d}-{safe_phase}-screenshot.png"
+        screenshot_path = trace_dir / filename
+        try:
+            trace_dir.mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+            return filename
+        except Exception:
+            return ""
 
     def _write_trace_snapshot(self, trace_dir: Path, trace_index: int, label: str, html: str) -> str:
         trace_dir.mkdir(parents=True, exist_ok=True)

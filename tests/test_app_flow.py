@@ -48,6 +48,7 @@ class FakeAutomationClient:
         session_checkpoint=None,
         prepare_sms_relay=None,
         wait_for_sms_code=None,
+        debug_screenshots=True,
     ):
         del session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
@@ -93,6 +94,7 @@ class FakeCheckpointAutomationClient:
         session_checkpoint=None,
         prepare_sms_relay=None,
         wait_for_sms_code=None,
+        debug_screenshots=True,
     ):
         del credentials, request_sms_code, config, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
@@ -153,6 +155,7 @@ class FakeMfaSelectionAutomationClient:
         session_checkpoint=None,
         prepare_sms_relay=None,
         wait_for_sms_code=None,
+        debug_screenshots=True,
     ):
         del credentials, request_sms_code, config, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         if report_progress is not None:
@@ -231,6 +234,7 @@ class FakeResumeAutomationClient:
         session_checkpoint=None,
         prepare_sms_relay=None,
         wait_for_sms_code=None,
+        debug_screenshots=True,
     ):
         del credentials, request_sms_code, config, report_progress
         assert session_checkpoint is not None
@@ -287,6 +291,7 @@ class CountingAutomationClient:
         session_checkpoint=None,
         prepare_sms_relay=None,
         wait_for_sms_code=None,
+        debug_screenshots=True,
     ):
         del request_sms_code, config, report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
         self.call_count += 1

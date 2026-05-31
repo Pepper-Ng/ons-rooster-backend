@@ -520,6 +520,7 @@ class BackendService:
                 "debug_notes": list(self.state.sync.debug_notes),
                 "auth_trace_run_id": self.state.sync.auth_trace_run_id,
                 "auth_trace": self.auth_trace_payload(),
+                "debug_screenshots": self.state.sync.debug_screenshots,
             },
         }
 
@@ -641,6 +642,23 @@ class BackendService:
     async def post_otp_screenshot(self) -> bytes | None:
         return await asyncio.to_thread(self.store.read_post_otp_screenshot)
 
+    async def screenshot_content(self, filename: str) -> bytes | None:
+        """Return raw PNG bytes for a debug trace screenshot by filename."""
+        if not filename or "/" in filename or ".." in filename or not filename.endswith(".png"):
+            return None
+        screenshot_path = self.config.auth_trace_dir / filename
+        if not await asyncio.to_thread(screenshot_path.exists):
+            return None
+        return await asyncio.to_thread(screenshot_path.read_bytes)
+
+    async def toggle_debug_screenshots(self) -> bool:
+        """Toggle debug screenshots on/off and persist the new value. Returns the new state."""
+        async with self._state_lock:
+            self.state.sync.debug_screenshots = not self.state.sync.debug_screenshots
+            new_value = self.state.sync.debug_screenshots
+            await self._persist_state()
+        return new_value
+
     async def roster_month_export(self, month_key: str) -> dict[str, Any] | None:
         return await asyncio.to_thread(self.store.read_roster_month_export, month_key)
 
@@ -672,6 +690,8 @@ class BackendService:
                     "has_snapshot": bool(item.get("snapshot_name")),
                     "snapshot_path": f"/status/auth-trace/{item.get('entry_id', '')}" if item.get("snapshot_name") else "",
                     "debug_snapshot_path": f"/debug/auth-trace/{item.get('entry_id', '')}" if item.get("snapshot_name") else "",
+                    "has_screenshot": bool(item.get("screenshot_name")),
+                    "screenshot_path": f"/status/screenshot/{item.get('screenshot_name', '')}" if item.get("screenshot_name") else "",
                 }
             )
         return payload
@@ -728,6 +748,7 @@ class BackendService:
                     session_checkpoint=session_checkpoint,
                     prepare_sms_relay=self._prepare_sms_relay,
                     wait_for_sms_code=self._wait_for_sms_code,
+                    debug_screenshots=self.state.sync.debug_screenshots,
                 )
                 await self._finalize_success(result)
             except Exception as exc:
@@ -743,6 +764,7 @@ class BackendService:
             "url": str(event.get("url", "")).strip(),
             "page_title": str(event.get("page_title", "")).strip(),
             "snapshot_name": str(event.get("snapshot_name", "")).strip(),
+            "screenshot_name": str(event.get("screenshot_name", "")).strip(),
             "status_code": event.get("status_code"),
         }
 
