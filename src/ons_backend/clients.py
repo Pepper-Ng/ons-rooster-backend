@@ -583,8 +583,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         def sync_progress(event: dict[str, Any]) -> None:
             if report_progress is None:
                 return
-            future = asyncio.run_coroutine_threadsafe(report_progress(event), loop)
-            future.result(timeout=max(config.login_timeout_seconds, 5))
+            asyncio.run_coroutine_threadsafe(report_progress(event), loop)
 
         return await asyncio.to_thread(
             self._authenticate_sync,
