@@ -541,6 +541,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     )
     SSO_REQUIRED_ERROR_CODE = "sso_required_error"
     SSO_PROVIDER_TITLE_MARKERS = ("microsoft", "entra", "azure", "office")
+    # Mimic a real browser so login pages don't reject the request as a bot.
+    BROWSER_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    # Dedicated timeout for the OTP-field-disappears transition after clicking Submit.
+    # This is independent of login_timeout_seconds so it never inherits an exhausted budget.
+    POST_OTP_TRANSITION_TIMEOUT = 30
     DUTCH_MONTHS = {
         "jan": 1,
         "januari": 1,
@@ -650,7 +659,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         with requests.Session() as session:
             session.headers.update(
                 {
-                    "User-Agent": "ons-rooster-backend/0.1",
+                    "User-Agent": self.BROWSER_USER_AGENT,
                     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
                 }
             )
@@ -969,7 +978,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             page = None
             try:
                 browser = await playwright.chromium.launch(headless=config.playwright_headless)
-                context = await browser.new_context(locale="nl-NL")
+                context = await browser.new_context(locale="nl-NL", user_agent=self.BROWSER_USER_AGENT)
                 page = await context.new_page()
                 await page.goto(provider_url, wait_until="domcontentloaded")
                 debug_notes.append(f"Opened SSO provider {provider_label} on {page.url}.")
@@ -1326,7 +1335,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             page = None
             try:
                 browser = await playwright.chromium.launch(headless=config.playwright_headless)
-                context = await browser.new_context(locale="nl-NL")
+                context = await browser.new_context(locale="nl-NL", user_agent=self.BROWSER_USER_AGENT)
                 if isinstance(stored_cookies, list) and stored_cookies:
                     await context.add_cookies(self._playwright_cookies(stored_cookies))
                 page = await context.new_page()
@@ -1384,7 +1393,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             page = None
             try:
                 browser = await playwright.chromium.launch(headless=config.playwright_headless)
-                context = await browser.new_context(locale="nl-NL")
+                context = await browser.new_context(locale="nl-NL", user_agent=self.BROWSER_USER_AGENT)
                 if isinstance(stored_cookies, list) and stored_cookies:
                     await context.add_cookies(self._playwright_cookies(stored_cookies))
                 page = await context.new_page()
@@ -1457,55 +1466,101 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         prepare_sms_relay: SmsRelayPrimer | None,
         wait_for_sms_code: SmsCodeAwaiter | None,
     ) -> AuthenticationResult:
-        if request_sms_code is None:
-            raise RuntimeError("De backend mist de callback om de SMS-code op te vragen.")
+        if prepare_sms_relay is not None and wait_for_sms_code is not None:
+            # Two-phase path: arm the Android relay (FCM push) first, then trigger the SMS.
+            # This guarantees Android is listening before the SMS arrives.
+            challenge_id = await prepare_sms_relay()
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Arm SMS relay",
+                message="Android SMS relay armed via FCM; triggering Microsoft SMS now.",
+                phase="sms_relay_armed",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            trace_index += 1
 
-        # Start one relay task before requesting the SMS so Android is armed first and
-        # the same challenge lifecycle is used for both arming and receiving.
-        sms_relay_task = asyncio.create_task(request_sms_code())
-        await asyncio.sleep(0)
-        self._record_event(
-            report_progress,
-            trace_index=trace_index,
-            label="Arm SMS relay",
-            message="Android SMS relay armed.",
-            phase="sms_relay_armed",
-            url=page.url,
-            page_title=await page.title(),
-        )
-        trace_index += 1
+            await self._click_microsoft_sms_proof(
+                page,
+                proof_selection=proof_selection,
+                timeout_seconds=config.login_timeout_seconds,
+            )
+            debug_notes.append("Triggered Microsoft SMS after arming the Android relay.")
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Request SMS code",
+                message="Microsoft SMS verification requested.",
+                phase="sms_requested",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            trace_index += 1
 
-        await self._click_microsoft_sms_proof(
-            page,
-            proof_selection=proof_selection,
-            timeout_seconds=config.login_timeout_seconds,
-        )
-        debug_notes.append("Requested the Microsoft SMS verification code after arming the Android relay.")
-        self._record_event(
-            report_progress,
-            trace_index=trace_index,
-            label="Request SMS code",
-            message="Microsoft SMS verification requested.",
-            phase="sms_requested",
-            url=page.url,
-            page_title=await page.title(),
-        )
-        trace_index += 1
+            await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
+            trace_index = await self._record_playwright_page_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="OTP entry page",
+                message="OTP input page opened; waiting for Android code.",
+                phase="otp_page_opened",
+                page=page,
+            )
 
-        await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
-        trace_index = await self._record_playwright_page_step(
-            report_progress,
-            config=config,
-            snapshot_path=snapshot_path,
-            trace_index=trace_index,
-            label="OTP entry page",
-            message="OTP input page opened; waiting for Android code.",
-            phase="otp_page_opened",
-            page=page,
-        )
+            sms_code = await wait_for_sms_code(challenge_id)
+            debug_notes.append("Received the SMS OTP from the Android relay (two-phase).")
+        else:
+            # Fallback: combined path — arm and wait in one coroutine, sleep to allow arming
+            # before the SMS is triggered.
+            if request_sms_code is None:
+                raise RuntimeError("De backend mist de callback om de SMS-code op te vragen.")
+            sms_relay_task = asyncio.create_task(request_sms_code())
+            await asyncio.sleep(2)
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Arm SMS relay",
+                message="Android SMS relay armed (combined path); triggering Microsoft SMS now.",
+                phase="sms_relay_armed",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            trace_index += 1
 
-        sms_code = await sms_relay_task
-        debug_notes.append("Received the SMS OTP from the Android relay.")
+            await self._click_microsoft_sms_proof(
+                page,
+                proof_selection=proof_selection,
+                timeout_seconds=config.login_timeout_seconds,
+            )
+            debug_notes.append("Triggered Microsoft SMS (combined relay path).")
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Request SMS code",
+                message="Microsoft SMS verification requested.",
+                phase="sms_requested",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            trace_index += 1
+
+            await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
+            trace_index = await self._record_playwright_page_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="OTP entry page",
+                message="OTP input page opened; waiting for Android code.",
+                phase="otp_page_opened",
+                page=page,
+            )
+
+            sms_code = await sms_relay_task
+            debug_notes.append("Received the SMS OTP from the Android relay (combined path).")
 
         await self._fill_first_visible(
             page,
@@ -1528,8 +1583,20 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             self.MICROSOFT_OTP_SUBMIT_SELECTORS,
             config.login_timeout_seconds,
         )
+        # Capture a snapshot immediately after clicking Submit so we can see any
+        # Microsoft error messages even if the post-OTP wait later times out.
+        trace_index = await self._record_playwright_page_step(
+            report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
+            trace_index=trace_index,
+            label="OTP submit clicked",
+            message=f"OTP submit button clicked; page is now {page.url}.",
+            phase="otp_submit_clicked",
+            page=page,
+        )
 
-        await self._wait_for_post_otp_page(page, config.login_timeout_seconds)
+        await self._wait_for_post_otp_page(page, self.POST_OTP_TRANSITION_TIMEOUT)
         html = await page.content()
         page_title = await page.title()
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
@@ -1610,8 +1677,13 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
             html = await page.content()
-            if await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
-                return
+            for selector in self.MICROSOFT_OTP_SELECTORS:
+                locator = page.locator(selector).first
+                try:
+                    if await locator.is_visible(timeout=250) and await locator.is_enabled(timeout=250):
+                        return
+                except Exception:
+                    continue
             login_error = self._extract_login_error(self._synthetic_response(200), html)
             if login_error:
                 raise RuntimeError(login_error)
@@ -1629,6 +1701,9 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             html = await page.content()
             if not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
                 return
+            login_error = self._extract_login_error(self._synthetic_response(200), html)
+            if login_error:
+                raise RuntimeError(login_error)
             await page.wait_for_timeout(250)
 
         html = await page.content()
