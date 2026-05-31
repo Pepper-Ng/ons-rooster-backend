@@ -1828,36 +1828,38 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     async def _wait_for_post_otp_page(self, page, timeout_seconds: int) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
+            # Fast exit: URL already left the Microsoft SSO host → success.
+            # Check this before fetching page content to avoid a pointless DOM read.
+            if not self._looks_like_external_sso_host(page.url):
+                return
+
             html = await page.content()
+
+            # Definitive rejection: Microsoft rendered an OTP-specific error message.
             otp_error = self._extract_microsoft_otp_error(html)
             if otp_error:
                 raise RuntimeError(otp_error)
 
-            # Success: URL has left the Microsoft SSO host.
-            if not self._looks_like_external_sso_host(page.url):
-                return
-
-            # Proactively dismiss the "Stay signed in?" (KMSI) prompt that Microsoft
-            # may show after accepting MFA.  It has no OTP field and stays on
-            # microsoftonline.com, so it must be handled here instead of timing out.
-            for selector in self.MICROSOFT_DECLINE_BUTTON_SELECTORS:
-                locator = page.locator(selector).first
-                try:
-                    if await locator.is_visible(timeout=250):
-                        await locator.click()
-                        await page.wait_for_timeout(500)
-                        break
-                except Exception:
-                    continue
-
-            # If the OTP field is still visible, check for an explicit error
-            # (wrong / expired code).  If the field is gone but we are still on
-            # the MS host, that is a normal transient state (JS XHR in flight or a
-            # new prompt loading) — just keep waiting.
             if await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
+                # OTP field still present — check for a generic login error that
+                # may have replaced the form (e.g. wrong / expired code).
                 login_error = self._extract_login_error(self._synthetic_response(200), html)
                 if login_error:
                     raise RuntimeError(login_error)
+            else:
+                # OTP field gone but URL still on microsoftonline.com — normal
+                # transient state: JS removed the field while the XHR response was
+                # being processed, before any navigation fires.  It also covers the
+                # "Stay signed in?" (KMSI) prompt.  Dismiss it if present so the
+                # redirect can proceed; otherwise just keep waiting.
+                for selector in self.MICROSOFT_DECLINE_BUTTON_SELECTORS:
+                    locator = page.locator(selector).first
+                    try:
+                        if await locator.is_visible(timeout=250):
+                            await locator.click(timeout=1_500)
+                            break
+                    except Exception:
+                        continue
 
             await page.wait_for_timeout(250)
 
