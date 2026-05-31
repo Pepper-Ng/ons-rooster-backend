@@ -382,7 +382,7 @@ async def handle_status_auth_trace(request: web.Request) -> web.Response:
             "<style>body { font-family: Arial, sans-serif; margin: 2rem; background: #f6f8fb; color: #1f2937; } "
             "pre { white-space: pre-wrap; word-break: break-word; background: #0f172a; color: white; padding: 1rem; border-radius: 10px; }</style>"
             "</head><body><p><a href='/status'>Terug naar operatorstatus</a></p>"
-            f"<pre>{html.escape(snapshot[:12000])}</pre></body></html>"
+            f"<pre>{html.escape(snapshot)}</pre></body></html>"
         ),
         content_type="text/html",
     )
@@ -1207,7 +1207,18 @@ def _render_status_page(
         .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
         .console-line:last-child {{ border-bottom: 0; }}
         .console-meta {{ color: #93c5fd; margin-right: 0.5rem; }}
+        .trace-table {{ width: 100%; max-width: 100%; table-layout: fixed; word-break: break-word; }}
+        .trace-table th:nth-child(1) {{ width: 7rem; }}
+        .trace-table th:nth-child(2) {{ width: 9rem; }}
+        .trace-table th:nth-child(3) {{ width: 14rem; }}
+        .trace-table th:nth-child(4) {{ width: auto; overflow: hidden; }}
+        .trace-table th:nth-child(5), .trace-table th:nth-child(6) {{ width: 6rem; }}
+        .trace-table td {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0.3rem 0.4rem; vertical-align: top; }}
+        .trace-table td.nowrap-off {{ white-space: normal; }}
         .trace-table a {{ color: #0f766e; }}
+        .trace-tijd {{ white-space: normal; }}
+        .trace-tijd .t-date {{ display: block; font-size: 0.85rem; }}
+        .trace-tijd .t-time {{ display: block; font-size: 0.85rem; color: #64748b; }}
         @media (max-width: 900px) {{ .portal-manager {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
@@ -1368,6 +1379,27 @@ def _render_status_page(
             return parsed.toLocaleString('nl-NL');
         }}
 
+        function formatTimestampHtml(value) {{
+            if (!value) return '<span>-</span>';
+            const parsed = new Date(value);
+            if (Number.isNaN(parsed.getTime())) return escapeHtml(value);
+            const datePart = parsed.toLocaleDateString('nl-NL', {{day:'2-digit',month:'2-digit',year:'numeric'}});
+            const timePart = parsed.toLocaleTimeString('nl-NL', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
+            return `<span class="trace-tijd"><span class="t-date">${{escapeHtml(datePart)}}</span><span class="t-time">${{escapeHtml(timePart)}}</span></span>`;
+        }}
+
+        function shortenUrl(url, maxLen) {{
+            if (!url) return '-';
+            if (url.length <= maxLen) return url;
+            try {{
+                const u = new URL(url);
+                const short = u.origin + u.pathname;
+                return short.length < url.length ? short : url.slice(0, maxLen) + '\u2026';
+            }} catch (_) {{
+                return url.slice(0, maxLen) + '\u2026';
+            }}
+        }}
+
         function setFlash(kind, text) {{
             if (!text) return;
             flashHost.innerHTML = `<p class="flash ${{kind === 'error' ? 'flash-error' : 'flash-ok'}}">${{escapeHtml(text)}}</p>`;
@@ -1509,10 +1541,10 @@ def _render_status_page(
 
             authTraceBody.innerHTML = entries.map((entry) => `
                 <tr>
-                    <td>${{escapeHtml(formatTimestamp(entry.created_at))}}</td>
+                    <td class="nowrap-off">${{formatTimestampHtml(entry.created_at)}}</td>
                     <td>${{escapeHtml(entry.phase || '-')}}</td>
                     <td>${{escapeHtml(entry.label || '-')}}</td>
-                    <td>${{entry.url ? `<a href="${{escapeHtml(entry.url)}}" target="_blank" rel="noreferrer">${{escapeHtml(entry.url)}}</a>` : '-'}}</td>
+                    <td title="${{escapeHtml(entry.url || '')}}">${{entry.url ? `<a href="${{escapeHtml(entry.url)}}" target="_blank" rel="noreferrer">${{escapeHtml(shortenUrl(entry.url, 80))}}</a>` : '-'}}</td>
                     <td>${{entry.snapshot_path ? `<a href="${{escapeHtml(entry.snapshot_path)}}" target="_blank" rel="noreferrer">Bekijk HTML</a>` : '-'}}</td>
                     <td>${{entry.screenshot_path ? `<a href="${{encodeURI(entry.screenshot_path)}}" target="_blank" rel="noreferrer">Screenshot</a>` : '-'}}</td>
                 </tr>`).join('');

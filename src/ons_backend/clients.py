@@ -1975,6 +1975,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         f"Rooster navigation for month {month_key} failed from {page.url}. "
                         f"Laatste pagina: {snippet or 'geen snapshot beschikbaar'}"
                     ) from exc
+            # Wait for the SPA-rendered roster grid before capturing HTML.
+            try:
+                await page.wait_for_selector("table.month-roster#grid-table", timeout=30_000)
+            except Exception:
+                debug_notes.append(f"grid-table selector not found within 30s for {month_key}; capturing page.content() anyway.")
             html = await page.content()
             if self._looks_like_external_sso_host(page.url) or self._response_still_looks_like_login(
                 page.url,
@@ -2204,12 +2209,12 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         month_items: list[dict[str, Any]] = []
         planned_entries: list[RosterItem] = []
 
-        for day_cell in soup.select("td.week-content"):
+        for day_cell in soup.find_all("td", class_=re.compile(r"^week-content")):
             for slot in day_cell.select("div.roster_slot"):
                 classes = list(slot.get("class", []))
                 title = " ".join(fragment.strip() for fragment in slot.select_one("h3.title").stripped_strings) if slot.select_one("h3.title") else ""
-                start_text = slot.select_one("span.timepair .start")
-                end_text = slot.select_one("span.timepair .stop")
+                start_text = slot.select_one(".timepair .start")
+                end_text = slot.select_one(".timepair .stop")
                 start = " ".join(start_text.stripped_strings) if start_text else ""
                 end = " ".join(end_text.stripped_strings) if end_text else ""
                 date_value = self._extract_slot_date(slot, month_start)
@@ -2271,7 +2276,13 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         )
 
     def _extract_slot_date(self, slot, month_start: date) -> str:
-        header = slot.select_one("span.slot_header")
+        # Real HTML: div.slot_header is a sibling of div.slot_content inside the parent td.
+        # Fallback: span/div.slot_header inside the slot itself (used in some test fixtures).
+        parent_td = slot.find_parent("td")
+        header = parent_td.select_one("div.slot_header, span.slot_header") if parent_td else None
+        if header is None:
+            # Inner fallback: slot_header directly inside the slot
+            header = slot.select_one("div.slot_header, span.slot_header")
         if header is None:
             return ""
         header_text = " ".join(fragment.strip() for fragment in header.stripped_strings).lower()
