@@ -1492,22 +1492,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             )
             trace_index += 1
 
-            await self._click_microsoft_sms_proof(
+            trace_index = await self._trigger_microsoft_sms_or_resume_otp(
                 page,
                 proof_selection=proof_selection,
                 timeout_seconds=config.login_timeout_seconds,
-            )
-            debug_notes.append("Triggered Microsoft SMS after arming the Android relay.")
-            self._record_event(
-                report_progress,
+                report_progress=report_progress,
                 trace_index=trace_index,
-                label="Request SMS code",
-                message="Microsoft SMS verification requested.",
-                phase="sms_requested",
-                url=page.url,
-                page_title=await page.title(),
+                debug_notes=debug_notes,
+                relay_mode_label="two-phase",
             )
-            trace_index += 1
 
             await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
             trace_index = await self._record_playwright_page_step(
@@ -1541,22 +1534,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             )
             trace_index += 1
 
-            await self._click_microsoft_sms_proof(
+            trace_index = await self._trigger_microsoft_sms_or_resume_otp(
                 page,
                 proof_selection=proof_selection,
                 timeout_seconds=config.login_timeout_seconds,
-            )
-            debug_notes.append("Triggered Microsoft SMS (combined relay path).")
-            self._record_event(
-                report_progress,
+                report_progress=report_progress,
                 trace_index=trace_index,
-                label="Request SMS code",
-                message="Microsoft SMS verification requested.",
-                phase="sms_requested",
-                url=page.url,
-                page_title=await page.title(),
+                debug_notes=debug_notes,
+                relay_mode_label="combined",
             )
-            trace_index += 1
 
             await self._wait_for_microsoft_otp_page(page, config.login_timeout_seconds)
             trace_index = await self._record_playwright_page_step(
@@ -1645,6 +1631,69 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             login_url=login_url,
             post_otp_screenshot_path=screenshot_path,
         )
+
+    async def _trigger_microsoft_sms_or_resume_otp(
+        self,
+        page,
+        *,
+        proof_selection: dict[str, Any],
+        timeout_seconds: int,
+        report_progress: Callable[[dict[str, Any]], None] | None,
+        trace_index: int,
+        debug_notes: list[str],
+        relay_mode_label: str,
+    ) -> int:
+        if await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
+            debug_notes.append(
+                f"Microsoft already showed the OTP entry page before the {relay_mode_label} relay path clicked the SMS proof."
+            )
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Reuse Microsoft OTP stage",
+                message="Microsoft already opened the OTP page; no SMS-proof click was needed.",
+                phase="sms_requested",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            return trace_index + 1
+
+        try:
+            await self._click_microsoft_sms_proof(
+                page,
+                proof_selection=proof_selection,
+                timeout_seconds=timeout_seconds,
+            )
+            debug_notes.append(f"Triggered Microsoft SMS ({relay_mode_label} relay path).")
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Request SMS code",
+                message="Microsoft SMS verification requested.",
+                phase="sms_requested",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            return trace_index + 1
+        except RuntimeError as exc:
+            try:
+                await self._wait_for_microsoft_otp_page(page, min(timeout_seconds, 5))
+            except RuntimeError:
+                raise exc
+
+            debug_notes.append(
+                "Microsoft skipped the proof-selection click and opened the OTP page directly."
+            )
+            self._record_event(
+                report_progress,
+                trace_index=trace_index,
+                label="Reuse Microsoft OTP stage",
+                message="Microsoft moved directly to the OTP page; no SMS-proof click was needed.",
+                phase="sms_requested",
+                url=page.url,
+                page_title=await page.title(),
+            )
+            return trace_index + 1
 
     @staticmethod
     def _playwright_cookies(cookies: list[dict[str, Any]]) -> list[dict[str, Any]]:

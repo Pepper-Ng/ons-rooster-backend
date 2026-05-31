@@ -878,6 +878,58 @@ def test_http_login_automation_client_extracts_microsoft_proof_selection():
 
 
 @pytest.mark.asyncio
+async def test_http_login_automation_client_reuses_existing_microsoft_otp_stage():
+        automation_client = HttpLoginAutomationClient()
+
+        class FakePage:
+            url = "https://login.microsoftonline.com/common/SAS/ProcessAuth"
+
+            async def title(self):
+                return "Aanmelden bij uw account"
+
+        recorded_events: list[dict[str, str]] = []
+        debug_notes: list[str] = []
+
+        def fake_report_progress(event: dict[str, str]) -> None:
+            recorded_events.append(event)
+
+        async def fake_has_visible_selector(page, selectors):
+            del page, selectors
+            return False
+
+        async def fake_click_microsoft_sms_proof(page, *, proof_selection, timeout_seconds):
+            del page, proof_selection, timeout_seconds
+            raise RuntimeError("No matching selector was found for proof selection.")
+
+        async def fake_wait_for_microsoft_otp_page(page, timeout_seconds):
+            del page, timeout_seconds
+            return None
+
+        automation_client._has_visible_selector = fake_has_visible_selector  # type: ignore[method-assign]
+        automation_client._click_microsoft_sms_proof = fake_click_microsoft_sms_proof  # type: ignore[method-assign]
+        automation_client._wait_for_microsoft_otp_page = fake_wait_for_microsoft_otp_page  # type: ignore[method-assign]
+
+        trace_index = await automation_client._trigger_microsoft_sms_or_resume_otp(
+            FakePage(),
+            proof_selection={"sms_proof_value": "OneWaySMS"},
+            timeout_seconds=30,
+            report_progress=fake_report_progress,
+            trace_index=7,
+            debug_notes=debug_notes,
+            relay_mode_label="two-phase",
+        )
+
+        assert trace_index == 8
+        assert debug_notes == ["Microsoft skipped the proof-selection click and opened the OTP page directly."]
+        assert len(recorded_events) == 1
+        assert recorded_events[0]["label"] == "Reuse Microsoft OTP stage"
+        assert recorded_events[0]["message"] == "Microsoft moved directly to the OTP page; no SMS-proof click was needed."
+        assert recorded_events[0]["phase"] == "sms_requested"
+        assert recorded_events[0]["page_title"] == "Aanmelden bij uw account"
+        assert recorded_events[0]["url"] == "https://login.microsoftonline.com/common/SAS/ProcessAuth"
+
+
+@pytest.mark.asyncio
 async def test_status_page_renders_auth_console(aiohttp_client, tmp_path):
     config = build_config(tmp_path)
     push_client = FakePushClient()
