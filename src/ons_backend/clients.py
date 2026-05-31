@@ -1569,16 +1569,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             sms_code,
             config.login_timeout_seconds,
         )
-        self._record_event(
+        trace_index = await self._record_playwright_page_step(
             report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
             trace_index=trace_index,
             label="Submit OTP code",
             message="OTP code entered.",
             phase="otp_submitted",
-            url=page.url,
-            page_title=await page.title(),
+            page=page,
         )
-        trace_index += 1
         await self._click_first_visible(
             page,
             self.MICROSOFT_OTP_SUBMIT_SELECTORS,
@@ -1901,7 +1901,23 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 continue
 
             await self._dismiss_dashboard_confirmation_modal(page, debug_notes=debug_notes)
-            await page.goto(month_url, wait_until="domcontentloaded")
+            try:
+                await page.goto(month_url, wait_until="domcontentloaded")
+            except Exception:
+                # Some post-login pages keep a blocking confirmation/modal alive; dismiss and retry once.
+                await self._dismiss_dashboard_confirmation_modal(page, debug_notes=debug_notes)
+                try:
+                    await page.goto(month_url, wait_until="domcontentloaded")
+                except Exception as exc:
+                    snippet = ""
+                    try:
+                        snippet = self._text_snippet(await page.content())
+                    except Exception:
+                        snippet = ""
+                    raise RuntimeError(
+                        f"Rooster navigation for month {month_key} failed from {page.url}. "
+                        f"Laatste pagina: {snippet or 'geen snapshot beschikbaar'}"
+                    ) from exc
             html = await page.content()
             if self._looks_like_external_sso_host(page.url) or self._response_still_looks_like_login(
                 page.url,
@@ -1966,29 +1982,54 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             return
 
     async def _dismiss_dashboard_confirmation_modal(self, page, *, debug_notes: list[str]) -> None:
-        try:
-            if not await page.locator('text=Weet je het zeker?').first.is_visible(timeout=400):
-                return
-        except Exception:
+        modal_markers = (
+            'text=Weet je het zeker?',
+            'text=Verzenden mislukt',
+            'text=Are you sure?',
+        )
+        marker_visible = False
+        for marker in modal_markers:
+            try:
+                if await page.locator(marker).first.is_visible(timeout=300):
+                    marker_visible = True
+                    break
+            except Exception:
+                continue
+        if not marker_visible:
             return
 
         for selector in (
             'button:has-text("Ja")',
             '[role="button"]:has-text("Ja")',
+            'a:has-text("Ja")',
+            'text=Ja',
             'button:has-text("Yes")',
             '[role="button"]:has-text("Yes")',
+            'a:has-text("Yes")',
+            'text=Yes',
             'button:has-text("Nee")',
             '[role="button"]:has-text("Nee")',
+            'a:has-text("Nee")',
+            'text=Nee',
+            'button:has-text("Sluiten")',
+            '[role="button"]:has-text("Sluiten")',
         ):
             locator = page.locator(selector).first
             try:
                 if await locator.is_visible(timeout=250):
-                    await locator.click(timeout=1_500)
+                    await locator.click(timeout=1_500, force=True)
                     await page.wait_for_timeout(250)
                     debug_notes.append("Dismissed the HasMoves confirmation modal before roster navigation.")
                     return
             except Exception:
                 continue
+
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(200)
+            debug_notes.append("Attempted to dismiss a blocking dashboard modal with Escape.")
+        except Exception:
+            return
 
     def _resolve_month_targets(
         self,
