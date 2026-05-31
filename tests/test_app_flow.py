@@ -877,6 +877,71 @@ def test_http_login_automation_client_extracts_microsoft_proof_selection():
         assert challenge["hidden_fields"]["ctx"] == "ctx-token"
 
 
+def test_http_login_automation_client_extracts_meta_refresh_redirect():
+        automation_client = HttpLoginAutomationClient()
+        html = """
+<!doctype html>
+<html>
+    <head>
+        <meta http-equiv="refresh" content="0;url=https://landvanhorne.mijnio.nl?hub_ticket=abc123">
+    </head>
+    <body></body>
+</html>
+"""
+
+        redirect_url = automation_client._extract_meta_refresh_redirect(
+            "https://landvanhorne.startmetons.nl/sso",
+            html,
+        )
+
+        assert redirect_url == "https://landvanhorne.mijnio.nl?hub_ticket=abc123"
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_stabilizes_post_otp_meta_refresh():
+        automation_client = HttpLoginAutomationClient()
+        debug_notes: list[str] = []
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = "https://landvanhorne.startmetons.nl/sso"
+                self.goto_calls: list[str] = []
+                self._html = (
+                    '<html><head><meta http-equiv="refresh" '
+                    'content="0;url=https://landvanhorne.mijnio.nl?hub_ticket=abc123"></head><body></body></html>'
+                )
+                self._title = "Aanmelden bij uw account"
+
+            async def content(self):
+                return self._html
+
+            async def title(self):
+                return self._title
+
+            async def goto(self, url, wait_until="domcontentloaded"):
+                del wait_until
+                self.goto_calls.append(url)
+                self.url = url
+                self._html = "<html><head><title>Rooster</title></head><body>Welkom</body></html>"
+                self._title = "Rooster"
+
+            async def wait_for_timeout(self, timeout_ms):
+                del timeout_ms
+                return None
+
+        fake_page = FakePage()
+
+        html, page_title = await automation_client._stabilize_post_otp_page(
+            fake_page,
+            debug_notes=debug_notes,
+        )
+
+        assert fake_page.goto_calls == ["https://landvanhorne.mijnio.nl?hub_ticket=abc123"]
+        assert "Following post-OTP meta refresh to https://landvanhorne.mijnio.nl?hub_ticket=abc123." in debug_notes
+        assert "Welkom" in html
+        assert page_title == "Rooster"
+
+
 @pytest.mark.asyncio
 async def test_http_login_automation_client_reuses_existing_microsoft_otp_stage():
         automation_client = HttpLoginAutomationClient()

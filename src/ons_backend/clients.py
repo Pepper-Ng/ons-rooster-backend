@@ -1594,8 +1594,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         )
 
         await self._wait_for_post_otp_page(page, self.POST_OTP_TRANSITION_TIMEOUT)
-        html = await page.content()
-        page_title = await page.title()
+        html, page_title = await self._stabilize_post_otp_page(page, debug_notes=debug_notes)
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
         screenshot_path: str | None = None
@@ -1631,6 +1630,60 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             login_url=login_url,
             post_otp_screenshot_path=screenshot_path,
         )
+
+    async def _stabilize_post_otp_page(
+        self,
+        page,
+        *,
+        debug_notes: list[str],
+        timeout_seconds: int = 10,
+    ) -> tuple[str, str]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_error: Exception | None = None
+        while asyncio.get_running_loop().time() < deadline:
+            try:
+                html = await page.content()
+                page_title = await page.title()
+            except Exception as exc:
+                last_error = exc
+                await page.wait_for_timeout(250)
+                continue
+
+            redirect_url = self._extract_meta_refresh_redirect(page.url, html)
+            if redirect_url:
+                debug_notes.append(f"Following post-OTP meta refresh to {redirect_url}.")
+                await page.goto(redirect_url, wait_until="domcontentloaded")
+                await page.wait_for_timeout(250)
+                continue
+
+            return html, page_title
+
+        if last_error is not None:
+            raise last_error
+        return await page.content(), await page.title()
+
+    def _extract_meta_refresh_redirect(self, page_url: str, html: str) -> str:
+        soup = BeautifulSoup(html, "html.parser")
+        refresh = soup.find("meta", attrs={"http-equiv": re.compile(r"^refresh$", re.I)})
+        if refresh is None:
+            return ""
+
+        content = str(refresh.get("content", "")).strip()
+        if not content:
+            return ""
+
+        match = re.search(r"url\s*=\s*([^;]+)", content, re.I)
+        if not match:
+            return ""
+
+        target = match.group(1).strip().strip("\"'")
+        if not target:
+            return ""
+
+        resolved = urljoin(page_url, target)
+        if resolved.rstrip("/") == page_url.rstrip("/"):
+            return ""
+        return resolved
 
     async def _trigger_microsoft_sms_or_resume_otp(
         self,
