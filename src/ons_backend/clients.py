@@ -1698,9 +1698,20 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     async def _wait_for_post_otp_page(self, page, timeout_seconds: int) -> None:
         deadline = asyncio.get_running_loop().time() + timeout_seconds
         while asyncio.get_running_loop().time() < deadline:
-            html = await page.content()
             if not await self._has_visible_selector(page, self.MICROSOFT_OTP_SELECTORS):
+                # OTP field disappeared, but staying on Microsoft's SSO host still means
+                # the submit did not complete the handoff to the roster session.
+                if self._looks_like_external_sso_host(page.url):
+                    html = await page.content()
+                    login_error = self._extract_login_error(self._synthetic_response(200), html)
+                    if login_error:
+                        raise RuntimeError(login_error)
+                    raise RuntimeError(
+                        "OTP submission did not leave Microsoft's SSO host. "
+                        f"Current URL: {page.url}. Last page: {self._text_snippet(html)}"
+                    )
                 return
+            html = await page.content()
             login_error = self._extract_login_error(self._synthetic_response(200), html)
             if login_error:
                 raise RuntimeError(login_error)
@@ -1738,6 +1749,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 continue
 
             await page.goto(month_url, wait_until="domcontentloaded")
+            html = await page.content()
+            if self._looks_like_external_sso_host(page.url) or self._response_still_looks_like_login(
+                page.url,
+                html,
+                login_url,
+            ):
+                raise RuntimeError(
+                    f"Roster navigation for month {month_key} was redirected to a login page on {page.url}. "
+                    "Session was not established after OTP submit."
+                )
             trace_index = await self._record_playwright_page_step(
                 report_progress,
                 config=config,
@@ -1749,7 +1770,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 page=page,
             )
 
-            html = await page.content()
             page_title = await page.title()
             export_payload, month_items, extraction_notes, publication_stop = self._extract_month_roster_export(
                 html,
