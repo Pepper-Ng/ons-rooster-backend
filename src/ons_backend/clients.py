@@ -1250,19 +1250,35 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 html = ""
                 page_title = ""
                 current_url = provider_url
+                screenshot_name = ""
                 if page is not None:
                     html = await page.content()
                     page_title = await page.title()
                     current_url = page.url
                     await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    if getattr(self, "_debug_screenshots", False):
+                        screenshot_name = await self._write_trace_screenshot(
+                            config.auth_trace_dir,
+                            trace_index,
+                            "automation-error",
+                            page,
+                        )
+                error_phase = "sso_error"
+                error_label = "SSO automation error"
+                error_message = "Microsoft SSO flow failed."
+                if current_url and not self._looks_like_external_sso_host(current_url):
+                    error_phase = "post_login_error"
+                    error_label = "Post-login automation error"
+                    error_message = "Login succeeded, but post-login roster automation failed."
                 self._record_event(
                     report_progress,
                     trace_index=trace_index,
-                    label="SSO automation error",
-                    message="Microsoft SSO flow failed.",
-                    phase="sso_error",
+                    label=error_label,
+                    message=f"{error_message} Root cause: {exc}",
+                    phase=error_phase,
                     url=current_url,
                     page_title=page_title,
+                    screenshot_name=screenshot_name,
                     snapshot_name=(
                         self._write_trace_snapshot(
                             config.auth_trace_dir,
@@ -1607,6 +1623,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             except Exception as _se:
                 debug_notes.append(f"Could not save post-OTP error screenshot: {_se}")
             raise
+        trace_index = await self._record_playwright_page_step(
+            report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
+            trace_index=trace_index,
+            label="Post-OTP redirect detected",
+            message=f"Microsoft flow left OTP stage; current page is {page.url}.",
+            phase="post_otp_redirected",
+            page=page,
+        )
         html, page_title = await self._stabilize_post_otp_page(page, debug_notes=debug_notes)
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
@@ -1618,27 +1644,22 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         except Exception as exc:
             screenshot_path = None
             debug_notes.append(f"Skipped post-OTP screenshot because Playwright could not capture it: {exc}")
-        self._record_event(
+        trace_index = await self._record_playwright_page_step(
             report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
             trace_index=trace_index,
             label="Post-OTP page detected",
             message=f"First page after OTP submit reached: {page.url}.",
             phase="post_otp_page_detected",
-            url=page.url,
-            page_title=page_title,
-            snapshot_name=self._write_trace_snapshot(
-                config.auth_trace_dir,
-                trace_index,
-                "post-otp-page",
-                html,
-            ),
+            page=page,
         )
         return await self._collect_roster_months_after_otp(
             page=page,
             snapshot_path=snapshot_path,
             config=config,
             report_progress=report_progress,
-            trace_index=trace_index + 1,
+            trace_index=trace_index,
             debug_notes=debug_notes,
             login_url=login_url,
             post_otp_screenshot_path=screenshot_path,
@@ -1746,7 +1767,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 await self._wait_for_microsoft_otp_page(page, min(timeout_seconds, 5))
             except RuntimeError:
                 raise exc
-
             debug_notes.append(
                 "Microsoft skipped the proof-selection click and opened the OTP page directly."
             )
