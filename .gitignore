@@ -5,6 +5,7 @@ build/
 dist/
 *.egg-info/
 data/
+!tests/data/
 firebase_key.json
 *firebase*.json
 secrets/

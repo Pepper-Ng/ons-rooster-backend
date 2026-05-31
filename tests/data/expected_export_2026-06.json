@@ -1,0 +1,561 @@
+{
+  "format": "ons-rooster-month-export",
+  "version": 1,
+  "month": "2026-06",
+  "source_url": "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
+  "page_title": "Rooster",
+  "notice": "",
+  "items": [
+    {
+      "date": "2026-06-01",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-02",
+      "start": "07:00",
+      "end": "15:30",
+      "title": "O1.5-SOM-2-MA",
+      "description": "07:00 15:30 (30M PAUZE) O1.5-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-03",
+      "start": "09:00",
+      "end": "17:00",
+      "title": "Vaste vrije dag",
+      "description": "09:00 17:00 Vaste vrije dag",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-04",
+      "start": "07:00",
+      "end": "15:30",
+      "title": "O1.5-SOM-2-MA",
+      "description": "07:00 15:30 (30M PAUZE) O1.5-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-05",
+      "start": "07:30",
+      "end": "15:00",
+      "title": "ZA-O1-SOM-MA",
+      "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-06",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    },
+    {
+      "date": "2026-06-07",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    },
+    {
+      "date": "2026-06-08",
+      "start": "07:00",
+      "end": "12:00",
+      "title": "O4-SOM-2-MA",
+      "description": "07:00 12:00 O4-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-09",
+      "start": "07:00",
+      "end": "15:30",
+      "title": "O1.5-SOM-2-MA",
+      "description": "07:00 15:30 (30M PAUZE) O1.5-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-10",
+      "start": "09:00",
+      "end": "17:00",
+      "title": "Vaste vrije dag",
+      "description": "09:00 17:00 Vaste vrije dag",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-11",
+      "start": "14:00",
+      "end": "15:30",
+      "title": "Indirecte uren",
+      "description": "14:00 15:30 Indirecte uren",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "halfheight",
+        "month-roster",
+        "unavailability",
+        "afternoon",
+        "indirect"
+      ]
+    },
+    {
+      "date": "2026-06-11",
+      "start": "15:30",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:30 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "halfheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-12",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-13",
+      "start": "11:30",
+      "end": "19:30",
+      "title": "ZA-M1-SOM-MA",
+      "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-15",
+      "start": "07:30",
+      "end": "15:00",
+      "title": "ZA-O1-SOM-MA",
+      "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-16",
+      "start": "07:00",
+      "end": "15:30",
+      "title": "O1.5-SOM-2-MA",
+      "description": "07:00 15:30 (30M PAUZE) O1.5-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-17",
+      "start": "09:00",
+      "end": "17:00",
+      "title": "Vaste vrije dag",
+      "description": "09:00 17:00 Vaste vrije dag",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-18",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-19",
+      "start": "07:30",
+      "end": "15:00",
+      "title": "ZA-O1-SOM-MA",
+      "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-20",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    },
+    {
+      "date": "2026-06-21",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    },
+    {
+      "date": "2026-06-22",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-23",
+      "start": "11:30",
+      "end": "19:30",
+      "title": "ZA-M1-SOM-MA",
+      "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-24",
+      "start": "09:00",
+      "end": "17:00",
+      "title": "Vaste vrije dag",
+      "description": "09:00 17:00 Vaste vrije dag",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-25",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-27",
+      "start": "07:30",
+      "end": "15:00",
+      "title": "ZA-O1-SOM-MA",
+      "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-28",
+      "start": "07:00",
+      "end": "15:30",
+      "title": "O1.5-SOM-2-MA",
+      "description": "07:00 15:30 (30M PAUZE) O1.5-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-06-29",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-06-30",
+      "start": "15:00",
+      "end": "23:30",
+      "title": "A1-SOM-2-MA",
+      "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "afternoon"
+      ]
+    },
+    {
+      "date": "2026-07-01",
+      "start": "09:00",
+      "end": "17:00",
+      "title": "Vaste vrije dag",
+      "description": "09:00 17:00 Vaste vrije dag",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-07-02",
+      "start": "11:30",
+      "end": "19:30",
+      "title": "ZA-M1-SOM-MA",
+      "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-07-03",
+      "start": "07:30",
+      "end": "15:00",
+      "title": "ZA-O1-SOM-MA",
+      "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+      "category": "planned_hours",
+      "is_planned_hours": true,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "shiftassignment",
+        "morning"
+      ]
+    },
+    {
+      "date": "2026-07-04",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    },
+    {
+      "date": "2026-07-05",
+      "start": "07:00",
+      "end": "23:00",
+      "title": "Niet beschikbaar",
+      "description": "07:00 23:00 Niet beschikbaar",
+      "category": "availability",
+      "is_planned_hours": false,
+      "classes": [
+        "roster_slot",
+        "fullheight",
+        "month-roster",
+        "unavailability",
+        "morning",
+        "time-off"
+      ]
+    }
+  ]
+}

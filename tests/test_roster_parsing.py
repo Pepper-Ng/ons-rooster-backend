@@ -1,6 +1,22 @@
-"""Unit tests for roster HTML parsing using a captured full-page example (roster.html)."""
+"""Snapshot test for roster HTML parsing.
+
+The test data lives in tests/data/:
+  roster.html                   — captured full-page HTML for June 2026
+  expected_export_2026-06.json  — golden output produced by _extract_month_roster_export()
+
+The test parses roster.html, strips the volatile ``generated_at`` timestamp from
+the result, and compares it field-for-field against the golden file.  Any change
+to the parsing logic that alters the output will cause this test to fail.
+
+To regenerate the golden file after an intentional parsing change, run:
+
+    python scripts/regenerate_golden.py  (or delete the JSON and re-run the
+    generate block below with UPDATE_GOLDEN=1 env var)
+"""
 from __future__ import annotations
 
+import json
+import os
 from datetime import date
 from pathlib import Path
 
@@ -8,19 +24,13 @@ import pytest
 
 from ons_backend.clients import HttpLoginAutomationClient
 
+DATA_DIR = Path(__file__).parent / "data"
+ROSTER_HTML = DATA_DIR / "roster.html"
+GOLDEN_JSON = DATA_DIR / "expected_export_2026-06.json"
 
-# Path to the reference roster HTML stored in the workspace root.
-ROSTER_HTML_PATH = Path(__file__).parent.parent.parent.parent / "roster.html"
-
-# Fallback: also try the workspace root relative to this file two levels up.
-_ALT_PATH = Path(__file__).parent.parent.parent / "roster.html"
-
-
-def _load_roster_html() -> str:
-    for candidate in (ROSTER_HTML_PATH, _ALT_PATH):
-        if candidate.exists():
-            return candidate.read_text(encoding="utf-8")
-    pytest.skip(f"roster.html not found (tried {ROSTER_HTML_PATH} and {_ALT_PATH})")
+MONTH_START = date(2026, 6, 1)
+SOURCE_URL = "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month"
+PAGE_TITLE = "Rooster"
 
 
 @pytest.fixture(scope="module")
@@ -29,88 +39,60 @@ def client() -> HttpLoginAutomationClient:
 
 
 @pytest.fixture(scope="module")
-def roster_html() -> str:
-    return _load_roster_html()
+def parsed_export(client: HttpLoginAutomationClient) -> dict:
+    """Parse roster.html and return the export dict (without volatile generated_at)."""
+    if not ROSTER_HTML.exists():
+        pytest.skip(f"Test fixture not found: {ROSTER_HTML}")
+    html = ROSTER_HTML.read_text(encoding="utf-8")
+    export, _, _, _ = client._extract_month_roster_export(
+        html,
+        month_start=MONTH_START,
+        source_url=SOURCE_URL,
+        page_title=PAGE_TITLE,
+    )
+    export.pop("generated_at", None)
+    return export
 
 
-class TestExtractMonthRosterExport:
-    def test_items_not_empty(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        """Parsing the reference HTML must yield at least one roster item."""
-        export, planned, notes, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
+@pytest.fixture(scope="module")
+def golden() -> dict:
+    """Load the golden/expected JSON from tests/data/."""
+    if not GOLDEN_JSON.exists():
+        pytest.skip(f"Golden file not found: {GOLDEN_JSON}")
+    return json.loads(GOLDEN_JSON.read_text(encoding="utf-8"))
+
+
+class TestRosterParsingSnapshot:
+    def test_export_matches_golden(self, parsed_export: dict, golden: dict) -> None:
+        """Full snapshot check: parsed output must exactly match the golden file."""
+        assert parsed_export == golden, (
+            "Roster parsing output no longer matches the golden file "
+            f"({GOLDEN_JSON.name}).  If this change is intentional, regenerate "
+            "the golden file by running: "
+            "python -c \"import json; ...\" (see module docstring)."
         )
-        assert export["items"], f"Expected items but got empty list. Notes: {notes}"
 
-    def test_metadata(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        export, _, _, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
-        )
-        assert export["format"] == "ons-rooster-month-export"
-        assert export["month"] == "2026-06"
-        assert export["page_title"] == "Rooster"
+    def test_items_not_empty(self, parsed_export: dict) -> None:
+        assert parsed_export["items"], "Expected at least one item"
 
-    def test_first_june_afternoon_shift(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        """1 June 2026 should have an afternoon shift 15:00–23:30 (A1-SOM-2-MA)."""
-        export, _, _, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
-        )
-        items = export["items"]
-        june_1 = [i for i in items if i.get("date") == "2026-06-01"]
-        assert june_1, f"No items found for 2026-06-01. All dates: {[i.get('date') for i in items]}"
-        match = next((i for i in june_1 if i.get("start") == "15:00" and i.get("end") == "23:30"), None)
-        assert match is not None, f"Expected 15:00–23:30 shift on 2026-06-01, found: {june_1}"
-        assert "A1-SOM-2-MA" in match.get("title", ""), f"Unexpected title: {match.get('title')}"
-        assert match["category"] == "planned_hours"
+    def test_metadata(self, parsed_export: dict) -> None:
+        assert parsed_export["format"] == "ons-rooster-month-export"
+        assert parsed_export["month"] == "2026-06"
+        assert parsed_export["page_title"] == PAGE_TITLE
 
-    def test_june_3_unavailability(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        """3 June 2026 is a 'Vaste vrije dag' (fixed day off)."""
-        export, _, _, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
-        )
-        items = export["items"]
-        june_3 = [i for i in items if i.get("date") == "2026-06-03"]
-        assert june_3, f"No items for 2026-06-03. All dates: {sorted({i.get('date') for i in items})}"
-        unavail = next((i for i in june_3 if i.get("category") == "availability"), None)
-        assert unavail is not None, f"Expected an availability item on 2026-06-03, got: {june_3}"
-
-    def test_planned_entries_returned(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        """The planned_entries list should contain RosterItem objects for shift assignments."""
+    def test_planned_entries_have_times(self, client: HttpLoginAutomationClient) -> None:
+        """The planned_entries list returned by the parser must have date/start/end."""
+        if not ROSTER_HTML.exists():
+            pytest.skip(f"Test fixture not found: {ROSTER_HTML}")
+        html = ROSTER_HTML.read_text(encoding="utf-8")
         _, planned, _, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
+            html,
+            month_start=MONTH_START,
+            source_url=SOURCE_URL,
+            page_title=PAGE_TITLE,
         )
         assert planned, "Expected at least one planned RosterItem"
-        # Every planned item should have a valid date string and time pair
         for item in planned:
             assert item.date, f"RosterItem missing date: {item}"
             assert item.start, f"RosterItem missing start: {item}"
             assert item.end, f"RosterItem missing end: {item}"
-
-    def test_all_item_dates_in_june_or_adjacent(self, client: HttpLoginAutomationClient, roster_html: str) -> None:
-        """All items with a parsed date should be in June 2026 or the adjacent boundary days."""
-        export, _, _, _ = client._extract_month_roster_export(
-            roster_html,
-            month_start=date(2026, 6, 1),
-            source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
-            page_title="Rooster",
-        )
-        for item in export["items"]:
-            d = item.get("date")
-            if d:
-                parsed = date.fromisoformat(d)
-                # The last week row shows days from July 2026 (boundary)
-                assert parsed.year in (2026, 2025), f"Unexpected year in date {d}"
