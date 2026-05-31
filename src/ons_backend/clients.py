@@ -1612,9 +1612,14 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         page_title = await page.title()
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
-        screenshot_path = str(config.post_otp_screenshot_file)
-        await page.screenshot(path=screenshot_path, full_page=True)
-        debug_notes.append(f"Saved post-OTP screenshot to {screenshot_path}.")
+        screenshot_path: str | None = None
+        try:
+            screenshot_path = str(config.post_otp_screenshot_file)
+            await page.screenshot(path=screenshot_path, full_page=True)
+            debug_notes.append(f"Saved post-OTP screenshot to {screenshot_path}.")
+        except Exception as exc:
+            screenshot_path = None
+            debug_notes.append(f"Skipped post-OTP screenshot because Playwright could not capture it: {exc}")
         self._record_event(
             report_progress,
             trace_index=trace_index,
