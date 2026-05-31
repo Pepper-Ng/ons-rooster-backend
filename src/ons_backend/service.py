@@ -382,7 +382,6 @@ class BackendService:
             pending=pending,
             code=code,
             sender=sender,
-            note="De backend heeft een SMS-code van de Android-app ontvangen.",
         )
 
     async def trigger_refresh(self, reason: str, wait: bool = False) -> dict[str, Any]:
@@ -430,7 +429,6 @@ class BackendService:
             pending=pending,
             code=code,
             sender=sender,
-            note="De backend heeft een mock SMS-code ontvangen vanaf de statuspagina.",
         )
 
     async def install_fcm_service_account(self, raw_payload: str) -> dict[str, Any]:
@@ -1021,7 +1019,6 @@ class BackendService:
         pending: PendingChallenge,
         code: str,
         sender: str,
-        note: str,
     ) -> None:
         if not self.sync_enabled():
             raise RuntimeError(SYNC_DISABLED_MESSAGE)
