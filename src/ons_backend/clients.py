@@ -1885,6 +1885,8 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         roster_items: list[RosterItem] = []
         stop_from: tuple[int, int] | None = None
 
+        await self._attach_best_effort_dialog_dismiss_handler(page, debug_notes=debug_notes)
+
         for month_start, month_url in self._resolve_month_targets(login_url, page.url, config.roster_url):
             month_key = f"{month_start.year:04d}-{month_start.month:02d}"
             month_tuple = (month_start.year, month_start.month)
@@ -1894,6 +1896,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 )
                 continue
 
+            await self._dismiss_dashboard_confirmation_modal(page, debug_notes=debug_notes)
             await page.goto(month_url, wait_until="domcontentloaded")
             html = await page.content()
             if self._looks_like_external_sso_host(page.url) or self._response_still_looks_like_login(
@@ -1942,6 +1945,46 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             roster_exports=exports,
             post_otp_screenshot_path=post_otp_screenshot_path,
         )
+
+    async def _attach_best_effort_dialog_dismiss_handler(self, page, *, debug_notes: list[str]) -> None:
+        async def _dismiss_dialog(dialog) -> None:
+            try:
+                await dialog.dismiss()
+                debug_notes.append(
+                    f"Dismissed browser dialog while opening roster pages: {dialog.type} ({dialog.message[:120]})."
+                )
+            except Exception:
+                return
+
+        try:
+            page.on("dialog", _dismiss_dialog)
+        except Exception:
+            return
+
+    async def _dismiss_dashboard_confirmation_modal(self, page, *, debug_notes: list[str]) -> None:
+        try:
+            if not await page.locator('text=Weet je het zeker?').first.is_visible(timeout=400):
+                return
+        except Exception:
+            return
+
+        for selector in (
+            'button:has-text("Ja")',
+            '[role="button"]:has-text("Ja")',
+            'button:has-text("Yes")',
+            '[role="button"]:has-text("Yes")',
+            'button:has-text("Nee")',
+            '[role="button"]:has-text("Nee")',
+        ):
+            locator = page.locator(selector).first
+            try:
+                if await locator.is_visible(timeout=250):
+                    await locator.click(timeout=1_500)
+                    await page.wait_for_timeout(250)
+                    debug_notes.append("Dismissed the HasMoves confirmation modal before roster navigation.")
+                    return
+            except Exception:
+                continue
 
     def _resolve_month_targets(
         self,
