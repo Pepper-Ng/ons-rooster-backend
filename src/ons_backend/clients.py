@@ -1024,9 +1024,8 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     url=page.url,
                 )
                 trace_index += 1
-                await self._click_first_visible(
+                await self._click_primary_or_press_enter(
                     page,
-                    self.MICROSOFT_PRIMARY_BUTTON_SELECTORS,
                     config.login_timeout_seconds,
                 )
 
@@ -1940,6 +1939,20 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     continue
             await page.wait_for_timeout(250)
         raise RuntimeError(f"No matching selector was found for {selectors!r}.")
+
+    async def _click_primary_or_press_enter(self, page, timeout_seconds: int) -> None:
+        try:
+            await self._click_first_visible(
+                page,
+                self.MICROSOFT_PRIMARY_BUTTON_SELECTORS,
+                timeout_seconds,
+            )
+            return
+        except RuntimeError:
+            pass
+
+        await page.keyboard.press("Enter")
+        await page.wait_for_timeout(250)
 
     async def _wait_for_first_visible_locator(self, page, selectors: tuple[str, ...], timeout_seconds: int):
         deadline = asyncio.get_running_loop().time() + timeout_seconds
