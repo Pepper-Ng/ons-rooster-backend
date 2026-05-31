@@ -1054,7 +1054,7 @@ async def test_partial_login_stage_persists_microsoft_proof_selection_checkpoint
     status = service.mobile_status_payload()
     assert status["sync"]["status"] == "partial"
     assert status["sync"]["auth_ready"] is False
-    assert "SMS is nog niet verzonden" in status["sync"]["last_message"]
+    assert "SMS not sent yet" in status["sync"]["last_message"]
     assert "+XX XXXXXXX32" in status["sync"]["last_message"]
 
     checkpoint = service.store.read_auth_session()
@@ -1139,12 +1139,12 @@ async def test_service_resumes_microsoft_proof_selection_and_arms_sms_before_wai
     assert automation_client.events[2] == ("received_code", "123456")
     status = service.mobile_status_payload()
     assert status["sync"]["status"] == "partial"
-    assert status["sync"]["last_message"].startswith("De OTP-code is ingestuurd")
+    assert status["sync"]["last_message"].startswith("OTP submitted")
     sms_received_entries = [
         entry for entry in status["sync"]["auth_trace"] if entry.get("phase") == "sms_received"
     ]
     assert sms_received_entries
-    assert sms_received_entries[-1]["message"] == "De backend heeft OTP-code 123456 van de Android-app ontvangen."
+    assert sms_received_entries[-1]["message"] == "OTP 123456 received from Android."
     assert push_client.auth_notifications == []
 
 

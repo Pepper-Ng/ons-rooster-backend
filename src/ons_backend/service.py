@@ -8,6 +8,7 @@ import logging
 import re
 import secrets
 import shutil
+import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
@@ -31,7 +32,7 @@ class PendingChallenge:
     challenge_id: str
     device_id: str
     created_at: str
-    event: asyncio.Event
+    event: threading.Event
     sender: str | None = None
     code: str | None = None
 
@@ -57,6 +58,7 @@ class BackendService:
         self.state, self.credentials = self.store.load()
         self._ensure_default_portals()
         self._pending_challenges: dict[str, PendingChallenge] = {}
+        self._pending_challenges_lock = threading.Lock()
         self._state_lock = asyncio.Lock()
         self._sync_lock = asyncio.Lock()
         self._live_condition = asyncio.Condition()
@@ -216,7 +218,7 @@ class BackendService:
                 self.state.sync.current_phase = "disabled"
                 self.state.sync.current_challenge_id = None
                 self.state.sync.challenge_created_at = None
-                self._pending_challenges.clear()
+                self._clear_pending_challenges()
                 self._remember_note("Synchronisatie is uitgeschakeld vanaf de statuspagina.")
             await self._persist_state()
 
@@ -370,7 +372,7 @@ class BackendService:
         if device is None:
             raise RuntimeError("De app-token hoort niet bij een gekoppeld apparaat.")
 
-        pending = self._pending_challenges.get(challenge_id)
+        pending = self._get_pending_challenge(challenge_id)
         if pending is None:
             raise RuntimeError("De aangeleverde SMS-uitdaging is niet meer actief.")
         if pending.device_id != device.device_id:
@@ -421,7 +423,7 @@ class BackendService:
         challenge_id = self.state.sync.current_challenge_id
         if not challenge_id:
             raise RuntimeError("Er is momenteel geen actieve SMS-uitdaging.")
-        pending = self._pending_challenges.get(challenge_id)
+        pending = self._get_pending_challenge(challenge_id)
         if pending is None:
             raise RuntimeError("De actieve SMS-uitdaging is al verlopen.")
         await self._accept_sms_code(
@@ -773,16 +775,16 @@ class BackendService:
             challenge_id=challenge_id,
             device_id=active_device.device_id,
             created_at=utc_now(),
-            event=asyncio.Event(),
+            event=threading.Event(),
         )
-        self._pending_challenges[challenge_id] = pending
+        self._set_pending_challenge(challenge_id, pending)
 
         async with self._state_lock:
             self.state.sync.current_phase = "waiting_for_sms"
             self.state.sync.current_challenge_id = challenge_id
             self.state.sync.challenge_created_at = pending.created_at
-            self.state.sync.last_message = "De backend wacht op de SMS-code van de Android-app."
-            self._remember_note("De backend heeft een SMS-luisterverzoek naar de Android-app verstuurd.")
+            self.state.sync.last_message = "Waiting for OTP from Android."
+            self._remember_note("SMS relay request sent to Android.")
             await self._persist_state()
 
         try:
@@ -792,23 +794,25 @@ class BackendService:
                 self.config.sms_timeout_seconds,
             )
         except Exception:
-            self._pending_challenges.pop(challenge_id, None)
+            self._pop_pending_challenge(challenge_id)
             raise
 
         return challenge_id
 
     async def _wait_for_sms_code(self, challenge_id: str) -> str:
-        pending = self._pending_challenges.get(challenge_id)
+        pending = self._get_pending_challenge(challenge_id)
         if pending is None:
             raise RuntimeError("De gevraagde SMS-uitdaging is niet meer actief.")
 
         try:
-            await asyncio.wait_for(pending.event.wait(), timeout=self.config.sms_timeout_seconds)
+            received = await asyncio.to_thread(pending.event.wait, self.config.sms_timeout_seconds)
+            if not received:
+                raise TimeoutError("Timed out waiting for OTP from Android.")
         except Exception:
-            self._pending_challenges.pop(challenge_id, None)
+            self._pop_pending_challenge(challenge_id)
             raise
 
-        self._pending_challenges.pop(challenge_id, None)
+        self._pop_pending_challenge(challenge_id)
         assert pending.code is not None
         return pending.code
 
@@ -828,29 +832,27 @@ class BackendService:
                 sms_display = ""
                 if isinstance(sms_proof, dict):
                     sms_display = str(sms_proof.get("display", "")).strip()
-                partial_message = (
-                    "Gebruikersnaam en wachtwoord zijn geaccepteerd. De Microsoft verificatiekeuze is bereikt; de SMS is nog niet verzonden."
-                )
+                partial_message = "Username/password accepted. Microsoft verification choice reached; SMS not sent yet."
                 if sms_display:
                     partial_message = (
-                        "Gebruikersnaam en wachtwoord zijn geaccepteerd. "
-                        f"De Microsoft verificatiekeuze is bereikt voor {sms_display}; de SMS is nog niet verzonden."
+                        "Username/password accepted. "
+                        f"Microsoft verification choice reached for {sms_display}; SMS not sent yet."
                     )
                 partial_note = (
-                    "De backend heeft de Microsoft verificatiekeuze bereikt en wacht op expliciete SMS-verzending."
+                    "Microsoft verification choice reached; waiting for explicit SMS send."
                 )
             elif isinstance(challenge, dict) and challenge.get("challenge_kind") == "post_otp_result_page":
                 partial_phase = "post_otp_page"
                 page_summary = str(challenge.get("page_summary", "")).strip()
-                partial_message = "De OTP-code is ingestuurd en de eerste vervolgpagina is vastgelegd voor inspectie."
+                partial_message = "OTP submitted and first follow-up page captured."
                 if result.page_title:
                     partial_message = (
-                        f"De OTP-code is ingestuurd en de pagina '{result.page_title}' is vastgelegd voor inspectie."
+                        f"OTP submitted and page '{result.page_title}' captured for inspection."
                     )
                 if page_summary:
                     partial_message = f"{partial_message} Inhoud: {page_summary}"
                 partial_note = (
-                    "De backend heeft de OTP-code ingestuurd en wacht op verdere afhandeling van de vervolgpagina."
+                    "OTP submitted; waiting for follow-up page handling."
                 )
 
         if result.auth_ready:
@@ -886,7 +888,7 @@ class BackendService:
                 )
             await asyncio.to_thread(self.store.write_auth_session, result.session_checkpoint)
             roster_export_summaries = list(self.state.sync.roster_month_exports)
-        self._pending_challenges.clear()
+        self._clear_pending_challenges()
 
         async with self._state_lock:
             # The latest successful page snapshot and roster payload become the operator-facing debug baseline.
@@ -896,7 +898,7 @@ class BackendService:
             self.state.sync.last_success_at = utc_now()
             self.state.sync.last_error = None
             self.state.sync.last_message = (
-                "De backend is succesvol aangemeld en klaar om te synchroniseren."
+                "Authentication complete. Ready to sync."
                 if result.auth_ready
                 else partial_message
             )
@@ -914,7 +916,7 @@ class BackendService:
             self.state.sync.roster_month_exports = roster_export_summaries
             self.state.sync.debug_notes = list(result.debug_notes[-25:])
             self._remember_note(
-                "De backend heeft de ONS-aanmelding succesvol afgerond."
+                "ONS authentication completed."
                 if result.auth_ready
                 else partial_note
             )
@@ -931,7 +933,7 @@ class BackendService:
     async def _finalize_failure(self, exc: Exception) -> None:
         log.exception("Backend sync failed.", exc_info=exc)
         await asyncio.to_thread(self.store.clear_auth_session)
-        self._pending_challenges.clear()
+        self._clear_pending_challenges()
         async with self._state_lock:
             self.state.sync.status = "error"
             self.state.sync.current_phase = "error"
@@ -945,7 +947,7 @@ class BackendService:
 
         await self._notify_auth_result(
             False,
-            f"De backend kon de aanmelding niet afronden: {exc}",
+            f"Authentication failed: {exc}",
         )
 
     async def _scheduler_loop(self) -> None:
@@ -1031,9 +1033,9 @@ class BackendService:
 
         auth_trace_entry: dict[str, Any] | None = None
         receipt_message = (
-            f"De backend heeft OTP-code {normalized_code} van de Android-app ontvangen."
+            f"OTP {normalized_code} received from Android."
             if normalized_code
-            else "De backend heeft een lege OTP-code van de Android-app ontvangen."
+            else "Empty OTP received from Android."
         )
 
         async with self._state_lock:
@@ -1045,7 +1047,7 @@ class BackendService:
             auth_trace_entry = {
                 "entry_id": f"step-{len(self.state.sync.auth_trace) + 1:03d}",
                 "created_at": received_at,
-                "label": "OTP code ontvangen",
+                "label": "OTP received",
                 "message": receipt_message,
                 "phase": "sms_received",
                 "url": self.state.sync.last_final_url,
@@ -1084,7 +1086,7 @@ class BackendService:
             self.state.active_device_id = self.state.devices[-1].device_id if self.state.devices else None
 
         if not self.state.devices:
-            self._pending_challenges.clear()
+            self._clear_pending_challenges()
 
         self._remember_note(f"Het gekoppelde apparaat {device.device_label} is verwijderd.")
         await self._persist_state()
@@ -1093,6 +1095,22 @@ class BackendService:
     async def _persist_state(self) -> None:
         await asyncio.to_thread(self.store.save, self.state, self.credentials)
         await self._publish_live_update()
+
+    def _get_pending_challenge(self, challenge_id: str) -> PendingChallenge | None:
+        with self._pending_challenges_lock:
+            return self._pending_challenges.get(challenge_id)
+
+    def _set_pending_challenge(self, challenge_id: str, pending: PendingChallenge) -> None:
+        with self._pending_challenges_lock:
+            self._pending_challenges[challenge_id] = pending
+
+    def _pop_pending_challenge(self, challenge_id: str) -> PendingChallenge | None:
+        with self._pending_challenges_lock:
+            return self._pending_challenges.pop(challenge_id, None)
+
+    def _clear_pending_challenges(self) -> None:
+        with self._pending_challenges_lock:
+            self._pending_challenges.clear()
 
     def _reset_auth_trace_dir(self) -> None:
         if self.config.auth_trace_dir.exists():

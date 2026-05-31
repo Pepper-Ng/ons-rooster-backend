@@ -617,7 +617,21 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             debug_notes.append("Continuing from the stored authentication session.")
             challenge = session_checkpoint.get("challenge", {}) if isinstance(session_checkpoint, dict) else {}
             challenge_kind = str(challenge.get("challenge_kind", "")).strip().lower() if isinstance(challenge, dict) else ""
-            try:
+            if challenge_kind == "microsoft_proof_selection":
+                debug_notes.append(
+                    "Skipping direct resume for Microsoft proof selection; restarting SSO flow in one piece."
+                )
+                self._record_event(
+                    report_progress,
+                    trace_index=trace_index,
+                    label="Restart SSO flow",
+                    message="Stored Microsoft proof-selection page skipped. Restarting SSO flow in one piece.",
+                    phase="sso_restart",
+                    url=login_url,
+                )
+                trace_index += 1
+                continue_after_microsoft_proof_selection = True
+            else:
                 return asyncio.run(
                     self._continue_from_session_checkpoint(
                         credentials=credentials,
@@ -632,22 +646,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         wait_for_sms_code=wait_for_sms_code,
                     )
                 )
-            except RuntimeError as exc:
-                if challenge_kind != "microsoft_proof_selection" or "opgeslagen Microsoft verificatiepagina" not in str(exc):
-                    raise
-                debug_notes.append(
-                    "The stored Microsoft verification page could not be reused; restarting the login flow."
-                )
-                self._record_event(
-                    report_progress,
-                    trace_index=trace_index,
-                    label="Restart SSO session",
-                    message="De opgeslagen Microsoft verificatiepagina is verlopen; de backend start de loginflow opnieuw.",
-                    phase="sso_session_restart",
-                    url=login_url,
-                )
-                trace_index += 1
-                continue_after_microsoft_proof_selection = True
 
         with requests.Session() as session:
             session.headers.update(
@@ -670,7 +668,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 snapshot_path=snapshot_path,
                 trace_index=trace_index,
                 label="Open login page",
-                message=f"De backend heeft de inlogpagina geopend op {login_response.url}.",
+                message=f"Login page opened: {login_response.url}.",
                 phase="login_opened",
                 response=login_response,
             )
@@ -691,7 +689,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Select SSO provider",
-                    message=f"De backend heeft {provider_label} geselecteerd voor de SSO-flow.",
+                    message=f"Login via {provider_label} selected.",
                     phase="sso_selected",
                     url=login_response.url,
                     page_title=self._extract_page_title(login_response.text),
@@ -732,7 +730,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Resolve CSRF",
-                    message="De backend heeft een CSRF-token voor de eerste loginstap opgehaald.",
+                    message="CSRF token resolved.",
                     phase="csrf_resolved",
                     url=login_response.url,
                 )
@@ -752,7 +750,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 report_progress,
                 trace_index=trace_index,
                 label="Submit credentials",
-                message=f"De backend heeft de credential-POST voorbereid voor {submit_url}.",
+                message=f"Credentials submitted to {submit_url}.",
                 phase="credentials_submitted",
                 url=submit_url,
             )
@@ -776,7 +774,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 snapshot_path=snapshot_path,
                 trace_index=trace_index,
                 label="Credential response",
-                message=f"De backend heeft de antwoordpagina na credential-submit ontvangen op {submit_response.url}.",
+                message=f"Credential response received at {submit_response.url}.",
                 phase="credential_response",
                 response=submit_response,
             )
@@ -794,7 +792,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="OTP challenge detected",
-                    message=f"De backend heeft een OTP-pagina gevonden op {challenge['action_url']}.",
+                    message=f"OTP page detected at {challenge['action_url']}.",
                     phase="otp_detected",
                     url=submit_response.url,
                     page_title=page_title,
@@ -832,9 +830,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         report_progress,
                         trace_index=trace_index,
                         label="Switch to SSO",
-                        message=(
-                            f"De backend schakelt over op {provider_label} nadat de ONS-site aangaf dat SSO verplicht is."
-                        ),
+                        message=(f"Switching to {provider_label}; ONS requires SSO."),
                         phase="sso_selected",
                         url=submit_response.url,
                         page_title=page_title,
@@ -886,7 +882,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Login still pending",
-                    message="De backend kwam terug op een pagina die nog steeds op de loginflow lijkt.",
+                    message="Still on login flow; authentication not confirmed.",
                     phase="login_unconfirmed",
                     url=submit_response.url,
                     page_title=page_title,
@@ -920,7 +916,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Post-login navigation",
-                    message=f"De backend heeft de ingestelde post-login pagina geopend op {page_response.url}.",
+                    message=f"Post-login page opened: {page_response.url}.",
                     phase="post_login_page",
                     response=page_response,
                 )
@@ -935,7 +931,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 report_progress,
                 trace_index=trace_index,
                 label="Authentication ready",
-                message=f"De backend heeft de loginflow afgerond en {len(roster_items)} roosterregels gedetecteerd.",
+                message=f"Authentication complete. Found {len(roster_items)} roster entries.",
                 phase="ready",
                 url=page_response.url,
                 page_title=page_title,
@@ -983,7 +979,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Open SSO provider",
-                    message=f"De backend heeft de {provider_label} SSO-provider geopend op {page.url}.",
+                    message=f"SSO provider opened: {provider_label} ({page.url}).",
                     phase="sso_opened",
                     page=page,
                 )
@@ -998,7 +994,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Submit SSO username",
-                    message="De backend heeft de Microsoft gebruikersnaam ingevoerd.",
+                    message="SSO username entered.",
                     phase="sso_username_submitted",
                     url=page.url,
                 )
@@ -1019,7 +1015,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Submit SSO password",
-                    message="De backend heeft het Microsoft wachtwoord ingevoerd.",
+                    message="SSO password entered.",
                     phase="sso_password_submitted",
                     url=page.url,
                 )
@@ -1035,7 +1031,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         report_progress,
                         trace_index=trace_index,
                         label="Dismiss keep-signed-in prompt",
-                        message="De backend heeft de Microsoft prompt om aangemeld te blijven afgewezen.",
+                        message="Keep-signed-in prompt declined.",
                         phase="sso_prompt_handled",
                         url=page.url,
                     )
@@ -1073,11 +1069,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         "Microsoft verification method selection detected"
                         f"{f' for {sms_display}' if sms_display else ''}; SMS not sent."
                     )
-                    message = "De backend heeft de Microsoft verificatiekeuze bereikt; de SMS is nog niet verzonden."
+                    message = "Microsoft verification choice reached; SMS not sent yet."
                     if sms_display:
                         message = (
-                            "De backend heeft de Microsoft verificatiekeuze bereikt en kan nu een SMS sturen naar "
-                            f"{sms_display}, maar heeft dat nog niet gedaan."
+                            "Microsoft verification choice reached for "
+                            f"{sms_display}; SMS not sent yet."
                         )
                     self._record_event(
                         report_progress,
@@ -1117,7 +1113,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         report_progress,
                         trace_index=trace_index,
                         label="OTP challenge detected",
-                        message=f"De backend heeft na de SSO-flow een OTP-pagina gevonden op {challenge['action_url']}.",
+                        message=f"OTP page detected after SSO at {challenge['action_url']}.",
                         phase="otp_detected",
                         url=page.url,
                         page_title=page_title,
@@ -1169,7 +1165,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         report_progress,
                         trace_index=trace_index,
                         label="SSO still pending",
-                        message="De backend kwam na de SSO-flow terug op een pagina die nog steeds op de loginflow lijkt.",
+                        message="Still on login flow after SSO; authentication not confirmed.",
                         phase="login_unconfirmed",
                         url=page.url,
                         page_title=page_title,
@@ -1196,7 +1192,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         snapshot_path=snapshot_path,
                         trace_index=trace_index,
                         label="Post-login navigation",
-                        message=f"De backend heeft de ingestelde post-login pagina geopend op {page.url}.",
+                        message=f"Post-login page opened: {page.url}.",
                         phase="post_login_page",
                         page=page,
                     )
@@ -1211,7 +1207,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="Authentication ready",
-                    message=f"De backend heeft de SSO-flow afgerond en {len(roster_items)} roosterregels gedetecteerd.",
+                    message=f"SSO authentication complete. Found {len(roster_items)} roster entries.",
                     phase="ready",
                     url=page.url,
                     page_title=page_title,
@@ -1239,7 +1235,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     report_progress,
                     trace_index=trace_index,
                     label="SSO automation error",
-                    message="De backend kon de Microsoft SSO-flow niet afronden.",
+                    message="Microsoft SSO flow failed.",
                     phase="sso_error",
                     url=current_url,
                     page_title=page_title,
@@ -1342,7 +1338,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Resume post-OTP page",
-                    message="De backend heeft de opgeslagen pagina na OTP-submit opnieuw geopend.",
+                    message="Stored post-OTP page reopened.",
                     phase="post_otp_resumed",
                     page=page,
                 )
@@ -1400,7 +1396,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Resume SSO session",
-                    message="De backend heeft de opgeslagen Microsoft verificatiepagina opnieuw geopend.",
+                    message="Stored Microsoft verification page reopened.",
                     phase="sso_resumed",
                     page=page,
                 )
@@ -1472,7 +1468,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             report_progress,
             trace_index=trace_index,
             label="Arm SMS relay",
-            message="De backend heeft de Android-app eerst klaar gezet om de komende OTP-SMS op te vangen.",
+            message="Android SMS relay armed.",
             phase="sms_relay_armed",
             url=page.url,
             page_title=await page.title(),
@@ -1489,7 +1485,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             report_progress,
             trace_index=trace_index,
             label="Request SMS code",
-            message="De backend heeft nu de Microsoft optie gekozen om de OTP-SMS te verzenden.",
+            message="Microsoft SMS verification requested.",
             phase="sms_requested",
             url=page.url,
             page_title=await page.title(),
@@ -1503,7 +1499,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             snapshot_path=snapshot_path,
             trace_index=trace_index,
             label="OTP entry page",
-            message="De backend heeft de Microsoft OTP-invoerpagina bereikt en wacht op de code van Android.",
+            message="OTP input page opened; waiting for Android code.",
             phase="otp_page_opened",
             page=page,
         )
@@ -1521,7 +1517,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             report_progress,
             trace_index=trace_index,
             label="Submit OTP code",
-            message="De backend heeft de door Android teruggestuurde OTP-code ingevoerd.",
+            message="OTP code entered.",
             phase="otp_submitted",
             url=page.url,
             page_title=await page.title(),
@@ -1545,7 +1541,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             report_progress,
             trace_index=trace_index,
             label="Post-OTP page detected",
-            message=f"De backend heeft de eerste pagina na OTP-submit bereikt op {page.url}.",
+            message=f"First page after OTP submit reached: {page.url}.",
             phase="post_otp_page_detected",
             url=page.url,
             page_title=page_title,
