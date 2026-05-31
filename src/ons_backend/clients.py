@@ -633,7 +633,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         debug_notes: list[str] = []
         login_url = credentials.login_url or config.default_login_url
         trace_index = 1
-        continue_after_microsoft_proof_selection = False
+        continue_after_microsoft_proof_selection = True
 
         if session_checkpoint is not None:
             debug_notes.append("Continuing from the stored authentication session.")
@@ -684,16 +684,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             )
             login_response.raise_for_status()
             debug_notes.append(f"Opened login page {login_response.url}.")
-            trace_index = self._record_response_step(
-                report_progress,
-                config=config,
-                snapshot_path=snapshot_path,
-                trace_index=trace_index,
-                label="Open login page",
-                message=f"Login page opened: {login_response.url}.",
-                phase="login_opened",
-                response=login_response,
-            )
 
             login_form = self._extract_login_form(login_response.url, login_response.text)
             sso_providers = self._extract_sso_providers(login_response.url, login_response.text)
@@ -707,23 +697,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 debug_notes.append(
                     f"Selected SSO provider {provider_label} ({sso_reason}) from {login_response.url}."
                 )
-                self._record_event(
-                    report_progress,
-                    trace_index=trace_index,
-                    label="Select SSO provider",
-                    message=f"Login via {provider_label} selected.",
-                    phase="sso_selected",
-                    url=login_response.url,
-                    page_title=self._extract_page_title(login_response.text),
-                    snapshot_name=self._write_trace_snapshot(
-                        config.auth_trace_dir,
-                        trace_index,
-                        "sso-provider-selection",
-                        login_response.text,
-                    ),
-                    status_code=login_response.status_code,
-                )
-                trace_index += 1
                 return asyncio.run(
                     self._authenticate_with_sso_playwright(
                         credentials=credentials,
@@ -740,6 +713,17 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         wait_for_sms_code=wait_for_sms_code,
                     )
                 )
+
+            trace_index = self._record_response_step(
+                report_progress,
+                config=config,
+                snapshot_path=snapshot_path,
+                trace_index=trace_index,
+                label="Open login page",
+                message=f"Login page opened: {login_response.url}.",
+                phase="login_opened",
+                response=login_response,
+            )
 
             csrf_token = self._resolve_csrf_token(
                 session,
@@ -993,6 +977,27 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 browser = await playwright.chromium.launch(headless=config.playwright_headless)
                 context = await browser.new_context(locale="nl-NL", user_agent=self.BROWSER_USER_AGENT)
                 page = await context.new_page()
+                await page.goto(login_url, wait_until="domcontentloaded")
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Open login page",
+                    message=f"Login page opened: {page.url}.",
+                    phase="login_opened",
+                    page=page,
+                )
+                trace_index = await self._record_playwright_page_step(
+                    report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
+                    trace_index=trace_index,
+                    label="Select SSO provider",
+                    message=f"Login via {provider_label} selected.",
+                    phase="sso_selected",
+                    page=page,
+                )
                 await page.goto(provider_url, wait_until="domcontentloaded")
                 debug_notes.append(f"Opened SSO provider {provider_label} on {page.url}.")
                 trace_index = await self._record_playwright_page_step(
@@ -1012,15 +1017,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     credentials.username,
                     config.login_timeout_seconds,
                 )
-                self._record_event(
+                trace_index = await self._record_playwright_page_step(
                     report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Submit SSO username",
                     message="SSO username entered.",
                     phase="sso_username_submitted",
-                    url=page.url,
+                    page=page,
                 )
-                trace_index += 1
                 await self._click_first_visible(
                     page,
                     self.MICROSOFT_PRIMARY_BUTTON_SELECTORS,
@@ -1033,15 +1039,16 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     credentials.password,
                     config.login_timeout_seconds,
                 )
-                self._record_event(
+                trace_index = await self._record_playwright_page_step(
                     report_progress,
+                    config=config,
+                    snapshot_path=snapshot_path,
                     trace_index=trace_index,
                     label="Submit SSO password",
                     message="SSO password entered.",
                     phase="sso_password_submitted",
-                    url=page.url,
+                    page=page,
                 )
-                trace_index += 1
                 await self._click_primary_or_press_enter(
                     page,
                     config.login_timeout_seconds,
@@ -1097,20 +1104,15 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                             "Microsoft verification choice reached for "
                             f"{sms_display}; SMS not sent yet."
                         )
-                    self._record_event(
+                    trace_index = await self._record_playwright_page_step(
                         report_progress,
+                        config=config,
+                        snapshot_path=snapshot_path,
                         trace_index=trace_index,
                         label="MFA selection detected",
                         message=message,
                         phase="mfa_selection_detected",
-                        url=page.url,
-                        page_title=page_title,
-                        snapshot_name=self._write_trace_snapshot(
-                            config.auth_trace_dir,
-                            trace_index,
-                            "mfa-selection-after-sso",
-                            html,
-                        ),
+                        page=page,
                     )
                     return AuthenticationResult(
                         final_url=page.url,
@@ -2007,8 +2009,13 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         parsed_reference = urlparse(reference_url)
         scheme = parsed_reference.scheme or "https"
         host = parsed_reference.netloc
+        parsed_current = urlparse(current_url)
+        if not host or "mijnio.nl" in host.lower():
+            inferred_host = self._infer_hasmoves_host(parsed_login.netloc, parsed_current.netloc)
+            if inferred_host:
+                host = inferred_host
+                scheme = "https"
         if not host:
-            parsed_current = urlparse(current_url)
             host = parsed_current.netloc
             if not parsed_reference.scheme:
                 scheme = parsed_current.scheme or scheme
@@ -2022,6 +2029,20 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             month_path = f"/onsdraaiboek/roster/{month_start.isoformat()}/month"
             targets.append((month_start, f"{scheme}://{host}{month_path}"))
         return targets
+
+    @staticmethod
+    def _infer_hasmoves_host(login_host: str, current_host: str) -> str:
+        for candidate in (login_host, current_host):
+            host = str(candidate or "").strip().lower()
+            if not host:
+                continue
+            if host.endswith(".hasmoves.com"):
+                return host
+            if host.endswith(".startmetons.nl"):
+                prefix = host[: -len(".startmetons.nl")]
+                if prefix:
+                    return f"{prefix}.hasmoves.com"
+        return ""
 
     @staticmethod
     def _extract_month_from_roster_url(path: str) -> date | None:
