@@ -10,11 +10,12 @@ import secrets
 import shutil
 import threading
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 from icalendar import Calendar, Event
 
+from .calendar_export import build_icalendar, parse_local_datetime, timezone_or_utc
 from .clients import AutomationClient, FcmPushClient, PushClient
 from .config import AppConfig
 from .google_calendar import CalendarSyncSummary, GoogleCalendarSyncClient
@@ -78,6 +79,7 @@ class BackendService:
             service_account_json=self.config.google_calendar_service_account_json,
             dry_run=self.config.google_calendar_dry_run,
         )
+        self._calendar_feed_token = self._resolve_calendar_feed_token()
         self._pending_challenges: dict[str, PendingChallenge] = {}
         self._pending_challenges_lock = threading.Lock()
         self._state_lock = asyncio.Lock()
@@ -225,6 +227,34 @@ class BackendService:
 
     def calendar_sync_configured(self) -> bool:
         return self.calendar_sync_client.is_configured()
+
+    def calendar_feed_url(self) -> str:
+        return f"{self.config.public_base_url}/calendar/{self._calendar_feed_token}/rooster.ics"
+
+    def calendar_feed_query_url(self) -> str:
+        return f"{self.config.public_base_url}/rooster.ics?token={self._calendar_feed_token}"
+
+    def calendar_feed_token_is_valid(self, token: str | None) -> bool:
+        if not token:
+            return False
+        return hmac.compare_digest(token, self._calendar_feed_token)
+
+    def calendar_feed_token_is_env_managed(self) -> bool:
+        return bool(self.config.calendar_feed_token)
+
+    async def rotate_calendar_feed_token(self) -> str:
+        if self.calendar_feed_token_is_env_managed():
+            raise RuntimeError(
+                "De kalenderfeed-token wordt via CALENDAR_FEED_TOKEN beheerd. Pas die omgevingsvariabele aan om de URL te wijzigen."
+            )
+
+        new_token = secrets.token_urlsafe(32)
+        async with self._state_lock:
+            await asyncio.to_thread(self.store.write_calendar_feed_token, new_token)
+            self._calendar_feed_token = new_token
+            self._remember_note("De geheime ICS-feed URL is vernieuwd vanaf de statuspagina.")
+            await self._persist_state()
+        return self.calendar_feed_url()
 
     async def set_sync_enabled(self, enabled: bool) -> str:
         async with self._state_lock:
@@ -431,6 +461,7 @@ class BackendService:
             raise RuntimeError("Er zijn nog geen roosterexports beschikbaar voor Google Calendar synchronisatie.")
 
         await self._sync_calendar_exports(exports)
+        await asyncio.to_thread(self.store.write_ics, self._generate_ical(exports))
         return self.mobile_status_payload()
 
     async def send_test_notification(self, message: str, device_id: str | None = None) -> None:
@@ -533,6 +564,12 @@ class BackendService:
             "portal_name": selected_portal.name if selected_portal else "",
             "portal_logo_url": selected_portal.logo_url if selected_portal else "",
             "portals": self.portal_catalog_payload(),
+            "calendar_feed": {
+                "url": self.calendar_feed_url(),
+                "query_url": self.calendar_feed_query_url(),
+                "token_env_managed": self.calendar_feed_token_is_env_managed(),
+                "has_payload": self.config.ics_file.exists(),
+            },
             "paired": current_device is not None,
             "connected": bool(current_device and self.device_is_connected(current_device.device_id)),
             "device_id": current_device.device_id if current_device else "",
@@ -995,7 +1032,7 @@ class BackendService:
             )
             await self._persist_state()
             if result.auth_ready:
-                await asyncio.to_thread(self.store.write_ics, self._generate_ical())
+                await asyncio.to_thread(self.store.write_ics, self._generate_ical(result.roster_exports))
 
         if result.auth_ready:
             await self._notify_auth_result(
@@ -1083,36 +1120,58 @@ class BackendService:
             except Exception:
                 log.exception("Scheduled sync failed.")
 
-    def _generate_ical(self) -> bytes:
+    def _generate_ical(self, month_exports: list[dict[str, Any]] | None = None) -> bytes:
+        if month_exports:
+            return build_icalendar(
+                month_exports,
+                timezone_name=self.config.google_calendar_timezone or self.config.timezone,
+            )
+
+        timezone = timezone_or_utc(self.config.timezone)
+        generated_at = datetime.now(UTC).replace(microsecond=0)
         calendar = Calendar()
         calendar.add("prodid", "-//ONS Rooster Backend//NL")
         calendar.add("version", "2.0")
         calendar.add("x-wr-calname", "ONS Rooster")
+        calendar.add("x-wr-timezone", timezone.key)
+        calendar.add("method", "PUBLISH")
 
         for item in self.state.sync.roster_items:
-            start = self._parse_datetime(item.date, item.start)
-            end = self._parse_datetime(item.date, item.end)
+            start = parse_local_datetime(item.date, item.start, timezone)
+            end = parse_local_datetime(item.date, item.end, timezone)
             if start is None or end is None:
                 continue
+            if end <= start:
+                end = end + timedelta(days=1)
             event = Event()
+            event.add("uid", self._fallback_ical_uid(item))
             event.add("summary", item.description)
             event.add("dtstart", start)
             event.add("dtend", end)
-            event.add("dtstamp", datetime.now(UTC))
+            event.add("dtstamp", generated_at)
+            event.add("last-modified", generated_at)
+            event.add("categories", ["ONS Rooster"])
             calendar.add_component(event)
 
         return calendar.to_ical()
 
-    def _parse_datetime(self, date_value: str, time_value: str):
-        if not date_value or not time_value:
-            return None
-        normalized = date_value.replace("/", "-")
-        for fmt in ("%d-%m-%Y %H:%M", "%d-%m-%y %H:%M"):
-            try:
-                return datetime.strptime(f"{normalized} {time_value}", fmt)
-            except ValueError:
-                continue
-        return None
+    @staticmethod
+    def _fallback_ical_uid(item: RosterItem) -> str:
+        payload = json.dumps(item.to_dict(), ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return f"ons-rooster-{digest}@ons-rooster-backend"
+
+    def _resolve_calendar_feed_token(self) -> str:
+        if self.config.calendar_feed_token:
+            return self.config.calendar_feed_token
+
+        stored_token = self.store.read_calendar_feed_token()
+        if stored_token:
+            return stored_token
+
+        token = secrets.token_urlsafe(32)
+        self.store.write_calendar_feed_token(token)
+        return token
 
     def _remember_note(self, message: str) -> None:
         timestamped = f"{utc_now()} {message}"

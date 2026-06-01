@@ -76,6 +76,20 @@ class StateStore:
             return None
         return self.config.ics_file.read_bytes()
 
+    def write_calendar_feed_token(self, token: str) -> None:
+        encrypted = self._fernet.encrypt(token.encode("utf-8")).decode("utf-8")
+        self._write_atomic(self.config.calendar_feed_token_file, encrypted)
+        self._set_owner_only_permissions(self.config.calendar_feed_token_file)
+
+    def read_calendar_feed_token(self) -> str | None:
+        if not self.config.calendar_feed_token_file.exists():
+            return None
+        encrypted = self.config.calendar_feed_token_file.read_text(encoding="utf-8")
+        try:
+            return self._fernet.decrypt(encrypted.encode("utf-8")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError("De opgeslagen kalenderfeed-token kon niet worden ontsleuteld.") from exc
+
     def clear_roster_month_exports(self) -> None:
         if not self.config.roster_exports_dir.exists():
             return

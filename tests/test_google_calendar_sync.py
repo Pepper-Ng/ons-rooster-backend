@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ons_backend.calendar_export import build_icalendar
 from ons_backend.google_calendar import GoogleCalendarSyncClient
 
 
@@ -72,6 +73,37 @@ def test_event_key_is_deterministic() -> None:
     assert len(first) == 1
     assert first[0]["_key"] == second[0]["_key"]
     assert first[0]["id"] == second[0]["id"]
+
+
+def test_event_key_ignores_mutable_roster_text() -> None:
+    client = InMemoryCalendarSyncClient()
+    first = client._build_desired_events([_sample_export(title="A1-SOM-2-MA")])
+    changed_title = _sample_export(title="A1-SOM-2-MA GEWIJZIGD")
+    changed_title["items"][0]["description"] = "15:00 23:30 gewijzigde omschrijving"
+    second = client._build_desired_events([changed_title])
+
+    assert first[0]["_key"] == second[0]["_key"]
+    assert first[0]["summary"] != second[0]["summary"]
+
+
+def test_window_uses_export_month_in_local_timezone() -> None:
+    client = InMemoryCalendarSyncClient()
+    export = _sample_export()
+
+    assert client._determine_window([export], client._build_desired_events([export])) == (
+        "2026-05-31T22:00:00Z",
+        "2026-06-30T22:00:00Z",
+    )
+
+
+def test_icalendar_uses_same_planned_month_exports() -> None:
+    payload = build_icalendar([_sample_export()], timezone_name="Europe/Amsterdam").decode("utf-8")
+
+    assert "BEGIN:VCALENDAR" in payload
+    assert "BEGIN:VEVENT" in payload
+    assert "UID:ons-rooster-" in payload
+    assert "SUMMARY:A1-SOM-2-MA" in payload
+    assert "Vaste vrije dag" not in payload
 
 
 def test_sync_exports_creates_updates_and_deletes() -> None:

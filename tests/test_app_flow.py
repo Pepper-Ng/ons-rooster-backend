@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from datetime import date
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -353,6 +354,7 @@ def build_config(tmp_path):
         setup_secret="setup-code",
         debug_token="debug-code",
         admin_token="admin-code",
+        calendar_feed_token="",
         storage_key="",
         fcm_project_id="test-project",
         fcm_service_account_file=None,
@@ -686,6 +688,7 @@ async def test_admin_calendar_sync_uses_persisted_roster_exports(aiohttp_client,
         setup_secret=config.setup_secret,
         debug_token=config.debug_token,
         admin_token=config.admin_token,
+        calendar_feed_token=config.calendar_feed_token,
         storage_key=config.storage_key,
         fcm_project_id=config.fcm_project_id,
         fcm_service_account_file=config.fcm_service_account_file,
@@ -756,6 +759,49 @@ async def test_admin_calendar_sync_uses_persisted_roster_exports(aiohttp_client,
     assert calendar_status["last_summary"]["created"] == 1
     assert calendar_status["last_summary"]["updated"] == 2
     assert calendar_status["last_summary"]["deleted"] == 3
+
+
+@pytest.mark.asyncio
+async def test_ics_feed_requires_secret_token(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+    service.store.write_ics(b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    client = await aiohttp_client(app)
+
+    public_response = await client.get("/rooster.ics")
+    assert public_response.status == 401
+
+    wrong_response = await client.get("/rooster.ics?token=wrong")
+    assert wrong_response.status == 401
+
+    feed_path = urlparse(service.calendar_feed_url()).path
+    feed_response = await client.get(feed_path)
+    assert feed_response.status == 200
+    assert feed_response.headers["Content-Type"].startswith("text/calendar")
+    assert await feed_response.read() == b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n"
+
+    query_url = urlparse(service.calendar_feed_query_url())
+    query_response = await client.get(f"{query_url.path}?{query_url.query}")
+    assert query_response.status == 200
+
+
+@pytest.mark.asyncio
+async def test_admin_can_rotate_ics_feed_token(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+    service.store.write_ics(b"BEGIN:VCALENDAR\r\nEND:VCALENDAR\r\n")
+    client = await aiohttp_client(app)
+
+    old_path = urlparse(service.calendar_feed_url()).path
+    rotate_response = await client.post("/api/v1/admin/calendar/feed-token/rotate?token=admin-code")
+    assert rotate_response.status == 200
+    rotate_payload = await rotate_response.json()
+    new_path = urlparse(rotate_payload["calendar_feed_url"]).path
+    assert new_path != old_path
+
+    old_response = await client.get(old_path)
+    assert old_response.status == 401
+
+    new_response = await client.get(new_path)
+    assert new_response.status == 200
 
 
 @pytest.mark.asyncio
@@ -1730,6 +1776,7 @@ async def test_install_page_uploads_encrypted_firebase_key(aiohttp_client, tmp_p
         setup_secret=config.setup_secret,
         debug_token=config.debug_token,
         admin_token=config.admin_token,
+        calendar_feed_token=config.calendar_feed_token,
         storage_key=config.storage_key,
         fcm_project_id="",
         fcm_service_account_file=None,

@@ -46,6 +46,7 @@ def create_app(
 
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/calendar/{token}/rooster.ics", handle_ics)
     app.router.add_get("/rooster.ics", handle_ics)
     app.router.add_get("/debug", handle_debug)
     app.router.add_get("/install", handle_install_page)
@@ -89,6 +90,7 @@ def create_app(
     app.router.add_post("/api/v1/admin/sync", handle_admin_sync_state)
     app.router.add_post("/api/v1/admin/refresh", handle_refresh)
     app.router.add_post("/api/v1/admin/calendar/sync", handle_admin_calendar_sync)
+    app.router.add_post("/api/v1/admin/calendar/feed-token/rotate", handle_admin_calendar_feed_token_rotate)
     app.router.add_get("/api/v1/admin/fcm", handle_admin_fcm_status)
     app.router.add_post("/api/v1/admin/fcm/test", handle_admin_fcm_test)
 
@@ -127,13 +129,24 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_ics(request: web.Request) -> web.Response:
-    payload = await _service(request.app).ics_payload()
+    service = _service(request.app)
+    token = request.match_info.get("token") or request.query.get("token")
+    if not service.calendar_feed_token_is_valid(token):
+        raise web.HTTPUnauthorized(text="Ongeldige kalenderfeed-token.")
+
+    payload = await service.ics_payload()
     if payload is None:
         return web.Response(status=404, text="Er is nog geen roosterbestand beschikbaar.")
     return web.Response(
         body=payload,
         content_type="text/calendar",
-        headers={"Content-Disposition": 'attachment; filename="rooster.ics"'},
+        headers={
+            "Content-Disposition": 'inline; filename="rooster.ics"',
+            "Cache-Control": "private, no-cache, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
     )
 
 
@@ -777,6 +790,22 @@ async def handle_admin_calendar_sync(request: web.Request) -> web.Response:
     )
 
 
+async def handle_admin_calendar_feed_token_rotate(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    service = _service(request.app)
+    try:
+        feed_url = await service.rotate_calendar_feed_token()
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response(
+        {
+            "message": "De geheime ICS-feed URL is vernieuwd. Werk bestaande agenda-abonnementen bij met de nieuwe URL.",
+            "calendar_feed_url": feed_url,
+            "status": service.operator_status_payload(),
+        }
+    )
+
+
 async def handle_admin_sync_state(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     payload = await _read_request_payload(request)
@@ -1143,6 +1172,23 @@ def _render_status_page(
         for item in status_payload["sync"].get("roster_month_exports", [])
     )
 
+    calendar_feed = status_payload.get("calendar_feed", {})
+    calendar_status = status_payload["sync"].get("calendar", {})
+    calendar_summary = calendar_status.get("last_summary", {}) or {}
+    calendar_summary_text = (
+        "-"
+        if not calendar_summary
+        else ", ".join(
+            f"{key}: {value}"
+            for key, value in calendar_summary.items()
+        )
+    )
+    calendar_feed_url = str(calendar_feed.get("url", ""))
+    calendar_feed_ready = "Ja" if calendar_feed.get("has_payload") else "Nog geen roosterbestand"
+    calendar_token_button_disabled = " disabled" if calendar_feed.get("token_env_managed") else ""
+    google_calendar_state = "Ingeschakeld" if calendar_status.get("enabled") else "Uitgeschakeld"
+    google_calendar_configured = "Ja" if calendar_status.get("configured") else "Nee"
+
     selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
     initial_snapshot_json = json.dumps(status_snapshot, ensure_ascii=True).replace("</", "<\\/")
     if not config.admin_token:
@@ -1225,6 +1271,13 @@ def _render_status_page(
         .challenge-note {{ margin: 0; color: #475569; }}
         .credential-export-form {{ display: grid; gap: 0.85rem; max-width: 42rem; }}
         .field-help {{ margin: 0; color: #475569; }}
+        .calendar-grid {{ display: grid; grid-template-columns: minmax(280px, 1.4fr) minmax(240px, 1fr); gap: 1rem; align-items: start; }}
+        .calendar-url-row {{ display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }}
+        .calendar-url-row input {{ flex: 1 1 28rem; min-width: 16rem; font-family: Consolas, "Courier New", monospace; }}
+        .calendar-status-list {{ display: grid; gap: 0.45rem; margin: 0; }}
+        .calendar-status-list div {{ display: grid; grid-template-columns: 11rem 1fr; gap: 0.75rem; }}
+        .calendar-status-list dt {{ font-weight: 700; color: #0f172a; }}
+        .calendar-status-list dd {{ margin: 0; word-break: break-word; }}
         .console-shell {{ background: #0f172a; color: #e2e8f0; border-radius: 16px; padding: 1rem; font: 0.92rem/1.55 Consolas, "Courier New", monospace; max-height: 420px; overflow: auto; margin-bottom: 1rem; }}
         .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
         .console-line:last-child {{ border-bottom: 0; }}
@@ -1241,7 +1294,7 @@ def _render_status_page(
         .trace-tijd {{ white-space: normal; }}
         .trace-tijd .t-date {{ display: block; font-size: 0.85rem; }}
         .trace-tijd .t-time {{ display: block; font-size: 0.85rem; color: #64748b; }}
-        @media (max-width: 900px) {{ .portal-manager {{ grid-template-columns: 1fr; }} }}
+        @media (max-width: 900px) {{ .portal-manager, .calendar-grid {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
 </head>
@@ -1320,6 +1373,32 @@ def _render_status_page(
         </table>
     </section>
     <section>
+        <h2>Kalenderkoppelingen</h2>
+        <div class="calendar-grid">
+            <div>
+                <p class="section-note">Gebruik deze geheime ICS-URL voor iPhone, Android, Outlook of een browser. Iedereen met de URL kan het rooster lezen; vernieuw de URL als hij gedeeld of gelekt is.</p>
+                <div class="calendar-url-row">
+                    <input id="calendar-feed-url" type="text" readonly value="{html.escape(calendar_feed_url)}">
+                    <button type="button" id="btn-copy-calendar-feed">Kopieer</button>
+                    <button type="button" id="btn-rotate-calendar-feed" class="danger"{calendar_token_button_disabled}>Vernieuw URL</button>
+                </div>
+                <p class="field-help" id="calendar-feed-ready">ICS-status: {html.escape(calendar_feed_ready)}</p>
+            </div>
+            <div>
+                <dl class="calendar-status-list" id="calendar-status-list">
+                    <div><dt>Google Calendar</dt><dd>{html.escape(google_calendar_state)}</dd></div>
+                    <div><dt>Geconfigureerd</dt><dd>{html.escape(google_calendar_configured)}</dd></div>
+                    <div><dt>Calendar-ID</dt><dd>{html.escape(str(calendar_status.get('calendar_id') or '-'))}</dd></div>
+                    <div><dt>Laatste poging</dt><dd>{html.escape(str(calendar_status.get('last_attempt_at') or '-'))}</dd></div>
+                    <div><dt>Laatste succes</dt><dd>{html.escape(str(calendar_status.get('last_success_at') or '-'))}</dd></div>
+                    <div><dt>Laatste fout</dt><dd>{html.escape(str(calendar_status.get('last_error') or '-'))}</dd></div>
+                    <div><dt>Laatste diff</dt><dd>{html.escape(calendar_summary_text)}</dd></div>
+                </dl>
+                <div class="actions"><button type="button" id="btn-calendar-sync">Google Calendar opnieuw syncen</button></div>
+            </div>
+        </div>
+    </section>
+    <section>
         <h2>Portalen beheren</h2>
         <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
         <div class="portal-manager">
@@ -1374,6 +1453,10 @@ def _render_status_page(
         const authTraceBody = document.getElementById('auth-trace-body');
         const postOtpScreenshotLink = document.getElementById('post-otp-screenshot-link');
         const rosterExportBody = document.getElementById('roster-export-body');
+        const calendarFeedUrlInput = document.getElementById('calendar-feed-url');
+        const calendarFeedReady = document.getElementById('calendar-feed-ready');
+        const calendarStatusList = document.getElementById('calendar-status-list');
+        const rotateCalendarFeedButton = document.getElementById('btn-rotate-calendar-feed');
         const portalForm = document.getElementById('portal-form');
         const portalFormHeading = document.getElementById('portal-form-heading');
         const portalIdInput = document.getElementById('portal_id');
@@ -1597,6 +1680,26 @@ def _render_status_page(
                 </tr>`).join('');
         }}
 
+        function renderCalendar(snapshot) {{
+            const feed = snapshot.status.calendar_feed || {{}};
+            const calendar = snapshot.status.sync.calendar || {{}};
+            const summary = calendar.last_summary || {{}};
+            const summaryText = Object.keys(summary).length
+                ? Object.entries(summary).map(([key, value]) => `${{key}}: ${{value}}`).join(', ')
+                : '-';
+            calendarFeedUrlInput.value = feed.url || '';
+            calendarFeedReady.textContent = `ICS-status: ${{feed.has_payload ? 'Ja' : 'Nog geen roosterbestand'}}`;
+            rotateCalendarFeedButton.disabled = Boolean(feed.token_env_managed);
+            calendarStatusList.innerHTML = `
+                <div><dt>Google Calendar</dt><dd>${{calendar.enabled ? 'Ingeschakeld' : 'Uitgeschakeld'}}</dd></div>
+                <div><dt>Geconfigureerd</dt><dd>${{calendar.configured ? 'Ja' : 'Nee'}}</dd></div>
+                <div><dt>Calendar-ID</dt><dd>${{escapeHtml(calendar.calendar_id || '-')}}</dd></div>
+                <div><dt>Laatste poging</dt><dd>${{escapeHtml(formatTimestamp(calendar.last_attempt_at))}}</dd></div>
+                <div><dt>Laatste succes</dt><dd>${{escapeHtml(formatTimestamp(calendar.last_success_at))}}</dd></div>
+                <div><dt>Laatste fout</dt><dd>${{escapeHtml(calendar.last_error || '-')}}</dd></div>
+                <div><dt>Laatste diff</dt><dd>${{escapeHtml(summaryText)}}</dd></div>`;
+        }}
+
         function render(snapshot) {{
             statusSnapshot = snapshot;
             renderOverview(snapshot);
@@ -1604,6 +1707,7 @@ def _render_status_page(
             renderChallenge(snapshot);
             renderAuthTrace(snapshot);
             renderRosterExports(snapshot);
+            renderCalendar(snapshot);
             renderPortals(snapshot);
             syncPortalForm(snapshot);
             updateSyncControls(snapshot);
@@ -1717,6 +1821,40 @@ def _render_status_page(
                 const response = await callJson('/api/v1/admin/challenges/mock-sms', {{ method: 'POST' }});
                 applyStatusPayload(response);
                 setFlash('ok', response.message || 'Mock OTP ingestuurd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-copy-calendar-feed').addEventListener('click', async () => {{
+            try {{
+                await navigator.clipboard.writeText(calendarFeedUrlInput.value);
+                setFlash('ok', 'ICS-URL is gekopieerd.');
+            }} catch (_error) {{
+                calendarFeedUrlInput.focus();
+                calendarFeedUrlInput.select();
+                setFlash('ok', 'ICS-URL is geselecteerd.');
+            }}
+        }});
+
+        rotateCalendarFeedButton.addEventListener('click', async () => {{
+            if (!window.confirm('Bestaande agenda-abonnementen stoppen met updaten totdat je de nieuwe URL invult. Doorgaan?')) {{
+                return;
+            }}
+            try {{
+                const response = await callJson('/api/v1/admin/calendar/feed-token/rotate', {{ method: 'POST' }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || 'ICS-feed URL vernieuwd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-calendar-sync').addEventListener('click', async () => {{
+            try {{
+                const response = await callJson('/api/v1/admin/calendar/sync', {{ method: 'POST' }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || 'Google Calendar synchronisatie uitgevoerd.');
             }} catch (error) {{
                 setFlash('error', error.message);
             }}

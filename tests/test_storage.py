@@ -24,6 +24,7 @@ def build_config(tmp_path):
         setup_secret="",
         debug_token="",
         admin_token="",
+        calendar_feed_token="",
         storage_key="",
         fcm_project_id="",
         fcm_service_account_file=None,
@@ -120,6 +121,16 @@ def test_state_store_persists_snapshot_and_ics(tmp_path):
     assert config.snapshot_file.read_text(encoding="utf-8") == "<html>snapshot</html>"
     assert store.read_ics() == b"BEGIN:VCALENDAR\nEND:VCALENDAR\n"
     assert not config.state_file.exists()
+
+
+def test_state_store_encrypts_calendar_feed_token(tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+
+    store.write_calendar_feed_token("secret-feed-token")
+
+    assert "secret-feed-token" not in config.calendar_feed_token_file.read_text(encoding="utf-8")
+    assert store.read_calendar_feed_token() == "secret-feed-token"
 
 
 def test_state_store_persists_multiple_devices(tmp_path):
