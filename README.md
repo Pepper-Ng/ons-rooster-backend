@@ -97,6 +97,13 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
 | `POST_LOGIN_URL` | Optional URL to open immediately after login. |
 | `ROSTER_URL` | Optional explicit roster page URL. |
+| `GOOGLE_CALENDAR_SYNC_ENABLED` | Enable Google Calendar reconciliation after successful roster export. |
+| `GOOGLE_CALENDAR_ID` | Target Google Calendar ID (recommended: dedicated calendar). |
+| `GOOGLE_CALENDAR_TIMEZONE` | Timezone used for event start and end values. |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to a Google service-account JSON with calendar scope access. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Raw Google service-account JSON as env var (fallback). |
+| `GOOGLE_CALENDAR_DRY_RUN` | When true, only compute diff counts without writing calendar changes. |
+| `GOOGLE_CALENDAR_FAIL_ON_ERROR` | When true, fail the backend sync when calendar push fails. |
 
 The current Land van Horne default is:
 
@@ -173,6 +180,29 @@ curl -X POST \
 
 If the app is paired and FCM is configured correctly, the phone should receive the same lightweight notification path the backend uses after a successful login.
 
+### Google Calendar sync setup
+
+The backend can reconcile roster exports directly into Google Calendar.
+
+Recommended setup:
+
+1. Create a dedicated Google Calendar for roster data.
+2. Create a Google Cloud service account and download the JSON key.
+3. Enable Google Calendar API in that Google Cloud project.
+4. Share the target calendar with the service-account email and grant write access.
+5. Configure these env vars in the stack:
+      - `GOOGLE_CALENDAR_SYNC_ENABLED=true`
+      - `GOOGLE_CALENDAR_ID=<calendar-id>`
+      - `GOOGLE_CALENDAR_TIMEZONE=Europe/Amsterdam`
+      - `GOOGLE_SERVICE_ACCOUNT_FILE=<mounted-path>` or `GOOGLE_SERVICE_ACCOUNT_JSON=<json>`
+
+Sync semantics in the current implementation:
+
+- only `planned_hours` entries are pushed
+- current and next month exports are used
+- missing managed events are deleted
+- unchanged events are left untouched (idempotent reruns)
+
 ## Operator status page
 
 The operator page is available at `/status`.
@@ -248,6 +278,7 @@ The app does not persist the ONS password locally after submission. The backend 
 | `POST /api/v1/mobile/tokens/fcm` | Android FCM token refresh endpoint. |
 | `POST /api/v1/mobile/challenges/{id}/sms-code` | Android callback endpoint for a 2FA code. |
 | `POST /api/v1/admin/refresh` | Optional authenticated manual refresh trigger. |
+| `POST /api/v1/admin/calendar/sync` | Re-run Google Calendar reconciliation from stored month exports. |
 
 ## Debug page
 

@@ -148,6 +148,11 @@ class SyncState:
     auth_trace_run_id: str | None = None
     auth_trace: list[dict[str, Any]] = field(default_factory=list)
     debug_screenshots: bool = True
+    calendar_last_attempt_at: str | None = None
+    calendar_last_success_at: str | None = None
+    calendar_last_failure_at: str | None = None
+    calendar_last_error: str | None = None
+    calendar_last_summary: dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -175,6 +180,11 @@ class SyncState:
             "auth_trace_run_id": self.auth_trace_run_id,
             "auth_trace": list(self.auth_trace),
             "debug_screenshots": self.debug_screenshots,
+            "calendar_last_attempt_at": self.calendar_last_attempt_at,
+            "calendar_last_success_at": self.calendar_last_success_at,
+            "calendar_last_failure_at": self.calendar_last_failure_at,
+            "calendar_last_error": self.calendar_last_error,
+            "calendar_last_summary": dict(self.calendar_last_summary),
         }
 
     @classmethod
@@ -204,6 +214,11 @@ class SyncState:
             auth_trace_run_id=data.get("auth_trace_run_id"),
             auth_trace=list(data.get("auth_trace", [])),
             debug_screenshots=bool(data.get("debug_screenshots", True)),
+            calendar_last_attempt_at=data.get("calendar_last_attempt_at"),
+            calendar_last_success_at=data.get("calendar_last_success_at"),
+            calendar_last_failure_at=data.get("calendar_last_failure_at"),
+            calendar_last_error=data.get("calendar_last_error"),
+            calendar_last_summary=dict(data.get("calendar_last_summary", {})),
         )
 
 

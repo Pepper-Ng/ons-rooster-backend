@@ -88,6 +88,7 @@ def create_app(
     app.router.add_delete("/api/v1/admin/portals/{portal_id}", handle_admin_portal_remove)
     app.router.add_post("/api/v1/admin/sync", handle_admin_sync_state)
     app.router.add_post("/api/v1/admin/refresh", handle_refresh)
+    app.router.add_post("/api/v1/admin/calendar/sync", handle_admin_calendar_sync)
     app.router.add_get("/api/v1/admin/fcm", handle_admin_fcm_status)
     app.router.add_post("/api/v1/admin/fcm/test", handle_admin_fcm_test)
 
@@ -753,6 +754,27 @@ async def handle_refresh(request: web.Request) -> web.Response:
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
     return web.json_response({"message": "De handmatige synchronisatie is gestart.", "status": service.operator_status_payload()})
+
+
+async def handle_admin_calendar_sync(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    service = _service(request.app)
+    try:
+        status = await service.sync_calendar_from_persisted_exports()
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response(
+        {
+            "message": "Google Calendar synchronisatie is uitgevoerd op basis van opgeslagen roosterexports.",
+            "status": {
+                "public_base_url": service.config.public_base_url,
+                "fcm_configured": service.push_client.is_configured(),
+                "status": status,
+                "devices": service.paired_devices_payload(),
+                "portals": service.portal_catalog_payload(),
+            },
+        }
+    )
 
 
 async def handle_admin_sync_state(request: web.Request) -> web.Response:

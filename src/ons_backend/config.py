@@ -41,6 +41,13 @@ class AppConfig:
     playwright_headless: bool
     post_login_url: str
     roster_url: str
+    google_calendar_sync_enabled: bool
+    google_calendar_id: str
+    google_calendar_timezone: str
+    google_calendar_service_account_file: Path | None
+    google_calendar_service_account_json: str
+    google_calendar_dry_run: bool
+    google_calendar_fail_on_error: bool
 
     @property
     def state_file(self) -> Path:
@@ -86,6 +93,7 @@ class AppConfig:
     def from_env(cls) -> "AppConfig":
         data_dir = Path(os.getenv("DATA_DIR", "./data")).resolve()
         fcm_service_account_file = os.getenv("FCM_SERVICE_ACCOUNT_FILE", "").strip()
+        google_calendar_service_account_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
         public_base_url = os.getenv(
             "PUBLIC_BASE_URL",
             "https://onsrooster.stefhermans.nl",
@@ -115,4 +123,15 @@ class AppConfig:
             playwright_headless=_read_bool("PLAYWRIGHT_HEADLESS", True),
             post_login_url=os.getenv("POST_LOGIN_URL", "").strip(),
             roster_url=os.getenv("ROSTER_URL", "").strip(),
+            google_calendar_sync_enabled=_read_bool("GOOGLE_CALENDAR_SYNC_ENABLED", False),
+            google_calendar_id=os.getenv("GOOGLE_CALENDAR_ID", "").strip(),
+            google_calendar_timezone=os.getenv("GOOGLE_CALENDAR_TIMEZONE", "Europe/Amsterdam").strip(),
+            google_calendar_service_account_file=(
+                Path(google_calendar_service_account_file)
+                if google_calendar_service_account_file
+                else None
+            ),
+            google_calendar_service_account_json=os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip(),
+            google_calendar_dry_run=_read_bool("GOOGLE_CALENDAR_DRY_RUN", False),
+            google_calendar_fail_on_error=_read_bool("GOOGLE_CALENDAR_FAIL_ON_ERROR", False),
         )

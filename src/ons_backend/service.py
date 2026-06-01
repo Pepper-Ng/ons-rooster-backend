@@ -11,12 +11,13 @@ import shutil
 import threading
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Protocol
 
 from icalendar import Calendar, Event
 
 from .clients import AutomationClient, FcmPushClient, PushClient
 from .config import AppConfig
+from .google_calendar import CalendarSyncSummary, GoogleCalendarSyncClient
 from .models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, PortalDefinition, RosterItem
 from .storage import StateStore
 
@@ -37,6 +38,14 @@ class PendingChallenge:
     code: str | None = None
 
 
+class CalendarSyncClient(Protocol):
+    def is_configured(self) -> bool:
+        ...
+
+    def sync_exports(self, month_exports: list[dict[str, Any]]) -> CalendarSyncSummary:
+        ...
+
+
 DEFAULT_PORTAL_ID = "land-van-horne"
 DEFAULT_PORTAL_NAME = "Land van Horne"
 DEFAULT_PORTAL_LOGO_URL = "https://aanmelden.ons-diensten.nl/api/images/a2d1a875-feed-4cc0-91d5-149c4f129db8.png"
@@ -50,6 +59,7 @@ class BackendService:
         store: StateStore,
         push_client: PushClient,
         automation_client: AutomationClient,
+        calendar_sync_client: CalendarSyncClient | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -57,6 +67,17 @@ class BackendService:
         self.automation_client = automation_client
         self.state, self.credentials = self.store.load()
         self._ensure_default_portals()
+        self.calendar_sync_client = calendar_sync_client or GoogleCalendarSyncClient(
+            calendar_id=self.config.google_calendar_id,
+            timezone=self.config.google_calendar_timezone,
+            service_account_file=(
+                str(self.config.google_calendar_service_account_file)
+                if self.config.google_calendar_service_account_file
+                else ""
+            ),
+            service_account_json=self.config.google_calendar_service_account_json,
+            dry_run=self.config.google_calendar_dry_run,
+        )
         self._pending_challenges: dict[str, PendingChallenge] = {}
         self._pending_challenges_lock = threading.Lock()
         self._state_lock = asyncio.Lock()
@@ -198,6 +219,12 @@ class BackendService:
 
     def sync_enabled(self) -> bool:
         return self.state.sync.sync_enabled
+
+    def calendar_sync_enabled(self) -> bool:
+        return self.config.google_calendar_sync_enabled
+
+    def calendar_sync_configured(self) -> bool:
+        return self.calendar_sync_client.is_configured()
 
     async def set_sync_enabled(self, enabled: bool) -> str:
         async with self._state_lock:
@@ -393,6 +420,19 @@ class BackendService:
             await self._current_sync_task
         return self.mobile_status_payload()
 
+    async def sync_calendar_from_persisted_exports(self) -> dict[str, Any]:
+        if not self.calendar_sync_enabled():
+            raise RuntimeError("Google Calendar synchronisatie is uitgeschakeld.")
+        if not self.calendar_sync_configured():
+            raise RuntimeError("Google Calendar synchronisatie is niet volledig geconfigureerd.")
+
+        exports = await self._load_persisted_roster_exports()
+        if not exports:
+            raise RuntimeError("Er zijn nog geen roosterexports beschikbaar voor Google Calendar synchronisatie.")
+
+        await self._sync_calendar_exports(exports)
+        return self.mobile_status_payload()
+
     async def send_test_notification(self, message: str, device_id: str | None = None) -> None:
         device = self.active_device() if device_id is None else self.device_by_id(device_id)
         if device is None:
@@ -521,6 +561,18 @@ class BackendService:
                 "auth_trace_run_id": self.state.sync.auth_trace_run_id,
                 "auth_trace": self.auth_trace_payload(),
                 "debug_screenshots": self.state.sync.debug_screenshots,
+                "calendar": {
+                    "enabled": self.calendar_sync_enabled(),
+                    "configured": self.calendar_sync_configured(),
+                    "calendar_id": self.config.google_calendar_id,
+                    "timezone": self.config.google_calendar_timezone,
+                    "dry_run": self.config.google_calendar_dry_run,
+                    "last_attempt_at": self.state.sync.calendar_last_attempt_at,
+                    "last_success_at": self.state.sync.calendar_last_success_at,
+                    "last_failure_at": self.state.sync.calendar_last_failure_at,
+                    "last_error": self.state.sync.calendar_last_error,
+                    "last_summary": dict(self.state.sync.calendar_last_summary),
+                },
             },
         }
 
@@ -901,6 +953,7 @@ class BackendService:
                         "download_path": f"/status/roster/{month_key}.json",
                     }
                 )
+            await self._sync_calendar_exports(result.roster_exports)
         else:
             if result.session_checkpoint is None:
                 raise RuntimeError(
@@ -949,6 +1002,57 @@ class BackendService:
                 True,
                 "De backend is aangemeld en klaar voor synchronisatie.",
             )
+
+    async def _sync_calendar_exports(self, month_exports: list[dict[str, Any]]) -> None:
+        attempt_at = utc_now()
+        async with self._state_lock:
+            self.state.sync.calendar_last_attempt_at = attempt_at
+            self.state.sync.calendar_last_error = None
+            await self._persist_state()
+
+        if not self.calendar_sync_enabled():
+            async with self._state_lock:
+                self.state.sync.calendar_last_summary = {}
+                await self._persist_state()
+            return
+
+        if not self.calendar_sync_configured():
+            message = "Google Calendar synchronisatie is niet volledig geconfigureerd."
+            async with self._state_lock:
+                self.state.sync.calendar_last_failure_at = utc_now()
+                self.state.sync.calendar_last_error = message
+                await self._persist_state()
+            if self.config.google_calendar_fail_on_error:
+                raise RuntimeError(message)
+            return
+
+        try:
+            summary = await asyncio.to_thread(self.calendar_sync_client.sync_exports, month_exports)
+        except Exception as exc:
+            async with self._state_lock:
+                self.state.sync.calendar_last_failure_at = utc_now()
+                self.state.sync.calendar_last_error = str(exc)
+                await self._persist_state()
+            if self.config.google_calendar_fail_on_error:
+                raise RuntimeError(str(exc)) from exc
+            return
+
+        async with self._state_lock:
+            self.state.sync.calendar_last_success_at = utc_now()
+            self.state.sync.calendar_last_error = None
+            self.state.sync.calendar_last_summary = summary.to_dict()
+            await self._persist_state()
+
+    async def _load_persisted_roster_exports(self) -> list[dict[str, Any]]:
+        exports: list[dict[str, Any]] = []
+        for summary in self.state.sync.roster_month_exports:
+            month_key = str(summary.get("month", "")).strip()
+            if not month_key:
+                continue
+            export_payload = await asyncio.to_thread(self.store.read_roster_month_export, month_key)
+            if export_payload is not None:
+                exports.append(export_payload)
+        return exports
 
     async def _finalize_failure(self, exc: Exception) -> None:
         log.exception("Backend sync failed.", exc_info=exc)

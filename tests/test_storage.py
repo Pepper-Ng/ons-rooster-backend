@@ -31,6 +31,13 @@ def build_config(tmp_path):
         playwright_headless=True,
         post_login_url="",
         roster_url="",
+        google_calendar_sync_enabled=False,
+        google_calendar_id="",
+        google_calendar_timezone="Europe/Amsterdam",
+        google_calendar_service_account_file=None,
+        google_calendar_service_account_json="",
+        google_calendar_dry_run=False,
+        google_calendar_fail_on_error=False,
     )
 
 

@@ -12,6 +12,7 @@ from aiohttp import FormData
 from ons_backend.app import create_app
 from ons_backend.clients import FcmPushClient, HttpLoginAutomationClient
 from ons_backend.config import AppConfig
+from ons_backend.google_calendar import CalendarSyncSummary
 from ons_backend.models import AuthenticationResult, LoginCredentials, RosterItem
 from ons_backend.service import BackendService
 from ons_backend.storage import StateStore
@@ -32,6 +33,25 @@ class FakePushClient:
     async def send_auth_result(self, device, success: bool, message: str) -> None:
         self.auth_targets.append(device.device_id)
         self.auth_notifications.append((success, message))
+
+
+class FakeCalendarSyncClient:
+    def __init__(self) -> None:
+        self.synced_exports: list[list[dict]] = []
+
+    def is_configured(self) -> bool:
+        return True
+
+    def sync_exports(self, month_exports: list[dict]) -> CalendarSyncSummary:
+        self.synced_exports.append(month_exports)
+        return CalendarSyncSummary(
+            created=1,
+            updated=2,
+            deleted=3,
+            unchanged=4,
+            desired=5,
+            existing=6,
+        )
 
 
 class FakeAutomationClient:
@@ -347,6 +367,13 @@ def build_config(tmp_path):
         playwright_headless=True,
         post_login_url="",
         roster_url="",
+        google_calendar_sync_enabled=False,
+        google_calendar_id="",
+        google_calendar_timezone="Europe/Amsterdam",
+        google_calendar_service_account_file=None,
+        google_calendar_service_account_json="",
+        google_calendar_dry_run=False,
+        google_calendar_fail_on_error=False,
     )
 
 
@@ -640,6 +667,95 @@ async def test_admin_device_actions_return_updated_status_snapshot(aiohttp_clien
     remove_payload = await remove_response.json()
     assert remove_payload["device_id"] == second_device_id
     assert [item["device_id"] for item in remove_payload["status"]["devices"]] == [first_device_id]
+
+
+@pytest.mark.asyncio
+async def test_admin_calendar_sync_uses_persisted_roster_exports(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    config = AppConfig(
+        host=config.host,
+        port=config.port,
+        public_base_url=config.public_base_url,
+        data_dir=config.data_dir,
+        log_level=config.log_level,
+        timezone=config.timezone,
+        default_login_url=config.default_login_url,
+        sync_interval_minutes=config.sync_interval_minutes,
+        sms_timeout_seconds=config.sms_timeout_seconds,
+        login_timeout_seconds=config.login_timeout_seconds,
+        setup_secret=config.setup_secret,
+        debug_token=config.debug_token,
+        admin_token=config.admin_token,
+        storage_key=config.storage_key,
+        fcm_project_id=config.fcm_project_id,
+        fcm_service_account_file=config.fcm_service_account_file,
+        fcm_service_account_json=config.fcm_service_account_json,
+        playwright_headless=config.playwright_headless,
+        post_login_url=config.post_login_url,
+        roster_url=config.roster_url,
+        google_calendar_sync_enabled=True,
+        google_calendar_id="calendar-id@example.com",
+        google_calendar_timezone="Europe/Amsterdam",
+        google_calendar_service_account_file=None,
+        google_calendar_service_account_json="",
+        google_calendar_dry_run=False,
+        google_calendar_fail_on_error=False,
+    )
+    store = StateStore(config)
+    fake_calendar = FakeCalendarSyncClient()
+    service = BackendService(
+        config=config,
+        store=store,
+        push_client=FakePushClient(),
+        automation_client=CountingAutomationClient(),
+        calendar_sync_client=fake_calendar,
+    )
+
+    export_payload = {
+        "format": "ons-rooster-month-export",
+        "version": 1,
+        "month": "2026-06",
+        "source_url": "https://example.invalid/roster/2026-06",
+        "page_title": "Rooster",
+        "notice": "",
+        "items": [
+            {
+                "date": "2026-06-01",
+                "start": "15:00",
+                "end": "23:30",
+                "title": "A1-SOM-2-MA",
+                "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+                "category": "planned_hours",
+                "is_planned_hours": True,
+                "classes": ["roster_slot", "shiftassignment"],
+            }
+        ],
+    }
+    store.write_roster_month_export("2026-06", export_payload)
+    service.state.sync.roster_month_exports = [
+        {
+            "month": "2026-06",
+            "item_count": 1,
+            "planned_hours_count": 1,
+            "notice": "",
+            "download_path": "/status/roster/2026-06.json",
+        }
+    ]
+
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post("/api/v1/admin/calendar/sync?token=admin-code")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["message"].startswith("Google Calendar synchronisatie")
+    assert len(fake_calendar.synced_exports) == 1
+    assert fake_calendar.synced_exports[0][0]["month"] == "2026-06"
+
+    calendar_status = payload["status"]["status"]["sync"]["calendar"]
+    assert calendar_status["last_summary"]["created"] == 1
+    assert calendar_status["last_summary"]["updated"] == 2
+    assert calendar_status["last_summary"]["deleted"] == 3
 
 
 @pytest.mark.asyncio
@@ -1621,6 +1737,13 @@ async def test_install_page_uploads_encrypted_firebase_key(aiohttp_client, tmp_p
         playwright_headless=config.playwright_headless,
         post_login_url=config.post_login_url,
         roster_url=config.roster_url,
+        google_calendar_sync_enabled=config.google_calendar_sync_enabled,
+        google_calendar_id=config.google_calendar_id,
+        google_calendar_timezone=config.google_calendar_timezone,
+        google_calendar_service_account_file=config.google_calendar_service_account_file,
+        google_calendar_service_account_json=config.google_calendar_service_account_json,
+        google_calendar_dry_run=config.google_calendar_dry_run,
+        google_calendar_fail_on_error=config.google_calendar_fail_on_error,
     )
     service = BackendService(
         config=config,
