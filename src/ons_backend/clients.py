@@ -1068,8 +1068,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
 
                 await self._wait_for_sso_destination(page, config.login_timeout_seconds)
 
-                html = await page.content()
-                page_title = await page.title()
+                html, page_title = await self._read_stable_page(page)
                 proof_selection = self._extract_microsoft_proof_selection(page.url, html)
                 if proof_selection is not None:
                     if continue_after_proof_selection:
@@ -1221,8 +1220,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                         page=page,
                     )
 
-                html = await page.content()
-                page_title = await page.title()
+                html, page_title = await self._read_stable_page(page)
                 await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
                 roster_items, extraction_notes = self._extract_roster_items(html)
                 debug_notes.extend(extraction_notes)
@@ -1252,10 +1250,14 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 current_url = provider_url
                 screenshot_name = ""
                 if page is not None:
-                    html = await page.content()
-                    page_title = await page.title()
+                    try:
+                        html, page_title = await self._read_stable_page(page, timeout_seconds=3)
+                    except Exception:
+                        html = ""
+                        page_title = ""
                     current_url = page.url
-                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    if html:
+                        await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
                     if getattr(self, "_debug_screenshots", False):
                         screenshot_name = await self._write_trace_screenshot(
                             config.auth_trace_dir,
@@ -1419,8 +1421,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         login_url = credentials.login_url or config.default_login_url
         current_url = str(session_checkpoint.get("current_url", "")).strip() or login_url
         stored_cookies = session_checkpoint.get("cookies", [])
-        sms_relay_task: asyncio.Task[str] | None = None
-        sms_challenge_id = ""
 
         async with async_playwright() as playwright:
             browser = None
@@ -1444,7 +1444,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                     page=page,
                 )
 
-                html = await page.content()
+                html, _ = await self._read_stable_page(page)
                 proof_selection = self._extract_microsoft_proof_selection(page.url, html)
                 if proof_selection is None:
                     raise RuntimeError(
@@ -1469,13 +1469,13 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 raise
             except Exception as exc:
                 html = ""
-                page_title = ""
-                page_url = current_url
                 if page is not None:
-                    html = await page.content()
-                    page_title = await page.title()
-                    page_url = page.url
-                    await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+                    try:
+                        html, _ = await self._read_stable_page(page, timeout_seconds=3)
+                    except Exception:
+                        html = ""
+                    if html:
+                        await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
                 raise RuntimeError(
                     "De backend kon de Microsoft SSO-vervolgstap niet afronden. "
                     f"Laatste pagina: {self._text_snippet(html) if html else str(exc)}"
@@ -1544,7 +1544,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             # before the SMS is triggered.
             if request_sms_code is None:
                 raise RuntimeError("De backend mist de callback om de SMS-code op te vragen.")
-            sms_relay_task = asyncio.create_task(request_sms_code())
+            sms_relay_task = asyncio.ensure_future(request_sms_code())
             await asyncio.sleep(2)
             self._record_event(
                 report_progress,
@@ -1626,6 +1626,9 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             except Exception as _se:
                 debug_notes.append(f"Could not save post-OTP error screenshot: {_se}")
             raise
+        html, page_title = await self._stabilize_post_otp_page(page, debug_notes=debug_notes)
+        await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
+        debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
         trace_index = await self._record_playwright_page_step(
             report_progress,
             config=config,
@@ -1636,9 +1639,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             phase="post_otp_redirected",
             page=page,
         )
-        html, page_title = await self._stabilize_post_otp_page(page, debug_notes=debug_notes)
-        await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
-        debug_notes.append(f"Submitted the SMS OTP and reached {page.url}.")
         screenshot_path: str | None = None
         try:
             screenshot_path = str(config.post_otp_screenshot_file)
@@ -1679,8 +1679,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         last_error: Exception | None = None
         while asyncio.get_running_loop().time() < deadline:
             try:
-                html = await page.content()
-                page_title = await page.title()
+                html, page_title = await self._read_stable_page(page, timeout_seconds=2)
             except Exception as exc:
                 last_error = exc
                 await page.wait_for_timeout(250)
@@ -1694,6 +1693,43 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 continue
 
             return html, page_title
+
+        if last_error is not None:
+            raise last_error
+        return await self._read_stable_page(page, timeout_seconds=2)
+
+    async def _read_stable_page(
+        self,
+        page,
+        *,
+        timeout_seconds: float = 10,
+        settle_delay_ms: int = 250,
+    ) -> tuple[str, str]:
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_error: Exception | None = None
+        while True:
+            remaining_seconds = deadline - asyncio.get_running_loop().time()
+            if remaining_seconds <= 0:
+                break
+
+            load_timeout_ms = max(1, min(1_000, int(remaining_seconds * 1_000)))
+            for state in ("domcontentloaded", "load"):
+                try:
+                    await page.wait_for_load_state(state, timeout=load_timeout_ms)
+                except Exception:
+                    # Some ONS pages are long-lived SPAs; load-state waits are only a readiness hint.
+                    pass
+
+            if settle_delay_ms > 0:
+                await page.wait_for_timeout(settle_delay_ms)
+
+            try:
+                html = await page.content()
+                page_title = await page.title()
+                return html, page_title
+            except Exception as exc:
+                last_error = exc
+                await page.wait_for_timeout(250)
 
         if last_error is not None:
             raise last_error
@@ -1968,7 +2004,8 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 except Exception as exc:
                     snippet = ""
                     try:
-                        snippet = self._text_snippet(await page.content())
+                        failed_html, _ = await self._read_stable_page(page, timeout_seconds=2)
+                        snippet = self._text_snippet(failed_html)
                     except Exception:
                         snippet = ""
                     raise RuntimeError(
@@ -1979,8 +2016,8 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             try:
                 await page.wait_for_selector("table.month-roster#grid-table", timeout=30_000)
             except Exception:
-                debug_notes.append(f"grid-table selector not found within 30s for {month_key}; capturing page.content() anyway.")
-            html = await page.content()
+                debug_notes.append(f"grid-table selector not found within 30s for {month_key}; capturing a stable page snapshot anyway.")
+            html, page_title = await self._read_stable_page(page)
             if self._looks_like_external_sso_host(page.url) or self._response_still_looks_like_login(
                 page.url,
                 html,
@@ -2001,7 +2038,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 page=page,
             )
 
-            page_title = await page.title()
             export_payload, month_items, extraction_notes, publication_stop = self._extract_month_roster_export(
                 html,
                 month_start=month_start,
@@ -2017,10 +2053,11 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         if not exports:
             raise RuntimeError("De backend kon geen roostermaanden ophalen na OTP-verificatie.")
 
-        await asyncio.to_thread(snapshot_path.write_text, await page.content(), encoding="utf-8")
+        final_html, final_title = await self._read_stable_page(page)
+        await asyncio.to_thread(snapshot_path.write_text, final_html, encoding="utf-8")
         return AuthenticationResult(
             final_url=page.url,
-            page_title=await page.title(),
+            page_title=final_title,
             roster_items=roster_items,
             debug_notes=debug_notes,
             auth_ready=True,
@@ -2330,7 +2367,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         phase: str,
         page,
     ) -> int:
-        html = await page.content()
+        html, page_title = await self._read_stable_page(page)
         await asyncio.to_thread(snapshot_path.write_text, html, encoding="utf-8")
         screenshot_name = ""
         if getattr(self, "_debug_screenshots", False):
@@ -2342,7 +2379,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             message=message,
             phase=phase,
             url=page.url,
-            page_title=await page.title(),
+            page_title=page_title,
             snapshot_name=self._write_trace_snapshot(config.auth_trace_dir, trace_index, label, html),
             screenshot_name=screenshot_name,
         )

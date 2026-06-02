@@ -1027,6 +1027,7 @@ async def test_http_login_automation_client_stabilizes_post_otp_meta_refresh():
             def __init__(self) -> None:
                 self.url = "https://landvanhorne.startmetons.nl/sso"
                 self.goto_calls: list[str] = []
+                self.content_calls = 0
                 self._html = (
                     '<html><head><meta http-equiv="refresh" '
                     'content="0;url=https://landvanhorne.mijnio.nl?hub_ticket=abc123"></head><body></body></html>'
@@ -1034,6 +1035,11 @@ async def test_http_login_automation_client_stabilizes_post_otp_meta_refresh():
                 self._title = "Aanmelden bij uw account"
 
             async def content(self):
+                self.content_calls += 1
+                if self.content_calls == 1:
+                    raise RuntimeError(
+                        "Page.content: Unable to retrieve content because the page is navigating and changing the content."
+                    )
                 return self._html
 
             async def title(self):
@@ -1058,9 +1064,69 @@ async def test_http_login_automation_client_stabilizes_post_otp_meta_refresh():
         )
 
         assert fake_page.goto_calls == ["https://landvanhorne.mijnio.nl?hub_ticket=abc123"]
+        assert fake_page.content_calls >= 3
         assert "Following post-OTP meta refresh to https://landvanhorne.mijnio.nl?hub_ticket=abc123." in debug_notes
         assert "Welkom" in html
         assert page_title == "Rooster"
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_retries_trace_snapshot_during_navigation(tmp_path):
+        automation_client = HttpLoginAutomationClient()
+        config = build_config(tmp_path)
+        snapshot_path = tmp_path / "last-auth.html"
+        recorded_events: list[dict[str, object]] = []
+
+        class FakePage:
+            def __init__(self) -> None:
+                self.url = "https://landvanhorne.mijnio.nl/dashboard"
+                self.content_calls = 0
+                self.load_state_calls: list[str] = []
+                self.timeout_calls: list[int] = []
+
+            async def wait_for_load_state(self, state, timeout):
+                del timeout
+                self.load_state_calls.append(state)
+
+            async def wait_for_timeout(self, timeout_ms):
+                self.timeout_calls.append(timeout_ms)
+
+            async def content(self):
+                self.content_calls += 1
+                if self.content_calls == 1:
+                    raise RuntimeError(
+                        "Page.content: Unable to retrieve content because the page is navigating and changing the content."
+                    )
+                return "<html><head><title>Dashboard</title></head><body>Welkom</body></html>"
+
+            async def title(self):
+                return "Dashboard"
+
+        def report_progress(event: dict[str, object]) -> None:
+            recorded_events.append(event)
+
+        fake_page = FakePage()
+
+        next_trace_index = await automation_client._record_playwright_page_step(
+            report_progress,
+            config=config,
+            snapshot_path=snapshot_path,
+            trace_index=7,
+            label="Post-login landing page",
+            message="Post-login landing page reached.",
+            phase="post_login_landing",
+            page=fake_page,
+        )
+
+        assert next_trace_index == 8
+        assert fake_page.content_calls == 2
+        assert fake_page.load_state_calls == ["domcontentloaded", "load", "domcontentloaded", "load"]
+        assert 250 in fake_page.timeout_calls
+        assert snapshot_path.read_text(encoding="utf-8").endswith("<body>Welkom</body></html>")
+        assert recorded_events[0]["snapshot_name"] == "007-post-login-landing-page.html"
+        trace_snapshot = config.auth_trace_dir / "007-post-login-landing-page.html"
+        assert trace_snapshot.read_text(encoding="utf-8").endswith("<body>Welkom</body></html>")
+        assert recorded_events[0]["page_title"] == "Dashboard"
 
 
 @pytest.mark.asyncio
