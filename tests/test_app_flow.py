@@ -1111,10 +1111,10 @@ async def test_calendar_rebuild_from_json_updates_ics_when_google_is_disabled(ai
     service.state.sync.roster_month_exports = [
         {
             "month": "2026-06",
-            "item_count": 1,
-            "planned_slot_count": 1,
-            "planned_work_minutes": 480,
-            "planned_hours_label": "8",
+            "item_count": 0,
+            "planned_slot_count": 0,
+            "planned_work_minutes": 0,
+            "planned_hours_label": "0",
             "notice": "",
             "download_path": "/status/roster/2026-06.json",
         }
@@ -1131,6 +1131,11 @@ async def test_calendar_rebuild_from_json_updates_ics_when_google_is_disabled(ai
     assert payload["calendar_rebuild"]["google_calendar_completed"] is True
     assert b"SUMMARY:A1-SOM-2-MA" in (store.read_ics() or b"")
     assert payload["status"]["status"]["sync"]["last_completed_sync_at"]
+    rebuilt_summary = payload["status"]["status"]["sync"]["roster_month_exports"][0]
+    assert rebuilt_summary["item_count"] == 1
+    assert rebuilt_summary["planned_slot_count"] == 1
+    assert rebuilt_summary["planned_work_minutes"] == 480
+    assert rebuilt_summary["planned_hours_label"] == "8"
 
 
 @pytest.mark.asyncio

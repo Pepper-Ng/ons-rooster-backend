@@ -648,13 +648,22 @@ class BackendService:
         if not exports:
             raise RuntimeError("Er zijn nog geen roosterexports beschikbaar om de kalender uit JSON op te bouwen.")
 
+        account_key = self.current_account_key()
+        recomputed_summaries = [
+            self._summarize_roster_export(export_payload, account_key=account_key)
+            for export_payload in exports
+        ]
         calendar_sync_completed = await self._sync_calendar_exports(exports)
         await asyncio.to_thread(self.store.write_ics, self._generate_ical(exports))
-        if calendar_sync_completed:
-            async with self._state_lock:
+        async with self._state_lock:
+            self.state.sync.roster_month_exports = self._replace_roster_month_exports_for_account(
+                account_key,
+                recomputed_summaries,
+            )
+            self.state.sync.last_message = "Opgeslagen roosterexports zijn opnieuw verwerkt."
+            if calendar_sync_completed:
                 self.state.sync.last_completed_sync_at = utc_now()
-                self.state.sync.last_message = "Kalender is opnieuw opgebouwd vanuit opgeslagen roosterexports."
-                await self._persist_state()
+            await self._persist_state()
         return {
             "ics_updated": True,
             "google_calendar_enabled": self.calendar_sync_enabled(),
