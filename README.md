@@ -90,7 +90,7 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `LOGIN_TIMEOUT_SECONDS` | How long the server-side login step may wait for state changes. |
 | `SETUP_SECRET` | Optional setup code for first-time pairing or credential rotation. |
 | `DEBUG_TOKEN` | Optional token for the HTTPS debug page. |
-| `ADMIN_TOKEN` | Optional token for `POST /api/v1/admin/refresh`. |
+| `ADMIN_TOKEN` | Optional token for admin actions and `/status`. Set this when using browser-managed setup flows. |
 | `CALENDAR_FEED_TOKEN` | Optional fixed secret for the ICS subscription URL. If omitted, the backend generates and encrypts one in `DATA_DIR`. |
 | `STORAGE_KEY` | Optional pre-generated Fernet key. If omitted, one is generated in the data volume. |
 | `FCM_PROJECT_ID` | Firebase project ID used for FCM pushes. |
@@ -99,11 +99,11 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
 | `POST_LOGIN_URL` | Optional URL to open immediately after login. |
 | `ROSTER_URL` | Optional explicit roster page URL. |
-| `GOOGLE_CALENDAR_SYNC_ENABLED` | Enable Google Calendar reconciliation after successful roster export. |
-| `GOOGLE_CALENDAR_ID` | Target Google Calendar ID (recommended: dedicated calendar). |
-| `GOOGLE_CALENDAR_TIMEZONE` | Timezone used for event start and end values. |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to a Google service-account JSON with calendar scope access. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Raw Google service-account JSON as env var (fallback). |
+| `GOOGLE_CALENDAR_SYNC_ENABLED` | Optional stack-level fallback to enable Google Calendar reconciliation after successful roster export. |
+| `GOOGLE_CALENDAR_ID` | Optional stack-level fallback target Google Calendar ID. A dedicated calendar is recommended. |
+| `GOOGLE_CALENDAR_TIMEZONE` | Optional stack-level fallback timezone used for event start and end values. |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Optional stack-level fallback path to a Google service-account JSON with calendar scope access. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional stack-level fallback raw Google service-account JSON as env var. |
 | `GOOGLE_CALENDAR_DRY_RUN` | When true, only compute diff counts without writing calendar changes. |
 | `GOOGLE_CALENDAR_FAIL_ON_ERROR` | When true, fail the backend sync when calendar push fails. |
 
@@ -186,17 +186,33 @@ If the app is paired and FCM is configured correctly, the phone should receive t
 
 The backend can reconcile roster exports directly into Google Calendar.
 
-Recommended setup:
+Recommended browser setup:
 
 1. Create a dedicated Google Calendar for roster data.
 2. Create a Google Cloud service account and download the JSON key.
 3. Enable Google Calendar API in that Google Cloud project.
 4. Share the target calendar with the service-account email and grant write access.
-5. Configure these env vars in the stack:
-      - `GOOGLE_CALENDAR_SYNC_ENABLED=true`
-      - `GOOGLE_CALENDAR_ID=<calendar-id>`
-      - `GOOGLE_CALENDAR_TIMEZONE=Europe/Amsterdam`
-      - `GOOGLE_SERVICE_ACCOUNT_FILE=<mounted-path>` or `GOOGLE_SERVICE_ACCOUNT_JSON=<json>`
+5. Make sure `ADMIN_TOKEN` is set on the backend.
+6. Configure the ONS account from the Android app first, so the backend knows which account the calendar belongs to.
+7. Open `/status`, log in with the admin token, and use **Kalenderkoppelingen** to enter the Calendar ID, timezone, enable the sync toggle, and upload the Google service-account JSON.
+
+This browser flow is the recommended path for standalone installs because it keeps setup in one authenticated operator page and does not require editing Portainer stack variables for the Google key. The upload route always checks the admin token or the short-lived `/status` session cookie, validates that the JSON looks like a Google service-account key, stores the raw key encrypted under `DATA_DIR/google-calendar-accounts`, and never renders the private key back to the page.
+
+For stricter operational separation, configure Google Calendar through Docker/Portainer instead:
+
+- `GOOGLE_CALENDAR_SYNC_ENABLED=true`
+- `GOOGLE_CALENDAR_ID=<calendar-id>`
+- `GOOGLE_CALENDAR_TIMEZONE=Europe/Amsterdam`
+- `GOOGLE_SERVICE_ACCOUNT_FILE=<mounted-path>` or `GOOGLE_SERVICE_ACCOUNT_JSON=<json>`
+
+The mounted-file approach is still the cleanest option when you want key material managed outside the application data volume. Environment JSON works as a fallback, but it stores the secret in stack configuration.
+
+Account behavior:
+
+- Browser-managed Google Calendar settings are scoped to the current saved ONS username/account.
+- The backend derives a stable account key from that username and stores roster month exports and Google credentials separately per account.
+- The status page shows a masked account label and service-account email so you can verify which account is connected without exposing the ONS username or private key.
+- Future app instances can therefore connect a different ONS account and attach a different target calendar without overwriting the existing account's stored exports or Google key.
 
 Sync semantics in the current implementation:
 
@@ -261,7 +277,7 @@ It uses the same `ADMIN_TOKEN` as a lightweight web password. After login, the p
 - a manual sync trigger
 - a sync enable/disable toggle that blocks scheduled, setup-triggered, and manual login attempts while disabled
 - the secured ICS subscription URL with copy and rotate controls
-- Google Calendar status plus a manual reconciliation button
+- Google Calendar setup, status, and a manual reconciliation button
 - a mock OTP submit button for the current challenge
 - a credential-export form that downloads a passphrase-encrypted JSON bundle instead of showing plaintext credentials in the browser
 - direct links to the mock HasMoves pages
@@ -326,6 +342,7 @@ The app does not persist the ONS password locally after submission. The backend 
 | `POST /api/v1/mobile/tokens/fcm` | Android FCM token refresh endpoint. |
 | `POST /api/v1/mobile/challenges/{id}/sms-code` | Android callback endpoint for a 2FA code. |
 | `POST /api/v1/admin/refresh` | Optional authenticated manual refresh trigger. |
+| `POST /api/v1/admin/calendar/config` | Admin-only browser setup endpoint for per-account Google Calendar settings and service-account upload. |
 | `POST /api/v1/admin/calendar/sync` | Re-run Google Calendar reconciliation from stored month exports. |
 
 ## Debug page
@@ -350,6 +367,7 @@ Backend tests currently cover:
 - encrypted state persistence
 - snapshot and ICS persistence
 - secured ICS feed token persistence and rotation
+- browser-managed Google Calendar setup and encrypted per-account key storage
 - multi-device state persistence
 - Firebase configuration diagnostics
 - authenticated mobile setup flow

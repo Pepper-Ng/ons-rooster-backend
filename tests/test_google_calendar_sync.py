@@ -106,6 +106,17 @@ def test_icalendar_uses_same_planned_month_exports() -> None:
     assert "Vaste vrije dag" not in payload
 
 
+def test_validate_service_account_json_rejects_malformed_payload() -> None:
+    try:
+        GoogleCalendarSyncClient.validate_service_account_json('{"type":"service_account"}')
+    except RuntimeError as exc:
+        assert "client_email" in str(exc)
+        assert "private_key" in str(exc)
+        assert "token_uri" in str(exc)
+    else:
+        raise AssertionError("Expected malformed service-account JSON to be rejected")
+
+
 def test_sync_exports_creates_updates_and_deletes() -> None:
     client = InMemoryCalendarSyncClient()
     desired = client._build_desired_events([_sample_export(title="NEW-TITLE")])

@@ -54,6 +54,28 @@ class GoogleCalendarSyncClient:
     def is_configured(self) -> bool:
         return bool(self.calendar_id and (self.service_account_file or self.service_account_json))
 
+    @staticmethod
+    def validate_service_account_json(raw_payload: str) -> dict[str, Any]:
+        try:
+            info = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Het geuploade Google service-accountbestand is geen geldige JSON.") from exc
+
+        if not isinstance(info, dict):
+            raise RuntimeError("Het geuploade Google service-accountbestand moet een JSON-object bevatten.")
+        if str(info.get("type", "")).strip() != "service_account":
+            raise RuntimeError("Het geuploade bestand is geen Google service-account JSON.")
+
+        missing = [
+            field_name
+            for field_name in ("client_email", "private_key", "token_uri")
+            if not str(info.get(field_name, "")).strip()
+        ]
+        if missing:
+            raise RuntimeError("De Google service-account JSON mist verplichte velden: " + ", ".join(missing))
+
+        return info
+
     def sync_exports(self, month_exports: list[dict[str, Any]]) -> CalendarSyncSummary:
         if not self.calendar_id:
             raise RuntimeError("Google Calendar sync mist GOOGLE_CALENDAR_ID.")
@@ -243,10 +265,7 @@ class GoogleCalendarSyncClient:
 
     def _load_credentials(self, scopes: list[str]):
         if self.service_account_json:
-            try:
-                info = json.loads(self.service_account_json)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is geen geldige JSON.") from exc
+            info = self.validate_service_account_json(self.service_account_json)
             return google.oauth2.service_account.Credentials.from_service_account_info(
                 info,
                 scopes=scopes,

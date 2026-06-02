@@ -19,7 +19,7 @@ from .calendar_export import build_icalendar, parse_local_datetime, timezone_or_
 from .clients import AutomationClient, FcmPushClient, PushClient
 from .config import AppConfig
 from .google_calendar import CalendarSyncSummary, GoogleCalendarSyncClient
-from .models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, PortalDefinition, RosterItem
+from .models import AppState, AuthenticationResult, DeviceRegistration, GoogleCalendarSettings, LoginCredentials, PortalDefinition, RosterItem
 from .storage import StateStore
 
 log = logging.getLogger(__name__)
@@ -68,17 +68,7 @@ class BackendService:
         self.automation_client = automation_client
         self.state, self.credentials = self.store.load()
         self._ensure_default_portals()
-        self.calendar_sync_client = calendar_sync_client or GoogleCalendarSyncClient(
-            calendar_id=self.config.google_calendar_id,
-            timezone=self.config.google_calendar_timezone,
-            service_account_file=(
-                str(self.config.google_calendar_service_account_file)
-                if self.config.google_calendar_service_account_file
-                else ""
-            ),
-            service_account_json=self.config.google_calendar_service_account_json,
-            dry_run=self.config.google_calendar_dry_run,
-        )
+        self._calendar_sync_client_override = calendar_sync_client
         self._calendar_feed_token = self._resolve_calendar_feed_token()
         self._pending_challenges: dict[str, PendingChallenge] = {}
         self._pending_challenges_lock = threading.Lock()
@@ -223,10 +213,81 @@ class BackendService:
         return self.state.sync.sync_enabled
 
     def calendar_sync_enabled(self) -> bool:
-        return self.config.google_calendar_sync_enabled
+        return bool(self._effective_google_calendar_settings()["enabled"])
 
     def calendar_sync_configured(self) -> bool:
-        return self.calendar_sync_client.is_configured()
+        return self._calendar_sync_client_for_current_account().is_configured()
+
+    def current_account_key(self) -> str:
+        resolved_credentials = self._resolved_credentials()
+        username = resolved_credentials.username if resolved_credentials else "default"
+        return self._account_key(username)
+
+    def current_account_label(self) -> str:
+        resolved_credentials = self._resolved_credentials()
+        if resolved_credentials is None or not resolved_credentials.username:
+            return "Default"
+        return self._mask_value(resolved_credentials.username)
+
+    def google_calendar_settings_for_current_account(self) -> GoogleCalendarSettings | None:
+        return self._google_calendar_settings_for_account(self.current_account_key())
+
+    async def configure_google_calendar_account(
+        self,
+        *,
+        calendar_id: str,
+        timezone: str,
+        enabled: bool,
+        service_account_json: str | None,
+    ) -> dict[str, Any]:
+        resolved_credentials = self._resolved_credentials()
+        if resolved_credentials is None or not resolved_credentials.username.strip():
+            raise RuntimeError("Sla eerst ONS-inloggegevens op voordat je Google Calendar voor dit account configureert.")
+
+        account_key = self._account_key(resolved_credentials.username)
+        account_label = self._mask_value(resolved_credentials.username)
+        normalized_calendar_id = calendar_id.strip()
+        normalized_timezone = timezone_or_utc(timezone.strip() or self.config.google_calendar_timezone or self.config.timezone).key
+        existing = self._google_calendar_settings_for_account(account_key)
+        now = utc_now()
+        service_account_email = existing.service_account_email if existing else ""
+        has_uploaded_secret = self.store.google_calendar_service_account_exists(account_key)
+
+        if service_account_json is not None:
+            info = GoogleCalendarSyncClient.validate_service_account_json(service_account_json)
+            service_account_email = str(info.get("client_email", "")).strip()
+            normalized_payload = json.dumps(info, indent=2, ensure_ascii=True)
+            await asyncio.to_thread(
+                self.store.write_google_calendar_service_account,
+                account_key,
+                normalized_payload,
+            )
+            has_uploaded_secret = True
+
+        if enabled:
+            if not normalized_calendar_id:
+                raise RuntimeError("Vul een Google Calendar-ID in om synchronisatie in te schakelen.")
+            if not has_uploaded_secret:
+                raise RuntimeError("Upload eerst een Google service-account JSON voor dit account.")
+
+        settings = GoogleCalendarSettings(
+            account_key=account_key,
+            account_label=account_label,
+            enabled=enabled,
+            calendar_id=normalized_calendar_id,
+            timezone=normalized_timezone,
+            service_account_email=service_account_email,
+            credential_source="browser_upload" if has_uploaded_secret else "none",
+            created_at=existing.created_at if existing else now,
+            updated_at=now,
+        )
+
+        async with self._state_lock:
+            self._save_google_calendar_settings(settings)
+            self._remember_note(f"Google Calendar-instellingen zijn bijgewerkt voor {account_label}.")
+            await self._persist_state()
+
+        return self.operator_status_payload()
 
     def calendar_feed_url(self) -> str:
         return f"{self.config.public_base_url}/calendar/{self._calendar_feed_token}/rooster.ics"
@@ -551,6 +612,7 @@ class BackendService:
         active_device = self.active_device()
         current_device = self.device_for_mobile_token(auth_token) if auth_token is not None else active_device
         selected_portal = self.selected_portal()
+        calendar_settings = self._effective_google_calendar_settings()
         return {
             "public_base_url": self.config.public_base_url,
             "device_registered": self.has_device(),
@@ -593,7 +655,7 @@ class BackendService:
                 "html_snapshot_path": self.state.sync.html_snapshot_path,
                 "post_otp_screenshot_path": self.state.sync.post_otp_screenshot_path,
                 "roster_count": len(self.state.sync.roster_items),
-                "roster_month_exports": list(self.state.sync.roster_month_exports),
+                "roster_month_exports": self.roster_month_exports(),
                 "debug_notes": list(self.state.sync.debug_notes),
                 "auth_trace_run_id": self.state.sync.auth_trace_run_id,
                 "auth_trace": self.auth_trace_payload(),
@@ -601,8 +663,12 @@ class BackendService:
                 "calendar": {
                     "enabled": self.calendar_sync_enabled(),
                     "configured": self.calendar_sync_configured(),
-                    "calendar_id": self.config.google_calendar_id,
-                    "timezone": self.config.google_calendar_timezone,
+                    "account_key": calendar_settings["account_key"],
+                    "account_label": calendar_settings["account_label"],
+                    "calendar_id": calendar_settings["calendar_id"],
+                    "timezone": calendar_settings["timezone"],
+                    "service_account_email": calendar_settings["service_account_email"],
+                    "credential_source": calendar_settings["credential_source"],
                     "dry_run": self.config.google_calendar_dry_run,
                     "last_attempt_at": self.state.sync.calendar_last_attempt_at,
                     "last_success_at": self.state.sync.calendar_last_success_at,
@@ -718,7 +784,7 @@ class BackendService:
         return list(self.state.sync.roster_items)
 
     def roster_month_exports(self) -> list[dict[str, Any]]:
-        return list(self.state.sync.roster_month_exports)
+        return self._roster_month_exports_for_account(self.current_account_key())
 
     async def ics_payload(self) -> bytes | None:
         return await asyncio.to_thread(self.store.read_ics)
@@ -748,8 +814,12 @@ class BackendService:
             await self._persist_state()
         return new_value
 
-    async def roster_month_export(self, month_key: str) -> dict[str, Any] | None:
-        return await asyncio.to_thread(self.store.read_roster_month_export, month_key)
+    async def roster_month_export(self, month_key: str, account_key: str | None = None) -> dict[str, Any] | None:
+        return await asyncio.to_thread(
+            self.store.read_roster_month_export,
+            month_key,
+            account_key or self.current_account_key(),
+        )
 
     async def auth_trace_snapshot_html(self, entry_id: str) -> str | None:
         entry = next((item for item in self.state.sync.auth_trace if item.get("entry_id") == entry_id), None)
@@ -966,13 +1036,15 @@ class BackendService:
 
         if result.auth_ready:
             await asyncio.to_thread(self.store.clear_auth_session)
-            await asyncio.to_thread(self.store.clear_roster_month_exports)
+            account_key = self.current_account_key()
+            await asyncio.to_thread(self.store.clear_roster_month_exports, account_key)
             roster_export_summaries: list[dict[str, Any]] = []
             for export_payload in result.roster_exports:
                 month_key = str(export_payload.get("month", "")).strip()
                 if not month_key:
                     continue
-                await asyncio.to_thread(self.store.write_roster_month_export, month_key, export_payload)
+                export_payload["account_key"] = account_key
+                await asyncio.to_thread(self.store.write_roster_month_export, month_key, export_payload, account_key)
                 items = export_payload.get("items", [])
                 planned_hours_count = 0
                 if isinstance(items, list):
@@ -983,11 +1055,12 @@ class BackendService:
                     )
                 roster_export_summaries.append(
                     {
+                        "account_key": account_key,
                         "month": month_key,
                         "item_count": len(items) if isinstance(items, list) else 0,
                         "planned_hours_count": planned_hours_count,
                         "notice": str(export_payload.get("notice", "")).strip(),
-                        "download_path": f"/status/roster/{month_key}.json",
+                        "download_path": f"/status/roster/{month_key}.json?account_key={account_key}",
                     }
                 )
             await self._sync_calendar_exports(result.roster_exports)
@@ -999,6 +1072,12 @@ class BackendService:
             await asyncio.to_thread(self.store.write_auth_session, result.session_checkpoint)
             roster_export_summaries = list(self.state.sync.roster_month_exports)
         self._clear_pending_challenges()
+
+        persisted_export_summaries = (
+            self._replace_roster_month_exports_for_account(account_key, roster_export_summaries)
+            if result.auth_ready
+            else roster_export_summaries
+        )
 
         async with self._state_lock:
             # The latest successful page snapshot and roster payload become the operator-facing debug baseline.
@@ -1023,7 +1102,7 @@ class BackendService:
                 else None
             )
             self.state.sync.roster_items = result.roster_items
-            self.state.sync.roster_month_exports = roster_export_summaries
+            self.state.sync.roster_month_exports = persisted_export_summaries
             self.state.sync.debug_notes = list(result.debug_notes[-25:])
             self._remember_note(
                 "ONS authentication completed."
@@ -1064,7 +1143,8 @@ class BackendService:
             return
 
         try:
-            summary = await asyncio.to_thread(self.calendar_sync_client.sync_exports, month_exports)
+            calendar_sync_client = self._calendar_sync_client_for_current_account()
+            summary = await asyncio.to_thread(calendar_sync_client.sync_exports, month_exports)
         except Exception as exc:
             async with self._state_lock:
                 self.state.sync.calendar_last_failure_at = utc_now()
@@ -1082,11 +1162,15 @@ class BackendService:
 
     async def _load_persisted_roster_exports(self) -> list[dict[str, Any]]:
         exports: list[dict[str, Any]] = []
+        account_key = self.current_account_key()
         for summary in self.state.sync.roster_month_exports:
+            summary_account_key = str(summary.get("account_key", account_key)).strip() or account_key
+            if summary_account_key != account_key:
+                continue
             month_key = str(summary.get("month", "")).strip()
             if not month_key:
                 continue
-            export_payload = await asyncio.to_thread(self.store.read_roster_month_export, month_key)
+            export_payload = await asyncio.to_thread(self.store.read_roster_month_export, month_key, account_key)
             if export_payload is not None:
                 exports.append(export_payload)
         return exports
@@ -1261,6 +1345,103 @@ class BackendService:
                 return
         self.state.portals.append(updated_portal)
 
+    def _save_google_calendar_settings(self, updated_settings: GoogleCalendarSettings) -> None:
+        for index, settings in enumerate(self.state.google_calendar_settings):
+            if settings.account_key == updated_settings.account_key:
+                self.state.google_calendar_settings[index] = updated_settings
+                return
+        self.state.google_calendar_settings.append(updated_settings)
+
+    def _google_calendar_settings_for_account(self, account_key: str) -> GoogleCalendarSettings | None:
+        for settings in self.state.google_calendar_settings:
+            if settings.account_key == account_key:
+                return settings
+        return None
+
+    def _roster_month_exports_for_account(self, account_key: str) -> list[dict[str, Any]]:
+        return [
+            summary
+            for summary in self.state.sync.roster_month_exports
+            if self._summary_account_key(summary, account_key) == account_key
+        ]
+
+    def _replace_roster_month_exports_for_account(
+        self,
+        account_key: str,
+        replacement_summaries: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        retained_summaries = [
+            summary
+            for summary in self.state.sync.roster_month_exports
+            if self._summary_account_key(summary, account_key) != account_key
+        ]
+        return retained_summaries + replacement_summaries
+
+    @staticmethod
+    def _summary_account_key(summary: dict[str, Any], fallback_account_key: str) -> str:
+        return str(summary.get("account_key", fallback_account_key)).strip() or fallback_account_key
+
+    def _effective_google_calendar_settings(self, account_key: str | None = None) -> dict[str, Any]:
+        resolved_account_key = account_key or self.current_account_key()
+        account_settings = self._google_calendar_settings_for_account(resolved_account_key)
+        if account_settings is not None:
+            service_account_json = self.store.read_google_calendar_service_account(resolved_account_key) or ""
+            return {
+                "enabled": account_settings.enabled,
+                "account_key": resolved_account_key,
+                "account_label": account_settings.account_label,
+                "calendar_id": account_settings.calendar_id,
+                "timezone": account_settings.timezone,
+                "service_account_file": "",
+                "service_account_json": service_account_json,
+                "service_account_email": account_settings.service_account_email,
+                "credential_source": account_settings.credential_source,
+            }
+
+        service_account_email = ""
+        if self.config.google_calendar_service_account_json:
+            try:
+                info = GoogleCalendarSyncClient.validate_service_account_json(
+                    self.config.google_calendar_service_account_json,
+                )
+                service_account_email = str(info.get("client_email", "")).strip()
+            except RuntimeError:
+                service_account_email = ""
+
+        return {
+            "enabled": self.config.google_calendar_sync_enabled,
+            "account_key": resolved_account_key,
+            "account_label": self.current_account_label(),
+            "calendar_id": self.config.google_calendar_id,
+            "timezone": timezone_or_utc(self.config.google_calendar_timezone or self.config.timezone).key,
+            "service_account_file": (
+                str(self.config.google_calendar_service_account_file)
+                if self.config.google_calendar_service_account_file
+                else ""
+            ),
+            "service_account_json": self.config.google_calendar_service_account_json,
+            "service_account_email": service_account_email,
+            "credential_source": "environment" if (
+                self.config.google_calendar_service_account_file
+                or self.config.google_calendar_service_account_json
+            ) else "none",
+        }
+
+    def _build_google_calendar_sync_client(self, account_key: str | None = None) -> GoogleCalendarSyncClient:
+        settings = self._effective_google_calendar_settings(account_key)
+        return GoogleCalendarSyncClient(
+            calendar_id=str(settings["calendar_id"]),
+            timezone=str(settings["timezone"]),
+            service_account_file=str(settings["service_account_file"]),
+            service_account_json=str(settings["service_account_json"]),
+            dry_run=self.config.google_calendar_dry_run,
+        )
+
+    def _calendar_sync_client_for_current_account(self) -> CalendarSyncClient:
+        if self._calendar_sync_client_override is not None:
+            return self._calendar_sync_client_override
+        return self._build_google_calendar_sync_client(self.current_account_key())
+
     async def _remove_device_locked(self, device: DeviceRegistration) -> DeviceRegistration:
         self.state.devices = [item for item in self.state.devices if item.device_id != device.device_id]
         self._connected_device_counts.pop(device.device_id, None)
@@ -1372,3 +1553,10 @@ class BackendService:
         if len(value) <= 4:
             return "*" * len(value)
         return f"{value[:2]}{'*' * (len(value) - 4)}{value[-2:]}"
+
+    @staticmethod
+    def _account_key(username: str) -> str:
+        normalized = username.strip().lower() or "default"
+        if normalized == "default":
+            return "default"
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]

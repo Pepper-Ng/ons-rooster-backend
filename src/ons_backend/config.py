@@ -87,6 +87,10 @@ class AppConfig:
         return self.data_dir / "roster-exports"
 
     @property
+    def google_calendar_accounts_dir(self) -> Path:
+        return self.data_dir / "google-calendar-accounts"
+
+    @property
     def managed_fcm_service_account_file(self) -> Path:
         return self.data_dir / "firebase-adminsdk.json.enc"
 

@@ -14,7 +14,7 @@ from ons_backend.app import create_app
 from ons_backend.clients import FcmPushClient, HttpLoginAutomationClient
 from ons_backend.config import AppConfig
 from ons_backend.google_calendar import CalendarSyncSummary
-from ons_backend.models import AuthenticationResult, LoginCredentials, RosterItem
+from ons_backend.models import AuthenticationResult, DeviceRegistration, LoginCredentials, RosterItem
 from ons_backend.service import BackendService
 from ons_backend.storage import StateStore
 
@@ -326,6 +326,51 @@ class CountingAutomationClient:
         )
 
 
+class ExportingAutomationClient:
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+        debug_screenshots=True,
+    ):
+        del request_sms_code, config, report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
+        snapshot_path.write_text("<html>roster</html>", encoding="utf-8")
+        return AuthenticationResult(
+            final_url=credentials.login_url,
+            page_title="Rooster",
+            roster_items=[],
+            debug_notes=["Exporting client completed."],
+            auth_ready=True,
+            roster_exports=[
+                {
+                    "format": "ons-rooster-month-export",
+                    "version": 1,
+                    "month": "2026-07",
+                    "source_url": credentials.login_url,
+                    "page_title": "Rooster",
+                    "notice": "",
+                    "items": [
+                        {
+                            "date": "2026-07-01",
+                            "start": "08:00",
+                            "end": "16:00",
+                            "title": "A1",
+                            "description": "08:00 16:00 A1",
+                            "category": "planned_hours",
+                            "is_planned_hours": True,
+                        }
+                    ],
+                }
+            ],
+        )
+
+
 async def wait_for(condition, timeout: float = 1.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -562,6 +607,74 @@ async def test_status_query_token_bootstraps_cookie_for_followup_actions(aiohttp
 
 
 @pytest.mark.asyncio
+async def test_admin_calendar_config_requires_auth_and_stores_encrypted_upload(aiohttp_client, test_context):
+    app, service, _, _ = test_context
+
+    async def fake_trigger_refresh(reason: str, wait: bool = False):
+        return service.mobile_status_payload()
+
+    service.trigger_refresh = fake_trigger_refresh  # type: ignore[method-assign]
+    client = await aiohttp_client(app)
+
+    unauthorized = await client.post("/api/v1/admin/calendar/config")
+    assert unauthorized.status == 401
+
+    setup_response = await client.post(
+        "/api/v1/mobile/setup",
+        json={
+            "setup_secret": "setup-code",
+            "login_url": "https://example.invalid/login",
+            "username": "alice@example.invalid",
+            "password": "super-secret",
+            "fcm_token": "token-calendar",
+            "device_label": "Pixel",
+        },
+    )
+    assert setup_response.status == 200
+
+    service_account_payload = json.dumps(
+        {
+            "type": "service_account",
+            "client_email": "calendar-sync@example.invalid",
+            "private_key": "-----BEGIN PRIVATE KEY-----\nfake\n-----END PRIVATE KEY-----\n",
+            "token_uri": "https://oauth2.googleapis.com/token",
+        }
+    )
+    form = FormData()
+    form.add_field("calendar_id", "calendar-id@example.com")
+    form.add_field("timezone", "Europe/Amsterdam")
+    form.add_field("enabled", "on")
+    form.add_field(
+        "google_service_account",
+        service_account_payload.encode("utf-8"),
+        filename="calendar-service-account.json",
+        content_type="application/json",
+    )
+
+    response = await client.post("/api/v1/admin/calendar/config?token=admin-code", data=form)
+    assert response.status == 200
+    payload = await response.json()
+    calendar_status = payload["status"]["status"]["sync"]["calendar"]
+
+    assert calendar_status["enabled"] is True
+    assert calendar_status["configured"] is True
+    assert calendar_status["calendar_id"] == "calendar-id@example.com"
+    assert calendar_status["timezone"] == "Europe/Amsterdam"
+    assert calendar_status["service_account_email"] == "calendar-sync@example.invalid"
+    assert calendar_status["credential_source"] == "browser_upload"
+    assert calendar_status["account_label"].startswith("al")
+
+    stored_files = list(service.config.google_calendar_accounts_dir.glob("*.json.enc"))
+    assert len(stored_files) == 1
+    raw_file = stored_files[0].read_text(encoding="utf-8")
+    assert "calendar-sync@example.invalid" not in raw_file
+    assert "BEGIN PRIVATE KEY" not in raw_file
+    assert "calendar-sync@example.invalid" in service.store.read_google_calendar_service_account(
+        calendar_status["account_key"]
+    )
+
+
+@pytest.mark.asyncio
 async def test_sync_toggle_blocks_setup_autosync_and_manual_refresh(aiohttp_client, tmp_path):
     config = build_config(tmp_path)
     push_client = FakePushClient()
@@ -759,6 +872,55 @@ async def test_admin_calendar_sync_uses_persisted_roster_exports(aiohttp_client,
     assert calendar_status["last_summary"]["created"] == 1
     assert calendar_status["last_summary"]["updated"] == 2
     assert calendar_status["last_summary"]["deleted"] == 3
+
+
+@pytest.mark.asyncio
+async def test_successful_sync_preserves_other_account_roster_export_summaries(tmp_path):
+    config = build_config(tmp_path)
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=FakePushClient(),
+        automation_client=ExportingAutomationClient(),
+    )
+    service.credentials = LoginCredentials(
+        login_url="https://example.invalid/alice",
+        username="alice@example.invalid",
+        password="super-secret",
+    )
+    service.state.devices.append(
+        DeviceRegistration(
+            device_id="device-alice",
+            device_label="Pixel",
+            fcm_token="token-alice",
+            api_token_hash="",
+            created_at="2026-06-02T00:00:00Z",
+            updated_at="2026-06-02T00:00:00Z",
+        )
+    )
+    service.state.active_device_id = "device-alice"
+
+    bob_account_key = service._account_key("bob@example.invalid")
+    service.state.sync.roster_month_exports = [
+        {
+            "account_key": bob_account_key,
+            "month": "2026-06",
+            "item_count": 1,
+            "planned_hours_count": 1,
+            "notice": "",
+            "download_path": f"/status/roster/2026-06.json?account_key={bob_account_key}",
+        }
+    ]
+
+    await service.trigger_refresh(reason="account-export-test", wait=True)
+
+    all_summaries = service.state.sync.roster_month_exports
+    assert {summary["month"] for summary in all_summaries} == {"2026-06", "2026-07"}
+    assert any(summary.get("account_key") == bob_account_key for summary in all_summaries)
+
+    current_summaries = service.mobile_status_payload()["sync"]["roster_month_exports"]
+    assert [summary["month"] for summary in current_summaries] == ["2026-07"]
+    assert current_summaries[0]["account_key"] == service.current_account_key()
 
 
 @pytest.mark.asyncio
