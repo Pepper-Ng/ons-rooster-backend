@@ -11,6 +11,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 from aiohttp import web
+from aiohttp.web_request import FileField
 
 from .clients import FcmPushClient, HttpLoginAutomationClient
 from .config import AppConfig
@@ -46,6 +47,7 @@ def create_app(
 
     app.router.add_get("/", handle_root)
     app.router.add_get("/healthz", handle_health)
+    app.router.add_get("/calendar/{token}/rooster.ics", handle_ics)
     app.router.add_get("/rooster.ics", handle_ics)
     app.router.add_get("/debug", handle_debug)
     app.router.add_get("/install", handle_install_page)
@@ -88,7 +90,9 @@ def create_app(
     app.router.add_delete("/api/v1/admin/portals/{portal_id}", handle_admin_portal_remove)
     app.router.add_post("/api/v1/admin/sync", handle_admin_sync_state)
     app.router.add_post("/api/v1/admin/refresh", handle_refresh)
+    app.router.add_post("/api/v1/admin/calendar/config", handle_admin_calendar_config)
     app.router.add_post("/api/v1/admin/calendar/sync", handle_admin_calendar_sync)
+    app.router.add_post("/api/v1/admin/calendar/feed-token/rotate", handle_admin_calendar_feed_token_rotate)
     app.router.add_get("/api/v1/admin/fcm", handle_admin_fcm_status)
     app.router.add_post("/api/v1/admin/fcm/test", handle_admin_fcm_test)
 
@@ -127,13 +131,24 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_ics(request: web.Request) -> web.Response:
-    payload = await _service(request.app).ics_payload()
+    service = _service(request.app)
+    token = request.match_info.get("token") or request.query.get("token")
+    if not service.calendar_feed_token_is_valid(token):
+        raise web.HTTPUnauthorized(text="Ongeldige kalenderfeed-token.")
+
+    payload = await service.ics_payload()
     if payload is None:
         return web.Response(status=404, text="Er is nog geen roosterbestand beschikbaar.")
     return web.Response(
         body=payload,
         content_type="text/calendar",
-        headers={"Content-Disposition": 'attachment; filename="rooster.ics"'},
+        headers={
+            "Content-Disposition": 'inline; filename="rooster.ics"',
+            "Cache-Control": "private, no-cache, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+            "X-Robots-Tag": "noindex, nofollow",
+        },
     )
 
 
@@ -432,7 +447,8 @@ async def handle_status_debug_toggle(request: web.Request) -> web.Response:
 async def handle_status_roster_month_export(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     month_key = str(request.match_info.get("month_key", "")).strip()
-    export_payload = await _service(request.app).roster_month_export(month_key)
+    account_key = str(request.query.get("account_key", "")).strip() or None
+    export_payload = await _service(request.app).roster_month_export(month_key, account_key)
     if export_payload is None:
         raise web.HTTPNotFound(text="Er is geen roosterexport voor deze maand beschikbaar.")
     return web.Response(
@@ -766,13 +782,59 @@ async def handle_admin_calendar_sync(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "message": "Google Calendar synchronisatie is uitgevoerd op basis van opgeslagen roosterexports.",
-            "status": {
-                "public_base_url": service.config.public_base_url,
-                "fcm_configured": service.push_client.is_configured(),
-                "status": status,
-                "devices": service.paired_devices_payload(),
-                "portals": service.portal_catalog_payload(),
-            },
+            "calendar_sync": status,
+            "status": service.operator_status_payload(),
+        }
+    )
+
+
+async def handle_admin_calendar_config(request: web.Request) -> web.Response:
+    _require_configured_admin_auth(request)
+    form = await request.post()
+    calendar_id = str(form.get("calendar_id", "")).strip()
+    timezone = str(form.get("timezone", "")).strip()
+    enabled = _form_bool(form.get("enabled"))
+
+    upload = form.get("google_service_account")
+    raw_payload: str | None = None
+    if isinstance(upload, FileField) and upload.filename:
+        file_bytes = upload.file.read()
+        try:
+            raw_payload = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            raise web.HTTPBadRequest(text="De geuploade Google service-account sleutel moet UTF-8 JSON zijn.")
+
+    service = _service(request.app)
+    try:
+        status = await service.configure_google_calendar_account(
+            calendar_id=calendar_id,
+            timezone=timezone,
+            enabled=enabled,
+            service_account_json=raw_payload,
+        )
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+
+    return web.json_response(
+        {
+            "message": "Google Calendar-instellingen zijn opgeslagen voor het huidige ONS-account.",
+            "status": status,
+        }
+    )
+
+
+async def handle_admin_calendar_feed_token_rotate(request: web.Request) -> web.Response:
+    _require_ops_auth(request)
+    service = _service(request.app)
+    try:
+        feed_url = await service.rotate_calendar_feed_token()
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    return web.json_response(
+        {
+            "message": "De geheime ICS-feed URL is vernieuwd. Werk bestaande agenda-abonnementen bij met de nieuwe URL.",
+            "calendar_feed_url": feed_url,
+            "status": service.operator_status_payload(),
         }
     )
 
@@ -999,6 +1061,12 @@ def _require_ops_auth(request: web.Request) -> None:
         raise web.HTTPUnauthorized(text="Ongeldig admin-token.")
 
 
+def _require_configured_admin_auth(request: web.Request) -> None:
+    if not request.app["config"].admin_token:
+        raise web.HTTPUnauthorized(text="Configureer eerst ADMIN_TOKEN voordat je geheime configuratie via de browser uploadt.")
+    _require_ops_auth(request)
+
+
 def _require_ops_session(request: web.Request) -> None:
     if not _ops_has_session(request):
         raise web.HTTPUnauthorized(
@@ -1016,6 +1084,10 @@ def _status_redirect(message: str | None = None, error: str | None = None) -> we
     if query:
         location = f"{location}?{urlencode(query)}"
     return web.HTTPSeeOther(location=location)
+
+
+def _form_bool(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _render_status_page(
@@ -1143,6 +1215,36 @@ def _render_status_page(
         for item in status_payload["sync"].get("roster_month_exports", [])
     )
 
+    calendar_feed = status_payload.get("calendar_feed", {})
+    calendar_status = status_payload["sync"].get("calendar", {})
+    calendar_summary = calendar_status.get("last_summary", {}) or {}
+    calendar_summary_text = (
+        "-"
+        if not calendar_summary
+        else ", ".join(
+            f"{key}: {value}"
+            for key, value in calendar_summary.items()
+        )
+    )
+    calendar_feed_url = str(calendar_feed.get("url", ""))
+    calendar_feed_ready = "Ja" if calendar_feed.get("has_payload") else "Nog geen roosterbestand"
+    calendar_token_button_disabled = " disabled" if calendar_feed.get("token_env_managed") else ""
+    google_calendar_state = "Ingeschakeld" if calendar_status.get("enabled") else "Uitgeschakeld"
+    google_calendar_configured = "Ja" if calendar_status.get("configured") else "Nee"
+    google_calendar_account_label = str(calendar_status.get("account_label") or "-")
+    google_calendar_calendar_id = str(calendar_status.get("calendar_id") or "")
+    google_calendar_timezone = str(calendar_status.get("timezone") or config.google_calendar_timezone or config.timezone)
+    google_calendar_service_account_email = str(calendar_status.get("service_account_email") or "-")
+    google_calendar_credential_source = str(calendar_status.get("credential_source") or "none")
+    google_calendar_enabled_checked = " checked" if calendar_status.get("enabled") else ""
+    google_calendar_form_disabled = not (config.admin_token and status_payload.get("credentials_present"))
+    google_calendar_form_disabled_attr = " disabled" if google_calendar_form_disabled else ""
+    google_calendar_form_note = ""
+    if not config.admin_token:
+        google_calendar_form_note = "Configureer eerst ADMIN_TOKEN om Google Calendar via de browser te beheren."
+    elif not status_payload.get("credentials_present"):
+        google_calendar_form_note = "Sla eerst ONS-inloggegevens op zodat de kalender aan het juiste account wordt gekoppeld."
+
     selected_portal = next((portal for portal in portals if portal.get("is_selected")), portals[0] if portals else None)
     initial_snapshot_json = json.dumps(status_snapshot, ensure_ascii=True).replace("</", "<\\/")
     if not config.admin_token:
@@ -1225,6 +1327,17 @@ def _render_status_page(
         .challenge-note {{ margin: 0; color: #475569; }}
         .credential-export-form {{ display: grid; gap: 0.85rem; max-width: 42rem; }}
         .field-help {{ margin: 0; color: #475569; }}
+        .calendar-grid {{ display: grid; grid-template-columns: minmax(280px, 1.4fr) minmax(240px, 1fr); gap: 1rem; align-items: start; }}
+        .calendar-url-row {{ display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }}
+        .calendar-url-row input {{ flex: 1 1 28rem; min-width: 16rem; font-family: Consolas, "Courier New", monospace; }}
+        .calendar-status-list {{ display: grid; gap: 0.45rem; margin: 0; }}
+        .calendar-status-list div {{ display: grid; grid-template-columns: 11rem 1fr; gap: 0.75rem; }}
+        .calendar-status-list dt {{ font-weight: 700; color: #0f172a; }}
+        .calendar-status-list dd {{ margin: 0; word-break: break-word; }}
+        .calendar-config-form {{ display: grid; gap: 0.85rem; margin-top: 1rem; }}
+        .calendar-config-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
+        .checkbox-row {{ display: flex; align-items: center; gap: 0.55rem; font-weight: 600; }}
+        .checkbox-row input {{ width: auto; padding: 0; }}
         .console-shell {{ background: #0f172a; color: #e2e8f0; border-radius: 16px; padding: 1rem; font: 0.92rem/1.55 Consolas, "Courier New", monospace; max-height: 420px; overflow: auto; margin-bottom: 1rem; }}
         .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
         .console-line:last-child {{ border-bottom: 0; }}
@@ -1241,7 +1354,7 @@ def _render_status_page(
         .trace-tijd {{ white-space: normal; }}
         .trace-tijd .t-date {{ display: block; font-size: 0.85rem; }}
         .trace-tijd .t-time {{ display: block; font-size: 0.85rem; color: #64748b; }}
-        @media (max-width: 900px) {{ .portal-manager {{ grid-template-columns: 1fr; }} }}
+        @media (max-width: 900px) {{ .portal-manager, .calendar-grid {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
 </head>
@@ -1320,6 +1433,57 @@ def _render_status_page(
         </table>
     </section>
     <section>
+        <h2>Kalenderkoppelingen</h2>
+        <div class="calendar-grid">
+            <div>
+                <p class="section-note">Gebruik deze geheime ICS-URL voor iPhone, Android, Outlook of een browser. Iedereen met de URL kan het rooster lezen; vernieuw de URL als hij gedeeld of gelekt is.</p>
+                <div class="calendar-url-row">
+                    <input id="calendar-feed-url" type="text" readonly value="{html.escape(calendar_feed_url)}">
+                    <button type="button" id="btn-copy-calendar-feed">Kopieer</button>
+                    <button type="button" id="btn-rotate-calendar-feed" class="danger"{calendar_token_button_disabled}>Vernieuw URL</button>
+                </div>
+                <p class="field-help" id="calendar-feed-ready">ICS-status: {html.escape(calendar_feed_ready)}</p>
+            </div>
+            <div>
+                <dl class="calendar-status-list" id="calendar-status-list">
+                    <div><dt>Account</dt><dd>{html.escape(google_calendar_account_label)}</dd></div>
+                    <div><dt>Google Calendar</dt><dd>{html.escape(google_calendar_state)}</dd></div>
+                    <div><dt>Geconfigureerd</dt><dd>{html.escape(google_calendar_configured)}</dd></div>
+                    <div><dt>Calendar-ID</dt><dd>{html.escape(str(calendar_status.get('calendar_id') or '-'))}</dd></div>
+                    <div><dt>Service-account</dt><dd>{html.escape(google_calendar_service_account_email)}</dd></div>
+                    <div><dt>Bron</dt><dd>{html.escape(google_calendar_credential_source)}</dd></div>
+                    <div><dt>Laatste poging</dt><dd>{html.escape(str(calendar_status.get('last_attempt_at') or '-'))}</dd></div>
+                    <div><dt>Laatste succes</dt><dd>{html.escape(str(calendar_status.get('last_success_at') or '-'))}</dd></div>
+                    <div><dt>Laatste fout</dt><dd>{html.escape(str(calendar_status.get('last_error') or '-'))}</dd></div>
+                    <div><dt>Laatste diff</dt><dd>{html.escape(calendar_summary_text)}</dd></div>
+                </dl>
+                <div class="actions"><button type="button" id="btn-calendar-sync">Google Calendar opnieuw syncen</button></div>
+                <form id="google-calendar-form" class="calendar-config-form" enctype="multipart/form-data">
+                    <div class="calendar-config-grid">
+                        <label>
+                            <span>Google Calendar-ID</span>
+                            <input type="text" id="google_calendar_id" name="calendar_id" value="{html.escape(google_calendar_calendar_id)}"{google_calendar_form_disabled_attr}>
+                        </label>
+                        <label>
+                            <span>Tijdzone</span>
+                            <input type="text" id="google_calendar_timezone" name="timezone" value="{html.escape(google_calendar_timezone)}"{google_calendar_form_disabled_attr}>
+                        </label>
+                        <label>
+                            <span>Service-account JSON</span>
+                            <input type="file" id="google_service_account" name="google_service_account" accept=".json,application/json"{google_calendar_form_disabled_attr}>
+                        </label>
+                    </div>
+                    <label class="checkbox-row">
+                        <input type="checkbox" id="google_calendar_enabled" name="enabled"{google_calendar_enabled_checked}{google_calendar_form_disabled_attr}>
+                        <span>Google Calendar sync actief</span>
+                    </label>
+                    <div class="actions"><button type="submit"{google_calendar_form_disabled_attr}>Google Calendar opslaan</button></div>
+                    <p class="field-help" id="google-calendar-form-note">{html.escape(google_calendar_form_note)}</p>
+                </form>
+            </div>
+        </div>
+    </section>
+    <section>
         <h2>Portalen beheren</h2>
         <p class="section-note">Voeg een nieuw portaal toe of kies <strong>Wijzig</strong> bij een bestaand portaal om naam, login-URL of logo aan te passen. Verwijderen werkt direct op de pagina.</p>
         <div class="portal-manager">
@@ -1374,6 +1538,16 @@ def _render_status_page(
         const authTraceBody = document.getElementById('auth-trace-body');
         const postOtpScreenshotLink = document.getElementById('post-otp-screenshot-link');
         const rosterExportBody = document.getElementById('roster-export-body');
+        const calendarFeedUrlInput = document.getElementById('calendar-feed-url');
+        const calendarFeedReady = document.getElementById('calendar-feed-ready');
+        const calendarStatusList = document.getElementById('calendar-status-list');
+        const rotateCalendarFeedButton = document.getElementById('btn-rotate-calendar-feed');
+        const googleCalendarForm = document.getElementById('google-calendar-form');
+        const googleCalendarIdInput = document.getElementById('google_calendar_id');
+        const googleCalendarTimezoneInput = document.getElementById('google_calendar_timezone');
+        const googleCalendarEnabledInput = document.getElementById('google_calendar_enabled');
+        const googleCalendarFileInput = document.getElementById('google_service_account');
+        const googleCalendarFormNote = document.getElementById('google-calendar-form-note');
         const portalForm = document.getElementById('portal-form');
         const portalFormHeading = document.getElementById('portal-form-heading');
         const portalIdInput = document.getElementById('portal_id');
@@ -1597,6 +1771,36 @@ def _render_status_page(
                 </tr>`).join('');
         }}
 
+        function renderCalendar(snapshot) {{
+            const feed = snapshot.status.calendar_feed || {{}};
+            const calendar = snapshot.status.sync.calendar || {{}};
+            const summary = calendar.last_summary || {{}};
+            const summaryText = Object.keys(summary).length
+                ? Object.entries(summary).map(([key, value]) => `${{key}}: ${{value}}`).join(', ')
+                : '-';
+            calendarFeedUrlInput.value = feed.url || '';
+            calendarFeedReady.textContent = `ICS-status: ${{feed.has_payload ? 'Ja' : 'Nog geen roosterbestand'}}`;
+            rotateCalendarFeedButton.disabled = Boolean(feed.token_env_managed);
+            calendarStatusList.innerHTML = `
+                <div><dt>Account</dt><dd>${{escapeHtml(calendar.account_label || '-')}}</dd></div>
+                <div><dt>Google Calendar</dt><dd>${{calendar.enabled ? 'Ingeschakeld' : 'Uitgeschakeld'}}</dd></div>
+                <div><dt>Geconfigureerd</dt><dd>${{calendar.configured ? 'Ja' : 'Nee'}}</dd></div>
+                <div><dt>Calendar-ID</dt><dd>${{escapeHtml(calendar.calendar_id || '-')}}</dd></div>
+                <div><dt>Service-account</dt><dd>${{escapeHtml(calendar.service_account_email || '-')}}</dd></div>
+                <div><dt>Bron</dt><dd>${{escapeHtml(calendar.credential_source || 'none')}}</dd></div>
+                <div><dt>Laatste poging</dt><dd>${{escapeHtml(formatTimestamp(calendar.last_attempt_at))}}</dd></div>
+                <div><dt>Laatste succes</dt><dd>${{escapeHtml(formatTimestamp(calendar.last_success_at))}}</dd></div>
+                <div><dt>Laatste fout</dt><dd>${{escapeHtml(calendar.last_error || '-')}}</dd></div>
+                <div><dt>Laatste diff</dt><dd>${{escapeHtml(summaryText)}}</dd></div>`;
+            if (document.activeElement !== googleCalendarIdInput) {{
+                googleCalendarIdInput.value = calendar.calendar_id || '';
+            }}
+            if (document.activeElement !== googleCalendarTimezoneInput) {{
+                googleCalendarTimezoneInput.value = calendar.timezone || 'Europe/Amsterdam';
+            }}
+            googleCalendarEnabledInput.checked = Boolean(calendar.enabled);
+        }}
+
         function render(snapshot) {{
             statusSnapshot = snapshot;
             renderOverview(snapshot);
@@ -1604,6 +1808,7 @@ def _render_status_page(
             renderChallenge(snapshot);
             renderAuthTrace(snapshot);
             renderRosterExports(snapshot);
+            renderCalendar(snapshot);
             renderPortals(snapshot);
             syncPortalForm(snapshot);
             updateSyncControls(snapshot);
@@ -1717,6 +1922,71 @@ def _render_status_page(
                 const response = await callJson('/api/v1/admin/challenges/mock-sms', {{ method: 'POST' }});
                 applyStatusPayload(response);
                 setFlash('ok', response.message || 'Mock OTP ingestuurd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-copy-calendar-feed').addEventListener('click', async () => {{
+            try {{
+                await navigator.clipboard.writeText(calendarFeedUrlInput.value);
+                setFlash('ok', 'ICS-URL is gekopieerd.');
+            }} catch (_error) {{
+                calendarFeedUrlInput.focus();
+                calendarFeedUrlInput.select();
+                setFlash('ok', 'ICS-URL is geselecteerd.');
+            }}
+        }});
+
+        rotateCalendarFeedButton.addEventListener('click', async () => {{
+            if (!window.confirm('Bestaande agenda-abonnementen stoppen met updaten totdat je de nieuwe URL invult. Doorgaan?')) {{
+                return;
+            }}
+            try {{
+                const response = await callJson('/api/v1/admin/calendar/feed-token/rotate', {{ method: 'POST' }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || 'ICS-feed URL vernieuwd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        document.getElementById('btn-calendar-sync').addEventListener('click', async () => {{
+            try {{
+                const response = await callJson('/api/v1/admin/calendar/sync', {{ method: 'POST' }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || 'Google Calendar synchronisatie uitgevoerd.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
+        googleCalendarForm.addEventListener('submit', async (event) => {{
+            event.preventDefault();
+            try {{
+                const formData = new FormData(googleCalendarForm);
+                const response = await fetch('/api/v1/admin/calendar/config', {{
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: {{ 'Accept': 'application/json' }},
+                    body: formData,
+                }});
+                const text = await response.text();
+                let payload = {{}};
+                if (text) {{
+                    try {{
+                        payload = JSON.parse(text);
+                    }} catch (_error) {{
+                        payload = {{ message: text }};
+                    }}
+                }}
+                if (!response.ok) {{
+                    throw new Error(payload.message || text || 'Google Calendar-instellingen konden niet worden opgeslagen.');
+                }}
+                googleCalendarFileInput.value = '';
+                applyStatusPayload(payload);
+                setFlash('ok', payload.message || 'Google Calendar-instellingen opgeslagen.');
+                googleCalendarFormNote.textContent = '';
             }} catch (error) {{
                 setFlash('error', error.message);
             }}

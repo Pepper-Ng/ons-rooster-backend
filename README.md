@@ -32,10 +32,11 @@ The backend is designed to run continuously as a Docker stack in Portainer. The 
 [HTTPS backend API]
       │  Completes login
       │  Scrapes the roster with fallback heuristics
-      │  Writes roster.ics
+      │  Writes a secured roster.ics feed
+      │  Optionally reconciles Google Calendar
       │  Sends auth_result notification to the phone
       ▼
-[Debug and calendar endpoints]
+[Debug, status, and calendar endpoints]
 ```
 
 ## What changed
@@ -89,7 +90,8 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `LOGIN_TIMEOUT_SECONDS` | How long the server-side login step may wait for state changes. |
 | `SETUP_SECRET` | Optional setup code for first-time pairing or credential rotation. |
 | `DEBUG_TOKEN` | Optional token for the HTTPS debug page. |
-| `ADMIN_TOKEN` | Optional token for `POST /api/v1/admin/refresh`. |
+| `ADMIN_TOKEN` | Optional token for admin actions and `/status`. Set this when using browser-managed setup flows. |
+| `CALENDAR_FEED_TOKEN` | Optional fixed secret for the ICS subscription URL. If omitted, the backend generates and encrypts one in `DATA_DIR`. |
 | `STORAGE_KEY` | Optional pre-generated Fernet key. If omitted, one is generated in the data volume. |
 | `FCM_PROJECT_ID` | Firebase project ID used for FCM pushes. |
 | `FCM_SERVICE_ACCOUNT_HOST_PATH` | Host path for the admin SDK JSON when using `docker-compose.portainer.secrets.yml`. |
@@ -97,11 +99,11 @@ These values are exposed directly in `docker-compose.yml` and `.env.example`.
 | `FCM_SERVICE_ACCOUNT_JSON` | Optional raw Firebase service account JSON string. |
 | `POST_LOGIN_URL` | Optional URL to open immediately after login. |
 | `ROSTER_URL` | Optional explicit roster page URL. |
-| `GOOGLE_CALENDAR_SYNC_ENABLED` | Enable Google Calendar reconciliation after successful roster export. |
-| `GOOGLE_CALENDAR_ID` | Target Google Calendar ID (recommended: dedicated calendar). |
-| `GOOGLE_CALENDAR_TIMEZONE` | Timezone used for event start and end values. |
-| `GOOGLE_SERVICE_ACCOUNT_FILE` | Path to a Google service-account JSON with calendar scope access. |
-| `GOOGLE_SERVICE_ACCOUNT_JSON` | Raw Google service-account JSON as env var (fallback). |
+| `GOOGLE_CALENDAR_SYNC_ENABLED` | Optional stack-level fallback to enable Google Calendar reconciliation after successful roster export. |
+| `GOOGLE_CALENDAR_ID` | Optional stack-level fallback target Google Calendar ID. A dedicated calendar is recommended. |
+| `GOOGLE_CALENDAR_TIMEZONE` | Optional stack-level fallback timezone used for event start and end values. |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Optional stack-level fallback path to a Google service-account JSON with calendar scope access. |
+| `GOOGLE_SERVICE_ACCOUNT_JSON` | Optional stack-level fallback raw Google service-account JSON as env var. |
 | `GOOGLE_CALENDAR_DRY_RUN` | When true, only compute diff counts without writing calendar changes. |
 | `GOOGLE_CALENDAR_FAIL_ON_ERROR` | When true, fail the backend sync when calendar push fails. |
 
@@ -184,17 +186,33 @@ If the app is paired and FCM is configured correctly, the phone should receive t
 
 The backend can reconcile roster exports directly into Google Calendar.
 
-Recommended setup:
+Recommended browser setup:
 
 1. Create a dedicated Google Calendar for roster data.
 2. Create a Google Cloud service account and download the JSON key.
 3. Enable Google Calendar API in that Google Cloud project.
 4. Share the target calendar with the service-account email and grant write access.
-5. Configure these env vars in the stack:
-      - `GOOGLE_CALENDAR_SYNC_ENABLED=true`
-      - `GOOGLE_CALENDAR_ID=<calendar-id>`
-      - `GOOGLE_CALENDAR_TIMEZONE=Europe/Amsterdam`
-      - `GOOGLE_SERVICE_ACCOUNT_FILE=<mounted-path>` or `GOOGLE_SERVICE_ACCOUNT_JSON=<json>`
+5. Make sure `ADMIN_TOKEN` is set on the backend.
+6. Configure the ONS account from the Android app first, so the backend knows which account the calendar belongs to.
+7. Open `/status`, log in with the admin token, and use **Kalenderkoppelingen** to enter the Calendar ID, timezone, enable the sync toggle, and upload the Google service-account JSON.
+
+This browser flow is the recommended path for standalone installs because it keeps setup in one authenticated operator page and does not require editing Portainer stack variables for the Google key. The upload route always checks the admin token or the short-lived `/status` session cookie, validates that the JSON looks like a Google service-account key, stores the raw key encrypted under `DATA_DIR/google-calendar-accounts`, and never renders the private key back to the page.
+
+For stricter operational separation, configure Google Calendar through Docker/Portainer instead:
+
+- `GOOGLE_CALENDAR_SYNC_ENABLED=true`
+- `GOOGLE_CALENDAR_ID=<calendar-id>`
+- `GOOGLE_CALENDAR_TIMEZONE=Europe/Amsterdam`
+- `GOOGLE_SERVICE_ACCOUNT_FILE=<mounted-path>` or `GOOGLE_SERVICE_ACCOUNT_JSON=<json>`
+
+The mounted-file approach is still the cleanest option when you want key material managed outside the application data volume. Environment JSON works as a fallback, but it stores the secret in stack configuration.
+
+Account behavior:
+
+- Browser-managed Google Calendar settings are scoped to the current saved ONS username/account.
+- The backend derives a stable account key from that username and stores roster month exports and Google credentials separately per account.
+- The status page shows a masked account label and service-account email so you can verify which account is connected without exposing the ONS username or private key.
+- Future app instances can therefore connect a different ONS account and attach a different target calendar without overwriting the existing account's stored exports or Google key.
 
 Sync semantics in the current implementation:
 
@@ -202,6 +220,49 @@ Sync semantics in the current implementation:
 - current and next month exports are used
 - missing managed events are deleted
 - unchanged events are left untouched (idempotent reruns)
+- event identity is based on the roster slot date/time, so text changes update the existing event instead of creating duplicates
+
+Manual reconciliation is available from the operator page and through:
+
+```bash
+curl -X POST "https://onsrooster.stefhermans.nl/api/v1/admin/calendar/sync?token=<admin-token>"
+```
+
+Use Google Calendar when you want Google/Android-native calendar integration and can create a dedicated private calendar. Keep that calendar private and share only with the service account and the real Google users who should see the roster.
+
+### ICS subscription setup
+
+The backend also publishes the same planned roster as an ICS subscription feed. This is the easiest option for iPhone Calendar, Outlook, browser downloads, and calendar apps that can subscribe to a URL.
+
+Open `/status` after logging in with `ADMIN_TOKEN`. The **Kalenderkoppelingen** section shows the current ICS URL and has buttons to copy it or rotate it.
+
+The preferred URL shape is:
+
+```text
+https://<your-backend>/calendar/<secret-feed-token>/rooster.ics
+```
+
+The compatibility form also works:
+
+```text
+https://<your-backend>/rooster.ics?token=<secret-feed-token>
+```
+
+For local testing on the same machine, use `http://localhost:18080/calendar/<secret-feed-token>/rooster.ics`. For a phone or another computer on the LAN, do not use `localhost`; use the backend machine's LAN hostname/IP or the public HTTPS URL from `PUBLIC_BASE_URL`.
+
+Security model and recommendation:
+
+- ICS subscriptions are effectively bearer-token URLs. Many clients do not reliably support custom auth headers, and Google/Apple/Outlook subscription flows often strip or ignore normal web login sessions.
+- The backend therefore uses a long, unguessable secret in the URL. If `CALENDAR_FEED_TOKEN` is empty, it generates one automatically, stores it encrypted in `DATA_DIR`, and exposes it only on the authenticated status page.
+- Treat the ICS URL like a password. Anyone with the URL can read the roster until the URL is rotated.
+- Use the rotate button on `/status` if the URL was shared with the wrong person. Existing subscriptions must then be updated with the new URL.
+- The endpoint sends `noindex` and `no-cache` style headers, but the real protection is the secret URL plus HTTPS.
+
+Update behavior:
+
+- after every successful scraper run, stored month exports, the ICS file, and the optional Google Calendar reconciliation are refreshed from the same source data
+- scheduled syncs use `SYNC_INTERVAL_MINUTES`; manual sync is available on `/status`
+- subscribed ICS clients refresh on their own polling schedule, so the backend has the new file immediately but iOS/Google/Outlook may display it after their next subscription fetch
 
 ## Operator status page
 
@@ -215,6 +276,8 @@ It uses the same `ADMIN_TOKEN` as a lightweight web password. After login, the p
 - a `Maak actief` button to switch the active device
 - a manual sync trigger
 - a sync enable/disable toggle that blocks scheduled, setup-triggered, and manual login attempts while disabled
+- the secured ICS subscription URL with copy and rotate controls
+- Google Calendar setup, status, and a manual reconciliation button
 - a mock OTP submit button for the current challenge
 - a credential-export form that downloads a passphrase-encrypted JSON bundle instead of showing plaintext credentials in the browser
 - direct links to the mock HasMoves pages
@@ -268,7 +331,8 @@ The app does not persist the ONS password locally after submission. The backend 
 | Route | Purpose |
 |---|---|
 | `GET /healthz` | Basic health check. |
-| `GET /rooster.ics` | Calendar output based on the last successful scrape. |
+| `GET /calendar/<feed-token>/rooster.ics` | Secured ICS subscription feed based on the last successful scrape. |
+| `GET /rooster.ics?token=<feed-token>` | Compatibility form of the same ICS feed. |
 | `GET /status` | Operator page with paired-device overview, per-device FCM ping, and manual controls. |
 | `GET /debug` | Operator-facing HTML debug page. Optional `DEBUG_TOKEN` protection is supported. |
 | `GET /install` | Operator-facing Firebase admin key upload page. |
@@ -278,6 +342,7 @@ The app does not persist the ONS password locally after submission. The backend 
 | `POST /api/v1/mobile/tokens/fcm` | Android FCM token refresh endpoint. |
 | `POST /api/v1/mobile/challenges/{id}/sms-code` | Android callback endpoint for a 2FA code. |
 | `POST /api/v1/admin/refresh` | Optional authenticated manual refresh trigger. |
+| `POST /api/v1/admin/calendar/config` | Admin-only browser setup endpoint for per-account Google Calendar settings and service-account upload. |
 | `POST /api/v1/admin/calendar/sync` | Re-run Google Calendar reconciliation from stored month exports. |
 
 ## Debug page
@@ -301,6 +366,8 @@ Backend tests currently cover:
 
 - encrypted state persistence
 - snapshot and ICS persistence
+- secured ICS feed token persistence and rotation
+- browser-managed Google Calendar setup and encrypted per-account key storage
 - multi-device state persistence
 - Firebase configuration diagnostics
 - authenticated mobile setup flow

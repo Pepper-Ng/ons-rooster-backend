@@ -34,6 +34,7 @@ class AppConfig:
     setup_secret: str
     debug_token: str
     admin_token: str
+    calendar_feed_token: str
     storage_key: str
     fcm_project_id: str
     fcm_service_account_file: Path | None
@@ -78,8 +79,16 @@ class AppConfig:
         return self.data_dir / "rooster.ics"
 
     @property
+    def calendar_feed_token_file(self) -> Path:
+        return self.data_dir / "calendar-feed-token.enc"
+
+    @property
     def roster_exports_dir(self) -> Path:
         return self.data_dir / "roster-exports"
+
+    @property
+    def google_calendar_accounts_dir(self) -> Path:
+        return self.data_dir / "google-calendar-accounts"
 
     @property
     def managed_fcm_service_account_file(self) -> Path:
@@ -116,6 +125,7 @@ class AppConfig:
             setup_secret=os.getenv("SETUP_SECRET", "").strip(),
             debug_token=os.getenv("DEBUG_TOKEN", "").strip(),
             admin_token=os.getenv("ADMIN_TOKEN", "").strip(),
+            calendar_feed_token=os.getenv("CALENDAR_FEED_TOKEN", "").strip(),
             storage_key=os.getenv("STORAGE_KEY", "").strip(),
             fcm_project_id=os.getenv("FCM_PROJECT_ID", "").strip(),
             fcm_service_account_file=Path(fcm_service_account_file) if fcm_service_account_file else None,

@@ -22,6 +22,7 @@ def build_config(tmp_path, *, project_id: str = "", service_account_file=None, s
         setup_secret="",
         debug_token="",
         admin_token="",
+        calendar_feed_token="",
         storage_key="",
         fcm_project_id=project_id,
         fcm_service_account_file=service_account_file,

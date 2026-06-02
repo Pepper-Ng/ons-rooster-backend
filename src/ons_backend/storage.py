@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -76,30 +77,87 @@ class StateStore:
             return None
         return self.config.ics_file.read_bytes()
 
-    def clear_roster_month_exports(self) -> None:
+    def write_calendar_feed_token(self, token: str) -> None:
+        encrypted = self._fernet.encrypt(token.encode("utf-8")).decode("utf-8")
+        self._write_atomic(self.config.calendar_feed_token_file, encrypted)
+        self._set_owner_only_permissions(self.config.calendar_feed_token_file)
+
+    def read_calendar_feed_token(self) -> str | None:
+        if not self.config.calendar_feed_token_file.exists():
+            return None
+        encrypted = self.config.calendar_feed_token_file.read_text(encoding="utf-8")
+        try:
+            return self._fernet.decrypt(encrypted.encode("utf-8")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError("De opgeslagen kalenderfeed-token kon niet worden ontsleuteld.") from exc
+
+    def clear_roster_month_exports(self, account_key: str | None = None) -> None:
         if not self.config.roster_exports_dir.exists():
             return
-        for export_file in self.config.roster_exports_dir.glob("*.json"):
+        if account_key is None:
+            export_files = self.config.roster_exports_dir.glob("**/*.json")
+        elif account_key == "default":
+            export_files = self.config.roster_exports_dir.glob("*.json")
+        else:
+            export_files = (self.config.roster_exports_dir / self._safe_account_file_stem(account_key)).glob("*.json")
+        for export_file in export_files:
             export_file.unlink(missing_ok=True)
 
-    def write_roster_month_export(self, month_key: str, payload: dict[str, Any]) -> None:
-        self.config.roster_exports_dir.mkdir(parents=True, exist_ok=True)
-        safe_month_key = re.sub(r"[^0-9-]", "", month_key)
-        if not safe_month_key:
-            raise RuntimeError("Kan roosterexport niet opslaan zonder geldige maandsleutel.")
-        export_path = self.config.roster_exports_dir / f"{safe_month_key}.json"
+    def write_roster_month_export(self, month_key: str, payload: dict[str, Any], account_key: str = "default") -> None:
+        export_path = self._roster_month_export_path(month_key, account_key)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
         serialized = json.dumps(payload, ensure_ascii=True, indent=2)
         self._write_atomic(export_path, serialized)
 
-    def read_roster_month_export(self, month_key: str) -> dict[str, Any] | None:
-        safe_month_key = re.sub(r"[^0-9-]", "", month_key)
-        if not safe_month_key:
+    def read_roster_month_export(self, month_key: str, account_key: str = "default") -> dict[str, Any] | None:
+        try:
+            export_path = self._roster_month_export_path(month_key, account_key)
+        except RuntimeError:
             return None
-        export_path = self.config.roster_exports_dir / f"{safe_month_key}.json"
+        if not export_path.exists() and account_key != "default":
+            legacy_path = self._roster_month_export_path(month_key, "default")
+            if legacy_path.exists():
+                export_path = legacy_path
         if not export_path.exists():
             return None
         payload = json.loads(export_path.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else None
+
+    def write_google_calendar_service_account(self, account_key: str, content: str) -> None:
+        encrypted = self._fernet.encrypt(content.encode("utf-8")).decode("utf-8")
+        credential_path = self._google_calendar_service_account_path(account_key)
+        credential_path.parent.mkdir(parents=True, exist_ok=True)
+        self._write_atomic(credential_path, encrypted)
+        self._set_owner_only_permissions(credential_path)
+
+    def read_google_calendar_service_account(self, account_key: str) -> str | None:
+        credential_path = self._google_calendar_service_account_path(account_key)
+        if not credential_path.exists():
+            return None
+        encrypted = credential_path.read_text(encoding="utf-8")
+        try:
+            return self._fernet.decrypt(encrypted.encode("utf-8")).decode("utf-8")
+        except InvalidToken as exc:
+            raise RuntimeError("De opgeslagen Google Calendar-sleutel kon niet worden ontsleuteld.") from exc
+
+    def google_calendar_service_account_exists(self, account_key: str) -> bool:
+        return self._google_calendar_service_account_path(account_key).exists()
+
+    def _roster_month_export_path(self, month_key: str, account_key: str) -> Path:
+        safe_month_key = re.sub(r"[^0-9-]", "", month_key)
+        if not safe_month_key:
+            raise RuntimeError("Kan roosterexport niet opslaan zonder geldige maandsleutel.")
+        if account_key == "default":
+            return self.config.roster_exports_dir / f"{safe_month_key}.json"
+        return self.config.roster_exports_dir / self._safe_account_file_stem(account_key) / f"{safe_month_key}.json"
+
+    def _google_calendar_service_account_path(self, account_key: str) -> Path:
+        return self.config.google_calendar_accounts_dir / f"{self._safe_account_file_stem(account_key)}.json.enc"
+
+    @staticmethod
+    def _safe_account_file_stem(account_key: str) -> str:
+        normalized = account_key.strip().lower() or "default"
+        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
     def write_auth_session(self, payload: dict[str, object] | None) -> None:
         if payload is None:

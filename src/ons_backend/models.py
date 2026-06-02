@@ -95,6 +95,46 @@ class LoginCredentials:
 
 
 @dataclass
+class GoogleCalendarSettings:
+    account_key: str
+    account_label: str
+    enabled: bool
+    calendar_id: str
+    timezone: str
+    service_account_email: str
+    credential_source: str = "browser_upload"
+    created_at: str = ""
+    updated_at: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "account_key": self.account_key,
+            "account_label": self.account_label,
+            "enabled": self.enabled,
+            "calendar_id": self.calendar_id,
+            "timezone": self.timezone,
+            "service_account_email": self.service_account_email,
+            "credential_source": self.credential_source,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GoogleCalendarSettings":
+        return cls(
+            account_key=str(data.get("account_key", "")).strip() or "default",
+            account_label=str(data.get("account_label", "")).strip() or "Account",
+            enabled=bool(data.get("enabled", True)),
+            calendar_id=str(data.get("calendar_id", "")).strip(),
+            timezone=str(data.get("timezone", "Europe/Amsterdam")).strip() or "Europe/Amsterdam",
+            service_account_email=str(data.get("service_account_email", "")).strip(),
+            credential_source=str(data.get("credential_source", "browser_upload")).strip() or "browser_upload",
+            created_at=str(data.get("created_at", "")).strip(),
+            updated_at=str(data.get("updated_at", "")).strip(),
+        )
+
+
+@dataclass
 class RosterItem:
     date: str
     start: str
@@ -226,6 +266,7 @@ class SyncState:
 class AppState:
     devices: list[DeviceRegistration] = field(default_factory=list)
     portals: list[PortalDefinition] = field(default_factory=list)
+    google_calendar_settings: list[GoogleCalendarSettings] = field(default_factory=list)
     active_device_id: str | None = None
     credentials_updated_at: str | None = None
     sync: SyncState = field(default_factory=SyncState)
@@ -234,6 +275,7 @@ class AppState:
         return {
             "devices": [device.to_dict() for device in self.devices],
             "portals": [portal.to_dict() for portal in self.portals],
+            "google_calendar_settings": [settings.to_dict() for settings in self.google_calendar_settings],
             "active_device_id": self.active_device_id,
             "credentials_updated_at": self.credentials_updated_at,
             "sync": self.sync.to_dict(),
@@ -255,6 +297,10 @@ class AppState:
         return cls(
             devices=devices,
             portals=[PortalDefinition.from_dict(portal) for portal in data.get("portals", [])],
+            google_calendar_settings=[
+                GoogleCalendarSettings.from_dict(settings)
+                for settings in data.get("google_calendar_settings", [])
+            ],
             active_device_id=active_device_id,
             credentials_updated_at=data.get("credentials_updated_at"),
             sync=SyncState.from_dict(data.get("sync", {})),

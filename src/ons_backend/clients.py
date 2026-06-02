@@ -59,6 +59,7 @@ class AutomationClient(Protocol):
         session_checkpoint: dict[str, Any] | None = None,
         prepare_sms_relay: SmsRelayPrimer | None = None,
         wait_for_sms_code: SmsCodeAwaiter | None = None,
+        debug_screenshots: bool = True,
     ) -> AuthenticationResult:
         ...
 

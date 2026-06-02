@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import quote
 
 import google.auth.transport.requests
 import google.oauth2.service_account
+
+from .calendar_export import build_roster_calendar_events, timezone_or_utc, utc_window_for_exports
 
 MANAGED_PROP = "ons_rooster_managed"
 KEY_PROP = "ons_rooster_key"
@@ -46,13 +46,35 @@ class GoogleCalendarSyncClient:
         dry_run: bool = False,
     ) -> None:
         self.calendar_id = calendar_id.strip()
-        self.timezone = timezone.strip() or "Europe/Amsterdam"
+        self.timezone = timezone_or_utc(timezone.strip() or "Europe/Amsterdam").key
         self.service_account_file = service_account_file.strip() if service_account_file else ""
         self.service_account_json = service_account_json.strip()
         self.dry_run = dry_run
 
     def is_configured(self) -> bool:
         return bool(self.calendar_id and (self.service_account_file or self.service_account_json))
+
+    @staticmethod
+    def validate_service_account_json(raw_payload: str) -> dict[str, Any]:
+        try:
+            info = json.loads(raw_payload)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Het geuploade Google service-accountbestand is geen geldige JSON.") from exc
+
+        if not isinstance(info, dict):
+            raise RuntimeError("Het geuploade Google service-accountbestand moet een JSON-object bevatten.")
+        if str(info.get("type", "")).strip() != "service_account":
+            raise RuntimeError("Het geuploade bestand is geen Google service-account JSON.")
+
+        missing = [
+            field_name
+            for field_name in ("client_email", "private_key", "token_uri")
+            if not str(info.get(field_name, "")).strip()
+        ]
+        if missing:
+            raise RuntimeError("De Google service-account JSON mist verplichte velden: " + ", ".join(missing))
+
+        return info
 
     def sync_exports(self, month_exports: list[dict[str, Any]]) -> CalendarSyncSummary:
         if not self.calendar_id:
@@ -61,7 +83,7 @@ class GoogleCalendarSyncClient:
             return CalendarSyncSummary()
 
         desired = self._build_desired_events(month_exports)
-        window = self._determine_window(desired)
+        window = self._determine_window(month_exports, desired)
         if window is None:
             return CalendarSyncSummary(desired=0, existing=0)
         time_min, time_max = window
@@ -111,76 +133,47 @@ class GoogleCalendarSyncClient:
 
     def _build_desired_events(self, month_exports: list[dict[str, Any]]) -> list[dict[str, Any]]:
         desired: list[dict[str, Any]] = []
-        for export_payload in month_exports:
-            month = str(export_payload.get("month", "")).strip()
-            source_url = str(export_payload.get("source_url", "")).strip()
-            for item in export_payload.get("items", []):
-                if not isinstance(item, dict):
-                    continue
-                if not bool(item.get("is_planned_hours")):
-                    continue
-                date_value = str(item.get("date", "")).strip()
-                start_value = str(item.get("start", "")).strip()
-                end_value = str(item.get("end", "")).strip()
-                if not date_value or not start_value or not end_value:
-                    continue
-
-                event_key = self._event_key(month, source_url, item)
-                summary = str(item.get("title", "")).strip() or str(item.get("description", "")).strip()
-                description_parts = [str(item.get("description", "")).strip()]
-                if source_url:
-                    description_parts.append(f"Source: {source_url}")
-                description = "\n".join(part for part in description_parts if part)
-                desired.append(
-                    {
-                        "id": self._event_id(event_key),
-                        "summary": summary,
-                        "description": description,
-                        "start": {
-                            "dateTime": f"{date_value}T{start_value}:00",
-                            "timeZone": self.timezone,
-                        },
-                        "end": {
-                            "dateTime": f"{date_value}T{end_value}:00",
-                            "timeZone": self.timezone,
-                        },
-                        "extendedProperties": {
-                            "private": {
-                                MANAGED_PROP: "1",
-                                KEY_PROP: event_key,
-                                MONTH_PROP: month,
-                            }
-                        },
-                        "_key": event_key,
-                    }
-                )
+        timezone = timezone_or_utc(self.timezone)
+        for roster_event in build_roster_calendar_events(month_exports):
+            start = roster_event.start_datetime(timezone)
+            end = roster_event.end_datetime(timezone)
+            if start is None or end is None:
+                continue
+            desired.append(
+                {
+                    "id": self._event_id(roster_event.key),
+                    "summary": roster_event.title,
+                    "description": roster_event.description,
+                    "start": {
+                        "dateTime": start.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "timeZone": self.timezone,
+                    },
+                    "end": {
+                        "dateTime": end.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "timeZone": self.timezone,
+                    },
+                    "extendedProperties": {
+                        "private": {
+                            MANAGED_PROP: "1",
+                            KEY_PROP: roster_event.key,
+                            MONTH_PROP: roster_event.month,
+                        }
+                    },
+                    "_key": roster_event.key,
+                }
+            )
         return desired
 
-    @staticmethod
-    def _determine_window(desired: list[dict[str, Any]]) -> tuple[str, str] | None:
-        if not desired:
-            return None
-        starts = [event["start"]["dateTime"] for event in desired]
-        ends = [event["end"]["dateTime"] for event in desired]
-        min_start = min(starts)
-        max_end = max(ends)
-        return (f"{min_start}+00:00", f"{max_end}+00:00")
-
-    @staticmethod
-    def _event_key(month: str, source_url: str, item: dict[str, Any]) -> str:
-        payload = {
-            "month": month,
-            "source_url": source_url,
-            "date": str(item.get("date", "")).strip(),
-            "start": str(item.get("start", "")).strip(),
-            "end": str(item.get("end", "")).strip(),
-            "title": str(item.get("title", "")).strip(),
-            "description": str(item.get("description", "")).strip(),
-            "category": str(item.get("category", "")).strip(),
-            "classes": list(item.get("classes", [])),
-        }
-        raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    def _determine_window(
+        self,
+        month_exports: list[dict[str, Any]],
+        desired: list[dict[str, Any]],
+    ) -> tuple[str, str] | None:
+        return utc_window_for_exports(
+            month_exports,
+            build_roster_calendar_events(month_exports) if desired else [],
+            self.timezone,
+        )
 
     @staticmethod
     def _event_id(event_key: str) -> str:
@@ -272,10 +265,7 @@ class GoogleCalendarSyncClient:
 
     def _load_credentials(self, scopes: list[str]):
         if self.service_account_json:
-            try:
-                info = json.loads(self.service_account_json)
-            except json.JSONDecodeError as exc:
-                raise RuntimeError("GOOGLE_SERVICE_ACCOUNT_JSON is geen geldige JSON.") from exc
+            info = self.validate_service_account_json(self.service_account_json)
             return google.oauth2.service_account.Credentials.from_service_account_info(
                 info,
                 scopes=scopes,
@@ -286,7 +276,3 @@ class GoogleCalendarSyncClient:
                 scopes=scopes,
             )
         raise RuntimeError("Geen Google service-account bron geconfigureerd.")
-
-
-def utc_now() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
