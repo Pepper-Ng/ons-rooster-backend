@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import replace
 from datetime import date
 from urllib.parse import urlparse
 
@@ -53,6 +54,12 @@ class FakeCalendarSyncClient:
             desired=5,
             existing=6,
         )
+
+
+class FailingCalendarSyncClient(FakeCalendarSyncClient):
+    def sync_exports(self, month_exports: list[dict]) -> CalendarSyncSummary:
+        self.synced_exports.append(month_exports)
+        raise RuntimeError("calendar boom")
 
 
 class FakeAutomationClient:
@@ -371,6 +378,162 @@ class ExportingAutomationClient:
         )
 
 
+class DetailedExportingAutomationClient:
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+        debug_screenshots=True,
+    ):
+        del request_sms_code, config, report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
+        snapshot_path.write_text("<html>roster</html>", encoding="utf-8")
+        return AuthenticationResult(
+            final_url=credentials.login_url,
+            page_title="Rooster",
+            roster_items=[],
+            debug_notes=["Detailed export completed."],
+            auth_ready=True,
+            roster_exports=[
+                {
+                    "format": "ons-rooster-month-export",
+                    "version": 1,
+                    "month": "2026-07",
+                    "source_url": credentials.login_url,
+                    "page_title": "Rooster",
+                    "notice": "",
+                    "items": [
+                        {
+                            "date": "2026-06-30",
+                            "start": "15:00",
+                            "end": "23:30",
+                            "title": "A1-SOM-2-MA",
+                            "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+                            "category": "planned_hours",
+                            "is_planned_hours": True,
+                        },
+                        {
+                            "date": "2026-07-01",
+                            "start": "09:00",
+                            "end": "17:00",
+                            "title": "Vaste vrije dag",
+                            "description": "09:00 17:00 Vaste vrije dag",
+                            "category": "availability",
+                            "is_planned_hours": False,
+                        },
+                        {
+                            "date": "2026-07-02",
+                            "start": "11:30",
+                            "end": "19:30",
+                            "title": "ZA-M1-SOM-MA",
+                            "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+                            "category": "planned_hours",
+                            "is_planned_hours": True,
+                        },
+                        {
+                            "date": "2026-07-02",
+                            "start": "11:30",
+                            "end": "19:30",
+                            "title": "ZA-M1-SOM-MA",
+                            "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+                            "category": "planned_hours",
+                            "is_planned_hours": True,
+                        },
+                    ],
+                }
+            ],
+        )
+
+
+class OverlappingRosterAutomationClient:
+    async def authenticate_and_scrape(
+        self,
+        credentials,
+        request_sms_code,
+        snapshot_path,
+        config,
+        report_progress=None,
+        session_checkpoint=None,
+        prepare_sms_relay=None,
+        wait_for_sms_code=None,
+        debug_screenshots=True,
+    ):
+        del request_sms_code, config, report_progress, session_checkpoint, prepare_sms_relay, wait_for_sms_code
+        snapshot_path.write_text("<html>roster</html>", encoding="utf-8")
+        june_shift = {
+            "date": "2026-06-29",
+            "start": "15:00",
+            "end": "23:30",
+            "title": "A1-SOM-2-MA",
+            "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+            "category": "planned_hours",
+            "is_planned_hours": True,
+            "classes": ["roster_slot", "shiftassignment"],
+        }
+        july_shift = {
+            "date": "2026-07-02",
+            "start": "11:30",
+            "end": "19:30",
+            "title": "ZA-M1-SOM-MA",
+            "description": "11:30 19:30 (30M PAUZE) ZA-M1-SOM-MA",
+            "category": "planned_hours",
+            "is_planned_hours": True,
+            "classes": ["roster_slot", "shiftassignment"],
+        }
+        july_second_shift = {
+            "date": "2026-07-03",
+            "start": "07:30",
+            "end": "15:00",
+            "title": "ZA-O1-SOM-MA",
+            "description": "07:30 15:00 (30M PAUZE) ZA-O1-SOM-MA",
+            "category": "planned_hours",
+            "is_planned_hours": True,
+            "classes": ["roster_slot", "shiftassignment"],
+        }
+        june_unavailability = {
+            "date": "2026-06-30",
+            "start": "09:00",
+            "end": "17:00",
+            "title": "Vaste vrije dag",
+            "description": "09:00 17:00 Vaste vrije dag",
+            "category": "availability",
+            "is_planned_hours": False,
+            "classes": ["roster_slot", "unavailability"],
+        }
+        return AuthenticationResult(
+            final_url=credentials.login_url,
+            page_title="Rooster",
+            roster_items=[],
+            debug_notes=["Overlapping export client completed."],
+            auth_ready=True,
+            roster_exports=[
+                {
+                    "format": "ons-rooster-month-export",
+                    "version": 1,
+                    "month": "2026-06",
+                    "source_url": "https://example.invalid/roster/2026-06-01/month",
+                    "page_title": "Rooster",
+                    "notice": "",
+                    "items": [june_shift, dict(june_shift), june_unavailability, july_shift, july_second_shift],
+                },
+                {
+                    "format": "ons-rooster-month-export",
+                    "version": 1,
+                    "month": "2026-07",
+                    "source_url": "https://example.invalid/roster/2026-07-01/month",
+                    "page_title": "Rooster",
+                    "notice": "",
+                    "items": [june_shift, july_shift, dict(july_shift), july_second_shift],
+                },
+            ],
+        )
+
+
 async def wait_for(condition, timeout: float = 1.0):
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
@@ -577,6 +740,41 @@ async def test_status_page_embeds_parseable_initial_snapshot_json(aiohttp_client
 
     payload = json.loads(raw_payload)
     assert set(["status", "devices", "portals"]).issubset(payload.keys())
+
+
+@pytest.mark.asyncio
+async def test_status_page_supports_autosync_interval_settings(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=FakePushClient(),
+        automation_client=CountingAutomationClient(),
+    )
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post(
+        "/api/v1/admin/sync?token=admin-code",
+        json={"enabled": True, "interval_minutes": 45},
+    )
+    assert response.status == 200
+    payload = await response.json()
+    sync_payload = payload["status"]["status"]["sync"]
+    assert sync_payload["sync_enabled"] is True
+    assert sync_payload["sync_interval_minutes"] == 45
+    assert sync_payload["next_scheduled_sync_at"]
+
+    status_page = await client.get("/status?token=admin-code")
+    assert status_page.status == 200
+    body = await status_page.text()
+    assert "Autosync" in body
+    assert "Kalender bijwerken uit JSON" in body
+    assert "Laatste synchronisatie" in body
+    assert "Geplande synchronisatie" in body
+    assert "Laatste succesvolle login" not in body
+    assert 'id="sync_interval_minutes"' in body
+    assert 'value="45"' in body
 
 
 @pytest.mark.asyncio
@@ -864,14 +1062,158 @@ async def test_admin_calendar_sync_uses_persisted_roster_exports(aiohttp_client,
     response = await client.post("/api/v1/admin/calendar/sync?token=admin-code")
     assert response.status == 200
     payload = await response.json()
-    assert payload["message"].startswith("Google Calendar synchronisatie")
+    assert payload["message"].startswith("Kalender is opnieuw opgebouwd")
+    assert payload["calendar_rebuild"]["ics_updated"] is True
+    assert payload["calendar_rebuild"]["google_calendar_enabled"] is True
+    assert payload["calendar_rebuild"]["google_calendar_completed"] is True
+    assert payload["calendar_rebuild"]["export_count"] == 1
     assert len(fake_calendar.synced_exports) == 1
     assert fake_calendar.synced_exports[0][0]["month"] == "2026-06"
+    assert b"BEGIN:VEVENT" in (store.read_ics() or b"")
 
     calendar_status = payload["status"]["status"]["sync"]["calendar"]
     assert calendar_status["last_summary"]["created"] == 1
     assert calendar_status["last_summary"]["updated"] == 2
     assert calendar_status["last_summary"]["deleted"] == 3
+
+
+@pytest.mark.asyncio
+async def test_calendar_rebuild_from_json_updates_ics_when_google_is_disabled(aiohttp_client, tmp_path):
+    config = build_config(tmp_path)
+    store = StateStore(config)
+    service = BackendService(
+        config=config,
+        store=store,
+        push_client=FakePushClient(),
+        automation_client=CountingAutomationClient(),
+    )
+    export_payload = {
+        "format": "ons-rooster-month-export",
+        "version": 1,
+        "month": "2026-06",
+        "source_url": "https://example.invalid/roster/2026-06",
+        "page_title": "Rooster",
+        "notice": "",
+        "items": [
+            {
+                "date": "2026-06-01",
+                "start": "15:00",
+                "end": "23:30",
+                "title": "A1-SOM-2-MA",
+                "description": "15:00 23:30 (30M PAUZE) A1-SOM-2-MA",
+                "category": "planned_hours",
+                "is_planned_hours": True,
+                "classes": ["roster_slot", "shiftassignment"],
+            }
+        ],
+    }
+    store.write_roster_month_export("2026-06", export_payload)
+    service.state.sync.roster_month_exports = [
+        {
+            "month": "2026-06",
+            "item_count": 0,
+            "planned_slot_count": 0,
+            "planned_work_minutes": 0,
+            "planned_hours_label": "0",
+            "notice": "",
+            "download_path": "/status/roster/2026-06.json",
+        }
+    ]
+
+    app = create_app(config=config, service=service)
+    client = await aiohttp_client(app)
+
+    response = await client.post("/api/v1/admin/calendar/sync?token=admin-code")
+    assert response.status == 200
+    payload = await response.json()
+    assert payload["calendar_rebuild"]["ics_updated"] is True
+    assert payload["calendar_rebuild"]["google_calendar_enabled"] is False
+    assert payload["calendar_rebuild"]["google_calendar_completed"] is True
+    assert b"SUMMARY:A1-SOM-2-MA" in (store.read_ics() or b"")
+    assert payload["status"]["status"]["sync"]["last_completed_sync_at"]
+    rebuilt_summary = payload["status"]["status"]["sync"]["roster_month_exports"][0]
+    assert rebuilt_summary["item_count"] == 1
+    assert rebuilt_summary["planned_slot_count"] == 1
+    assert rebuilt_summary["planned_work_minutes"] == 480
+    assert rebuilt_summary["planned_hours_label"] == "8"
+
+
+@pytest.mark.asyncio
+async def test_successful_sync_summarizes_month_working_hours_after_dedupe(tmp_path):
+    config = build_config(tmp_path)
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=FakePushClient(),
+        automation_client=DetailedExportingAutomationClient(),
+    )
+    service.credentials = LoginCredentials(
+        login_url="https://example.invalid/login",
+        username="alice@example.invalid",
+        password="super-secret",
+    )
+    service.state.devices.append(
+        DeviceRegistration(
+            device_id="device-alice",
+            device_label="Pixel",
+            fcm_token="token-alice",
+            api_token_hash="",
+            created_at="2026-06-02T00:00:00Z",
+            updated_at="2026-06-02T00:00:00Z",
+        )
+    )
+    service.state.active_device_id = "device-alice"
+
+    await service.trigger_refresh(reason="hours-test", wait=True)
+
+    summaries = service.mobile_status_payload()["sync"]["roster_month_exports"]
+    assert len(summaries) == 1
+    summary = summaries[0]
+    assert summary["month"] == "2026-07"
+    assert summary["item_count"] == 2
+    assert summary["planned_slot_count"] == 1
+    assert summary["planned_work_minutes"] == 450
+    assert summary["planned_hours_label"] == "7.5"
+    assert service.state.sync.last_completed_sync_at
+
+
+@pytest.mark.asyncio
+async def test_successful_auth_does_not_update_last_completed_sync_when_google_calendar_fails(tmp_path):
+    config = build_config(tmp_path)
+    config = replace(
+        config,
+        google_calendar_sync_enabled=True,
+        google_calendar_id="calendar-id@example.com",
+    )
+    service = BackendService(
+        config=config,
+        store=StateStore(config),
+        push_client=FakePushClient(),
+        automation_client=DetailedExportingAutomationClient(),
+        calendar_sync_client=FailingCalendarSyncClient(),
+    )
+    service.credentials = LoginCredentials(
+        login_url="https://example.invalid/login",
+        username="alice@example.invalid",
+        password="super-secret",
+    )
+    service.state.devices.append(
+        DeviceRegistration(
+            device_id="device-alice",
+            device_label="Pixel",
+            fcm_token="token-alice",
+            api_token_hash="",
+            created_at="2026-06-02T00:00:00Z",
+            updated_at="2026-06-02T00:00:00Z",
+        )
+    )
+    service.state.active_device_id = "device-alice"
+
+    await service.trigger_refresh(reason="calendar-failure-test", wait=True)
+
+    assert service.state.sync.last_success_at
+    assert service.state.sync.last_completed_sync_at is None
+    assert service.state.sync.calendar_last_error == "calendar boom"
 
 
 @pytest.mark.asyncio

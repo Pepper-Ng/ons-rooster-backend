@@ -77,11 +77,12 @@ class BackendService:
         self._live_condition = asyncio.Condition()
         self._live_version = 0
         self._connected_device_counts: dict[str, int] = {}
+        self._scheduler_wakeup = asyncio.Event()
         self._scheduler_task: asyncio.Task[None] | None = None
         self._current_sync_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
-        if self.config.sync_interval_minutes > 0:
+        if self._scheduler_task is None:
             self._scheduler_task = asyncio.create_task(self._scheduler_loop())
 
     async def stop(self) -> None:
@@ -212,6 +213,124 @@ class BackendService:
     def sync_enabled(self) -> bool:
         return self.state.sync.sync_enabled
 
+    def sync_interval_minutes(self) -> int:
+        interval = self.state.sync.sync_interval_minutes
+        if interval is None:
+            interval = self.config.sync_interval_minutes
+        return max(0, int(interval))
+
+    def _next_scheduled_sync_timestamp(self) -> str | None:
+        if not self.sync_enabled():
+            return None
+        interval_minutes = self.sync_interval_minutes()
+        if interval_minutes <= 0:
+            return None
+        next_run = datetime.now(UTC).replace(microsecond=0) + timedelta(minutes=interval_minutes)
+        return next_run.isoformat().replace("+00:00", "Z")
+
+    def _set_next_scheduled_sync_locked(self) -> None:
+        self.state.sync.next_scheduled_sync_at = self._next_scheduled_sync_timestamp()
+
+    @staticmethod
+    def _roster_item_date_in_month(item: dict[str, Any], month_key: str) -> bool:
+        date_value = str(item.get("date", "")).strip()
+        return bool(month_key and date_value.startswith(f"{month_key}-"))
+
+    @staticmethod
+    def _roster_item_identity(item: dict[str, Any]) -> tuple[str, str, str, str, str]:
+        return (
+            str(item.get("date", "")).strip(),
+            str(item.get("start", "")).strip(),
+            str(item.get("end", "")).strip(),
+            str(item.get("category", "")).strip(),
+            re.sub(r"\s+", " ", str(item.get("description", "")).strip()),
+        )
+
+    @staticmethod
+    def _planned_block_identity(item: dict[str, Any]) -> tuple[str, str, str]:
+        return (
+            str(item.get("date", "")).strip(),
+            str(item.get("start", "")).strip(),
+            str(item.get("end", "")).strip(),
+        )
+
+    @staticmethod
+    def _has_roster_break(item: dict[str, Any]) -> bool:
+        text = " ".join(
+            str(item.get(field_name, ""))
+            for field_name in ("description", "title")
+        )
+        return re.search(r"\(?\s*30\s*m\s+pauze\s*\)?", text, flags=re.IGNORECASE) is not None
+
+    def _planned_work_minutes(self, item: dict[str, Any]) -> int:
+        timezone = timezone_or_utc(self.config.google_calendar_timezone or self.config.timezone)
+        start = parse_local_datetime(
+            str(item.get("date", "")).strip(),
+            str(item.get("start", "")).strip(),
+            timezone,
+        )
+        end = parse_local_datetime(
+            str(item.get("date", "")).strip(),
+            str(item.get("end", "")).strip(),
+            timezone,
+        )
+        if start is None or end is None:
+            return 0
+        if end <= start:
+            end = end + timedelta(days=1)
+        minutes = int((end - start).total_seconds() // 60)
+        if self._has_roster_break(item):
+            minutes -= 30
+        return max(0, minutes)
+
+    @staticmethod
+    def _format_hours(minutes: int) -> str:
+        hours = minutes / 60
+        formatted = f"{hours:.2f}".rstrip("0").rstrip(".")
+        return formatted or "0"
+
+    def _summarize_roster_export(self, export_payload: dict[str, Any], *, account_key: str) -> dict[str, Any]:
+        month_key = str(export_payload.get("month", "")).strip()
+        items = export_payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
+
+        unique_month_items: list[dict[str, Any]] = []
+        seen_items: set[tuple[str, str, str, str, str]] = set()
+        for item in items:
+            if not isinstance(item, dict) or not self._roster_item_date_in_month(item, month_key):
+                continue
+            identity = self._roster_item_identity(item)
+            if identity in seen_items:
+                continue
+            seen_items.add(identity)
+            unique_month_items.append(item)
+
+        planned_items: list[dict[str, Any]] = []
+        seen_planned_blocks: set[tuple[str, str, str]] = set()
+        for item in unique_month_items:
+            if not bool(item.get("is_planned_hours")):
+                continue
+            planned_identity = self._planned_block_identity(item)
+            if planned_identity in seen_planned_blocks:
+                continue
+            seen_planned_blocks.add(planned_identity)
+            planned_items.append(item)
+
+        planned_minutes = sum(self._planned_work_minutes(item) for item in planned_items)
+        return {
+            "account_key": account_key,
+            "month": month_key,
+            "item_count": len(unique_month_items),
+            "planned_hours_count": len(planned_items),
+            "planned_slot_count": len(planned_items),
+            "planned_work_minutes": planned_minutes,
+            "planned_hours": round(planned_minutes / 60, 2),
+            "planned_hours_label": self._format_hours(planned_minutes),
+            "notice": str(export_payload.get("notice", "")).strip(),
+            "download_path": f"/status/roster/{month_key}.json?account_key={account_key}",
+        }
+
     def calendar_sync_enabled(self) -> bool:
         return bool(self._effective_google_calendar_settings()["enabled"])
 
@@ -318,27 +437,40 @@ class BackendService:
         return self.calendar_feed_url()
 
     async def set_sync_enabled(self, enabled: bool) -> str:
+        return await self.set_sync_settings(enabled=enabled, interval_minutes=None)
+
+    async def set_sync_settings(self, *, enabled: bool, interval_minutes: int | None) -> str:
         async with self._state_lock:
-            if self.state.sync.sync_enabled == enabled:
+            interval_changed = False
+            if interval_minutes is not None:
+                if interval_minutes < 1 or interval_minutes > 10080:
+                    raise RuntimeError("Kies een sync-interval tussen 1 minuut en 7 dagen.")
+                interval_changed = self.state.sync.sync_interval_minutes != interval_minutes
+                self.state.sync.sync_interval_minutes = interval_minutes
+
+            enabled_changed = self.state.sync.sync_enabled != enabled
+            if not enabled_changed and not interval_changed:
                 return "Synchronisatie staat al ingeschakeld." if enabled else "Synchronisatie staat al uitgeschakeld."
 
             self.state.sync.sync_enabled = enabled
             self.state.sync.last_message = (
-                "Synchronisatie is ingeschakeld."
+                "Synchronisatie-instellingen zijn opgeslagen."
                 if enabled
                 else "Synchronisatie is uitgeschakeld. Er worden geen nieuwe aanmeldpogingen gestart."
             )
             if enabled:
                 if self.state.sync.current_phase == "disabled":
                     self.state.sync.current_phase = "idle"
-                self._remember_note("Synchronisatie is opnieuw ingeschakeld vanaf de statuspagina.")
+                self._remember_note("Synchronisatie-instellingen zijn bijgewerkt vanaf de statuspagina.")
             else:
                 self.state.sync.current_phase = "disabled"
                 self.state.sync.current_challenge_id = None
                 self.state.sync.challenge_created_at = None
                 self._clear_pending_challenges()
                 self._remember_note("Synchronisatie is uitgeschakeld vanaf de statuspagina.")
+            self._set_next_scheduled_sync_locked()
             await self._persist_state()
+            self._scheduler_wakeup.set()
 
         return self.state.sync.last_message or ""
 
@@ -511,19 +643,37 @@ class BackendService:
             await self._current_sync_task
         return self.mobile_status_payload()
 
-    async def sync_calendar_from_persisted_exports(self) -> dict[str, Any]:
-        if not self.calendar_sync_enabled():
-            raise RuntimeError("Google Calendar synchronisatie is uitgeschakeld.")
-        if not self.calendar_sync_configured():
-            raise RuntimeError("Google Calendar synchronisatie is niet volledig geconfigureerd.")
-
+    async def rebuild_calendar_from_persisted_exports(self) -> dict[str, Any]:
         exports = await self._load_persisted_roster_exports()
         if not exports:
-            raise RuntimeError("Er zijn nog geen roosterexports beschikbaar voor Google Calendar synchronisatie.")
+            raise RuntimeError("Er zijn nog geen roosterexports beschikbaar om de kalender uit JSON op te bouwen.")
 
-        await self._sync_calendar_exports(exports)
+        account_key = self.current_account_key()
+        recomputed_summaries = [
+            self._summarize_roster_export(export_payload, account_key=account_key)
+            for export_payload in exports
+        ]
+        calendar_sync_completed = await self._sync_calendar_exports(exports)
         await asyncio.to_thread(self.store.write_ics, self._generate_ical(exports))
-        return self.mobile_status_payload()
+        async with self._state_lock:
+            self.state.sync.roster_month_exports = self._replace_roster_month_exports_for_account(
+                account_key,
+                recomputed_summaries,
+            )
+            self.state.sync.last_message = "Opgeslagen roosterexports zijn opnieuw verwerkt."
+            if calendar_sync_completed:
+                self.state.sync.last_completed_sync_at = utc_now()
+            await self._persist_state()
+        return {
+            "ics_updated": True,
+            "google_calendar_enabled": self.calendar_sync_enabled(),
+            "google_calendar_completed": calendar_sync_completed,
+            "export_count": len(exports),
+            "status": self.mobile_status_payload(),
+        }
+
+    async def sync_calendar_from_persisted_exports(self) -> dict[str, Any]:
+        return await self.rebuild_calendar_from_persisted_exports()
 
     async def send_test_notification(self, message: str, device_id: str | None = None) -> None:
         device = self.active_device() if device_id is None else self.device_by_id(device_id)
@@ -637,12 +787,15 @@ class BackendService:
             "device_id": current_device.device_id if current_device else "",
             "sync": {
                 "sync_enabled": self.state.sync.sync_enabled,
+                "sync_interval_minutes": self.sync_interval_minutes(),
+                "next_scheduled_sync_at": self.state.sync.next_scheduled_sync_at,
                 "status": self.state.sync.status,
                 "current_phase": self.state.sync.current_phase,
                 "auth_ready": self.state.sync.auth_ready,
                 "last_reason": self.state.sync.last_reason,
                 "last_attempt_at": self.state.sync.last_attempt_at,
                 "last_success_at": self.state.sync.last_success_at,
+                "last_completed_sync_at": self.state.sync.last_completed_sync_at,
                 "last_failure_at": self.state.sync.last_failure_at,
                 "last_error": self.state.sync.last_error,
                 "last_message": self.state.sync.last_message,
@@ -1034,6 +1187,7 @@ class BackendService:
                     "OTP submitted; waiting for follow-up page handling."
                 )
 
+        calendar_sync_completed = False
         if result.auth_ready:
             await asyncio.to_thread(self.store.clear_auth_session)
             account_key = self.current_account_key()
@@ -1045,25 +1199,10 @@ class BackendService:
                     continue
                 export_payload["account_key"] = account_key
                 await asyncio.to_thread(self.store.write_roster_month_export, month_key, export_payload, account_key)
-                items = export_payload.get("items", [])
-                planned_hours_count = 0
-                if isinstance(items, list):
-                    planned_hours_count = sum(
-                        1
-                        for item in items
-                        if isinstance(item, dict) and bool(item.get("is_planned_hours"))
-                    )
                 roster_export_summaries.append(
-                    {
-                        "account_key": account_key,
-                        "month": month_key,
-                        "item_count": len(items) if isinstance(items, list) else 0,
-                        "planned_hours_count": planned_hours_count,
-                        "notice": str(export_payload.get("notice", "")).strip(),
-                        "download_path": f"/status/roster/{month_key}.json?account_key={account_key}",
-                    }
+                    self._summarize_roster_export(export_payload, account_key=account_key)
                 )
-            await self._sync_calendar_exports(result.roster_exports)
+            calendar_sync_completed = await self._sync_calendar_exports(result.roster_exports)
         else:
             if result.session_checkpoint is None:
                 raise RuntimeError(
@@ -1112,6 +1251,10 @@ class BackendService:
             await self._persist_state()
             if result.auth_ready:
                 await asyncio.to_thread(self.store.write_ics, self._generate_ical(result.roster_exports))
+                if calendar_sync_completed:
+                    self.state.sync.last_completed_sync_at = utc_now()
+                    self._set_next_scheduled_sync_locked()
+                    await self._persist_state()
 
         if result.auth_ready:
             await self._notify_auth_result(
@@ -1119,7 +1262,7 @@ class BackendService:
                 "De backend is aangemeld en klaar voor synchronisatie.",
             )
 
-    async def _sync_calendar_exports(self, month_exports: list[dict[str, Any]]) -> None:
+    async def _sync_calendar_exports(self, month_exports: list[dict[str, Any]]) -> bool:
         attempt_at = utc_now()
         async with self._state_lock:
             self.state.sync.calendar_last_attempt_at = attempt_at
@@ -1130,7 +1273,7 @@ class BackendService:
             async with self._state_lock:
                 self.state.sync.calendar_last_summary = {}
                 await self._persist_state()
-            return
+            return True
 
         if not self.calendar_sync_configured():
             message = "Google Calendar synchronisatie is niet volledig geconfigureerd."
@@ -1140,7 +1283,7 @@ class BackendService:
                 await self._persist_state()
             if self.config.google_calendar_fail_on_error:
                 raise RuntimeError(message)
-            return
+            return False
 
         try:
             calendar_sync_client = self._calendar_sync_client_for_current_account()
@@ -1152,13 +1295,14 @@ class BackendService:
                 await self._persist_state()
             if self.config.google_calendar_fail_on_error:
                 raise RuntimeError(str(exc)) from exc
-            return
+            return False
 
         async with self._state_lock:
             self.state.sync.calendar_last_success_at = utc_now()
             self.state.sync.calendar_last_error = None
             self.state.sync.calendar_last_summary = summary.to_dict()
             await self._persist_state()
+        return True
 
     async def _load_persisted_roster_exports(self) -> list[dict[str, Any]]:
         exports: list[dict[str, Any]] = []
@@ -1197,12 +1341,36 @@ class BackendService:
 
     async def _scheduler_loop(self) -> None:
         while True:
-            await asyncio.sleep(self.config.sync_interval_minutes * 60)
+            interval_minutes = self.sync_interval_minutes()
+            if not self.sync_enabled() or interval_minutes <= 0:
+                async with self._state_lock:
+                    if self.state.sync.next_scheduled_sync_at is not None:
+                        self.state.sync.next_scheduled_sync_at = None
+                        await self._persist_state()
+                await self._wait_for_scheduler_wakeup(60)
+                continue
+
+            async with self._state_lock:
+                self._set_next_scheduled_sync_locked()
+                await self._persist_state()
+
+            if await self._wait_for_scheduler_wakeup(interval_minutes * 60):
+                continue
+
             try:
                 if self.sync_enabled() and self.credentials is not None and self.active_device() is not None:
                     await self.trigger_refresh(reason="scheduled", wait=True)
             except Exception:
                 log.exception("Scheduled sync failed.")
+
+    async def _wait_for_scheduler_wakeup(self, timeout_seconds: float) -> bool:
+        try:
+            await asyncio.wait_for(self._scheduler_wakeup.wait(), timeout=timeout_seconds)
+        except TimeoutError:
+            return False
+        finally:
+            self._scheduler_wakeup.clear()
+        return True
 
     def _generate_ical(self, month_exports: list[dict[str, Any]] | None = None) -> bytes:
         if month_exports:

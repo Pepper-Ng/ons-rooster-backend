@@ -33,12 +33,17 @@ class InMemoryCalendarSyncClient(GoogleCalendarSyncClient):
 
 
 
-def _sample_export(title: str = "A1-SOM-2-MA") -> dict:
+def _sample_export(
+    title: str = "A1-SOM-2-MA",
+    *,
+    month: str = "2026-06",
+    source_url: str = "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
+) -> dict:
     return {
         "format": "ons-rooster-month-export",
         "version": 1,
-        "month": "2026-06",
-        "source_url": "https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
+        "month": month,
+        "source_url": source_url,
         "page_title": "Rooster",
         "items": [
             {
@@ -84,6 +89,24 @@ def test_event_key_ignores_mutable_roster_text() -> None:
 
     assert first[0]["_key"] == second[0]["_key"]
     assert first[0]["summary"] != second[0]["summary"]
+
+
+def test_overlapping_month_exports_deduplicate_same_shift() -> None:
+    client = InMemoryCalendarSyncClient()
+    june_export = _sample_export(
+        month="2026-06",
+        source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-06-01/month",
+    )
+    july_export = _sample_export(
+        month="2026-07",
+        source_url="https://landvanhorne.hasmoves.com/onsdraaiboek/roster/2026-07-01/month",
+    )
+
+    desired = client._build_desired_events([june_export, july_export])
+    payload = build_icalendar([june_export, july_export], timezone_name="Europe/Amsterdam").decode("utf-8")
+
+    assert len(desired) == 1
+    assert payload.count("BEGIN:VEVENT") == 1
 
 
 def test_window_uses_export_month_in_local_timezone() -> None:
@@ -163,3 +186,46 @@ def test_sync_exports_creates_updates_and_deletes() -> None:
     assert len(client.updated) == 1
     assert client.updated[0][0] == "event-to-update"
     assert client.deleted == ["event-to-delete"]
+
+
+def test_sync_exports_deletes_duplicate_existing_events_with_same_key() -> None:
+    client = InMemoryCalendarSyncClient()
+    desired = client._build_desired_events([_sample_export(title="NEW-TITLE")])
+    desired_key = desired[0]["_key"]
+
+    client.existing_events = [
+        {
+            "id": "event-to-keep",
+            "summary": desired[0]["summary"],
+            "description": desired[0]["description"],
+            "start": desired[0]["start"],
+            "end": desired[0]["end"],
+            "extendedProperties": {
+                "private": {
+                    "ons_rooster_managed": "1",
+                    "ons_rooster_key": desired_key,
+                    "ons_rooster_month": "2026-06",
+                }
+            },
+        },
+        {
+            "id": "duplicate-event",
+            "summary": desired[0]["summary"],
+            "description": desired[0]["description"],
+            "start": desired[0]["start"],
+            "end": desired[0]["end"],
+            "extendedProperties": {
+                "private": {
+                    "ons_rooster_managed": "1",
+                    "ons_rooster_key": desired_key,
+                    "ons_rooster_month": "2026-06",
+                }
+            },
+        },
+    ]
+
+    summary = client.sync_exports([_sample_export(title="NEW-TITLE")])
+
+    assert summary.deleted == 1
+    assert summary.unchanged == 1
+    assert client.deleted == ["duplicate-event"]

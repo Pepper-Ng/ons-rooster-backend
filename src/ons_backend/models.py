@@ -165,12 +165,15 @@ class RosterItem:
 @dataclass
 class SyncState:
     sync_enabled: bool = True
+    sync_interval_minutes: int | None = None
+    next_scheduled_sync_at: str | None = None
     status: str = "idle"
     current_phase: str = "idle"
     auth_ready: bool = False
     last_reason: str | None = None
     last_attempt_at: str | None = None
     last_success_at: str | None = None
+    last_completed_sync_at: str | None = None
     last_failure_at: str | None = None
     last_error: str | None = None
     last_message: str | None = None
@@ -197,12 +200,15 @@ class SyncState:
     def to_dict(self) -> dict[str, Any]:
         return {
             "sync_enabled": self.sync_enabled,
+            "sync_interval_minutes": self.sync_interval_minutes,
+            "next_scheduled_sync_at": self.next_scheduled_sync_at,
             "status": self.status,
             "current_phase": self.current_phase,
             "auth_ready": self.auth_ready,
             "last_reason": self.last_reason,
             "last_attempt_at": self.last_attempt_at,
             "last_success_at": self.last_success_at,
+            "last_completed_sync_at": self.last_completed_sync_at,
             "last_failure_at": self.last_failure_at,
             "last_error": self.last_error,
             "last_message": self.last_message,
@@ -229,14 +235,24 @@ class SyncState:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SyncState":
+        raw_interval = data.get("sync_interval_minutes")
+        sync_interval_minutes: int | None
+        try:
+            sync_interval_minutes = int(raw_interval) if raw_interval is not None else None
+        except (TypeError, ValueError):
+            sync_interval_minutes = None
+
         return cls(
             sync_enabled=bool(data.get("sync_enabled", True)),
+            sync_interval_minutes=sync_interval_minutes,
+            next_scheduled_sync_at=data.get("next_scheduled_sync_at"),
             status=data.get("status", "idle"),
             current_phase=data.get("current_phase", "idle"),
             auth_ready=bool(data.get("auth_ready", False)),
             last_reason=data.get("last_reason"),
             last_attempt_at=data.get("last_attempt_at"),
             last_success_at=data.get("last_success_at"),
+            last_completed_sync_at=data.get("last_completed_sync_at"),
             last_failure_at=data.get("last_failure_at"),
             last_error=data.get("last_error"),
             last_message=data.get("last_message"),
