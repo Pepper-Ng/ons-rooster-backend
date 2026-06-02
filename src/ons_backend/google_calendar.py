@@ -89,11 +89,16 @@ class GoogleCalendarSyncClient:
         time_min, time_max = window
 
         existing = self._list_managed_events(time_min, time_max)
-        existing_by_key = {
-            self._extract_key(event): event
-            for event in existing
-            if self._extract_key(event)
-        }
+        existing_by_key: dict[str, dict[str, Any]] = {}
+        duplicate_existing: list[dict[str, Any]] = []
+        for event in existing:
+            event_key = self._extract_key(event)
+            if not event_key:
+                continue
+            if event_key in existing_by_key:
+                duplicate_existing.append(event)
+                continue
+            existing_by_key[event_key] = event
 
         created = 0
         updated = 0
@@ -121,6 +126,11 @@ class GoogleCalendarSyncClient:
                 deleted += 1
                 if not self.dry_run:
                     self._delete_event(event["id"])
+
+        for event in duplicate_existing:
+            deleted += 1
+            if not self.dry_run:
+                self._delete_event(event["id"])
 
         return CalendarSyncSummary(
             created=created,

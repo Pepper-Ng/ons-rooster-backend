@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from typing import Any, Iterable
@@ -42,7 +41,7 @@ def timezone_or_utc(timezone_name: str) -> ZoneInfo:
 
 def build_roster_calendar_events(month_exports: Iterable[dict[str, Any]]) -> list[RosterCalendarEvent]:
     events: list[RosterCalendarEvent] = []
-    occurrences: dict[tuple[str, str, str, str, str], int] = defaultdict(int)
+    seen_event_keys: set[str] = set()
 
     for export_payload in month_exports:
         month = str(export_payload.get("month", "")).strip()
@@ -63,9 +62,14 @@ def build_roster_calendar_events(month_exports: Iterable[dict[str, Any]]) -> lis
             if not date_value or not start_value or not end_value:
                 continue
 
-            occurrence_base = (month, source_url, date_value, start_value, end_value)
-            occurrence_index = occurrences[occurrence_base]
-            occurrences[occurrence_base] += 1
+            event_key = roster_event_key(
+                month=month,
+                source_url=source_url,
+                item=item,
+            )
+            if event_key in seen_event_keys:
+                continue
+            seen_event_keys.add(event_key)
 
             title = str(item.get("title", "")).strip() or str(item.get("description", "")).strip() or "Dienst"
             description_parts = [str(item.get("description", "")).strip()]
@@ -75,12 +79,7 @@ def build_roster_calendar_events(month_exports: Iterable[dict[str, Any]]) -> lis
 
             events.append(
                 RosterCalendarEvent(
-                    key=roster_event_key(
-                        month=month,
-                        source_url=source_url,
-                        item=item,
-                        occurrence_index=occurrence_index,
-                    ),
+                    key=event_key,
                     month=month,
                     source_url=source_url,
                     date=date_value,
@@ -102,12 +101,9 @@ def roster_event_key(
     occurrence_index: int = 0,
 ) -> str:
     payload = {
-        "month": month,
-        "source_url": source_url,
         "date": str(item.get("date", "")).strip(),
         "start": str(item.get("start", "")).strip(),
         "end": str(item.get("end", "")).strip(),
-        "occurrence_index": occurrence_index,
     }
     raw = json.dumps(payload, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

@@ -206,7 +206,7 @@ async def handle_debug(request: web.Request) -> web.Response:
     <p><strong>Laatste status:</strong> {html.escape(str(status['sync']['last_message'] or '-'))}</p>
     <p><strong>Laatste fout:</strong> {html.escape(str(status['sync']['last_error'] or '-'))}</p>
     <p><strong>Laatste poging:</strong> {html.escape(str(status['sync']['last_attempt_at'] or '-'))}</p>
-    <p><strong>Laatste succesvolle login:</strong> {html.escape(str(status['sync']['last_success_at'] or '-'))}</p>
+    <p><strong>Laatste synchronisatie:</strong> {html.escape(str(status['sync'].get('last_completed_sync_at') or '-'))}</p>
     <p><strong>Laatste eind-URL:</strong> {html.escape(str(status['sync']['last_final_url'] or '-'))}</p>
     <p><strong>Laatste paginatitel:</strong> {html.escape(str(status['sync']['last_page_title'] or '-'))}</p>
   </section>
@@ -776,13 +776,16 @@ async def handle_admin_calendar_sync(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     service = _service(request.app)
     try:
-        status = await service.sync_calendar_from_persisted_exports()
+        rebuild = await service.rebuild_calendar_from_persisted_exports()
     except RuntimeError as exc:
         raise web.HTTPBadRequest(text=str(exc))
+    message = "Kalender is opnieuw opgebouwd vanuit opgeslagen roosterexports."
+    if rebuild.get("google_calendar_enabled") and not rebuild.get("google_calendar_completed"):
+        message = "ICS-feed is bijgewerkt vanuit JSON; Google Calendar kon niet volledig worden bijgewerkt."
     return web.json_response(
         {
-            "message": "Google Calendar synchronisatie is uitgevoerd op basis van opgeslagen roosterexports.",
-            "calendar_sync": status,
+            "message": message,
+            "calendar_rebuild": {key: value for key, value in rebuild.items() if key != "status"},
             "status": service.operator_status_payload(),
         }
     )
@@ -843,6 +846,7 @@ async def handle_admin_sync_state(request: web.Request) -> web.Response:
     _require_ops_auth(request)
     payload = await _read_request_payload(request)
     raw_enabled = payload.get("enabled")
+    raw_interval = payload.get("interval_minutes", payload.get("sync_interval_minutes"))
 
     if isinstance(raw_enabled, bool):
         enabled = raw_enabled
@@ -857,8 +861,18 @@ async def handle_admin_sync_state(request: web.Request) -> web.Response:
     else:
         raise web.HTTPBadRequest(text="Geef enabled mee als true of false.")
 
+    interval_minutes: int | None = None
+    if raw_interval is not None and str(raw_interval).strip() != "":
+        try:
+            interval_minutes = int(str(raw_interval).strip())
+        except ValueError:
+            raise web.HTTPBadRequest(text="Geef interval_minutes mee als geheel aantal minuten.")
+
     service = _service(request.app)
-    message = await service.set_sync_enabled(enabled)
+    try:
+        message = await service.set_sync_settings(enabled=enabled, interval_minutes=interval_minutes)
+    except RuntimeError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
     return web.json_response({"message": message, "status": service.operator_status_payload()})
 
 
@@ -1207,13 +1221,17 @@ def _render_status_page(
                 <tr>
                     <td>{html.escape(str(item.get('month', '-')))}</td>
                     <td>{int(item.get('item_count', 0))}</td>
-                    <td>{int(item.get('planned_hours_count', 0))}</td>
+                    <td>{html.escape(str(item.get('planned_hours_label', item.get('planned_hours', item.get('planned_hours_count', 0)))))}</td>
                     <td>{html.escape(str(item.get('notice', '') or '-'))}</td>
                     <td>{f'<a href="{html.escape(str(item.get("download_path", "")))}" target="_blank" rel="noreferrer">Download JSON</a>' if item.get('download_path') else '-'}</td>
                 </tr>
 """
         for item in status_payload["sync"].get("roster_month_exports", [])
     )
+
+    sync_interval_minutes = int(status_payload["sync"].get("sync_interval_minutes") or 0)
+    sync_interval_form_value = sync_interval_minutes if sync_interval_minutes > 0 else 60
+    sync_settings_checked = " checked" if status_payload["sync"].get("sync_enabled") else ""
 
     calendar_feed = status_payload.get("calendar_feed", {})
     calendar_status = status_payload["sync"].get("calendar", {})
@@ -1338,6 +1356,7 @@ def _render_status_page(
         .calendar-config-grid {{ display: grid; gap: 0.85rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }}
         .checkbox-row {{ display: flex; align-items: center; gap: 0.55rem; font-weight: 600; }}
         .checkbox-row input {{ width: auto; padding: 0; }}
+        .sync-settings-form {{ display: grid; grid-template-columns: minmax(160px, 220px) minmax(160px, 220px) auto; gap: 0.85rem; align-items: end; }}
         .console-shell {{ background: #0f172a; color: #e2e8f0; border-radius: 16px; padding: 1rem; font: 0.92rem/1.55 Consolas, "Courier New", monospace; max-height: 420px; overflow: auto; margin-bottom: 1rem; }}
         .console-line {{ padding: 0.2rem 0; border-bottom: 1px solid rgba(148, 163, 184, 0.12); }}
         .console-line:last-child {{ border-bottom: 0; }}
@@ -1354,7 +1373,7 @@ def _render_status_page(
         .trace-tijd {{ white-space: normal; }}
         .trace-tijd .t-date {{ display: block; font-size: 0.85rem; }}
         .trace-tijd .t-time {{ display: block; font-size: 0.85rem; color: #64748b; }}
-        @media (max-width: 900px) {{ .portal-manager, .calendar-grid {{ grid-template-columns: 1fr; }} }}
+        @media (max-width: 900px) {{ .portal-manager, .calendar-grid, .sync-settings-form {{ grid-template-columns: 1fr; }} }}
         @media (max-width: 720px) {{ .hero {{ flex-direction: column-reverse; align-items: flex-start; }} .brand-mark {{ max-width: 72vw; }} }}
   </style>
 </head>
@@ -1378,6 +1397,20 @@ def _render_status_page(
       <a href="/debug?token={html.escape(config.debug_token)}">Debugpagina</a>
     </div>
   </section>
+    <section>
+        <h2>Autosync</h2>
+        <form id="sync-settings-form" class="sync-settings-form">
+                <label class="checkbox-row">
+                        <input type="checkbox" id="sync_enabled" name="enabled"{sync_settings_checked}>
+                        <span>Autosync actief</span>
+                </label>
+                <label>
+                        <span>Interval in minuten</span>
+                        <input type="number" id="sync_interval_minutes" name="interval_minutes" min="1" max="10080" step="1" value="{sync_interval_form_value}" required>
+                </label>
+                <div class="actions"><button type="submit">Instellingen opslaan</button></div>
+        </form>
+    </section>
   <section>
     <h2>Overzicht</h2>
         <div id="overview-grid" class="overview-grid">
@@ -1391,7 +1424,8 @@ def _render_status_page(
             <div class="overview-card"><strong>Laatste status</strong><span>{html.escape(str(status_payload['sync']['last_message'] or '-'))}</span></div>
             <div class="overview-card"><strong>Laatste fout</strong><span>{html.escape(str(status_payload['sync']['last_error'] or '-'))}</span></div>
             <div class="overview-card"><strong>Huidige fase</strong><span>{html.escape(str(status_payload['sync']['current_phase'] or '-'))}</span></div>
-            <div class="overview-card"><strong>Laatste succesvolle login</strong><span>{html.escape(str(status_payload['sync']['last_success_at'] or '-'))}</span></div>
+            <div class="overview-card"><strong>Laatste synchronisatie</strong><span>{html.escape(str(status_payload['sync'].get('last_completed_sync_at') or '-'))}</span></div>
+            <div class="overview-card"><strong>Geplande synchronisatie</strong><span>{html.escape(str(status_payload['sync'].get('next_scheduled_sync_at') or '-'))}</span></div>
         </div>
   </section>
   <section>
@@ -1457,7 +1491,7 @@ def _render_status_page(
                     <div><dt>Laatste fout</dt><dd>{html.escape(str(calendar_status.get('last_error') or '-'))}</dd></div>
                     <div><dt>Laatste diff</dt><dd>{html.escape(calendar_summary_text)}</dd></div>
                 </dl>
-                <div class="actions"><button type="button" id="btn-calendar-sync">Google Calendar opnieuw syncen</button></div>
+                <div class="actions"><button type="button" id="btn-calendar-sync">Kalender bijwerken uit JSON</button></div>
                 <form id="google-calendar-form" class="calendar-config-form" enctype="multipart/form-data">
                     <div class="calendar-config-grid">
                         <label>
@@ -1554,6 +1588,9 @@ def _render_status_page(
         const portalNameInput = document.getElementById('portal_name');
         const portalLoginUrlInput = document.getElementById('portal_login_url');
         const portalLogoUrlInput = document.getElementById('portal_logo_url');
+        const syncSettingsForm = document.getElementById('sync-settings-form');
+        const syncEnabledInput = document.getElementById('sync_enabled');
+        const syncIntervalInput = document.getElementById('sync_interval_minutes');
         const syncToggleButton = document.getElementById('btn-toggle-sync');
         const debugToggleButton = document.getElementById('btn-debug-toggle');
         const liveUrl = `${{window.location.protocol === 'https:' ? 'wss' : 'ws'}}://${{window.location.host}}/status/live`;
@@ -1582,6 +1619,15 @@ def _render_status_page(
             const datePart = parsed.toLocaleDateString('nl-NL', {{day:'2-digit',month:'2-digit',year:'numeric'}});
             const timePart = parsed.toLocaleTimeString('nl-NL', {{hour:'2-digit',minute:'2-digit',second:'2-digit'}});
             return `<span class="trace-tijd"><span class="t-date">${{escapeHtml(datePart)}}</span><span class="t-time">${{escapeHtml(timePart)}}</span></span>`;
+        }}
+
+        function formatRosterHours(item) {{
+            if (item.planned_hours_label !== undefined && item.planned_hours_label !== null && item.planned_hours_label !== '') {{
+                return String(item.planned_hours_label);
+            }}
+            const value = Number(item.planned_hours ?? item.planned_hours_count ?? 0);
+            if (!Number.isFinite(value)) return '0';
+            return String(Math.round(value * 100) / 100);
         }}
 
         function shortenUrl(url, maxLen) {{
@@ -1646,13 +1692,19 @@ def _render_status_page(
                 <div class="overview-card"><strong>Laatste status</strong><span>${{escapeHtml(status.sync.last_message || '-')}}</span></div>
                 <div class="overview-card"><strong>Laatste fout</strong><span>${{escapeHtml(status.sync.last_error || '-')}}</span></div>
                 <div class="overview-card"><strong>Huidige fase</strong><span>${{escapeHtml(status.sync.current_phase || '-')}}</span></div>
-                <div class="overview-card"><strong>Laatste succesvolle login</strong><span>${{escapeHtml(formatTimestamp(status.sync.last_success_at))}}</span></div>`;
+                <div class="overview-card"><strong>Laatste synchronisatie</strong><span>${{escapeHtml(formatTimestamp(status.sync.last_completed_sync_at))}}</span></div>
+                <div class="overview-card"><strong>Geplande synchronisatie</strong><span>${{escapeHtml(formatTimestamp(status.sync.next_scheduled_sync_at))}}</span></div>`;
         }}
 
         function updateSyncControls(snapshot) {{
             const enabled = Boolean(snapshot.status.sync.sync_enabled);
             syncToggleButton.textContent = enabled ? 'Schakel sync uit' : 'Schakel sync in';
             syncToggleButton.className = enabled ? 'danger' : '';
+            syncEnabledInput.checked = enabled;
+            const interval = Number(snapshot.status.sync.sync_interval_minutes || 0);
+            if (document.activeElement !== syncIntervalInput) {{
+                syncIntervalInput.value = interval > 0 ? String(interval) : '60';
+            }}
         }}
 
         function updateDebugToggle(snapshot) {{
@@ -1765,7 +1817,7 @@ def _render_status_page(
                 <tr>
                     <td>${{escapeHtml(item.month || '-')}}</td>
                     <td>${{Number(item.item_count || 0)}}</td>
-                    <td>${{Number(item.planned_hours_count || 0)}}</td>
+                    <td>${{escapeHtml(formatRosterHours(item))}}</td>
                     <td>${{escapeHtml(item.notice || '-')}}</td>
                     <td>${{item.download_path ? `<a href="${{escapeHtml(item.download_path)}}" target="_blank" rel="noreferrer">Download JSON</a>` : '-'}}</td>
                 </tr>`).join('');
@@ -1901,6 +1953,25 @@ def _render_status_page(
             }}
         }});
 
+        syncSettingsForm.addEventListener('submit', async (event) => {{
+            event.preventDefault();
+            const interval = Number.parseInt(syncIntervalInput.value, 10);
+            if (!Number.isFinite(interval) || interval < 1 || interval > 10080) {{
+                setFlash('error', 'Kies een sync-interval tussen 1 minuut en 7 dagen.');
+                return;
+            }}
+            try {{
+                const response = await callJson('/api/v1/admin/sync', {{
+                    method: 'POST',
+                    body: JSON.stringify({{ enabled: syncEnabledInput.checked, interval_minutes: interval }}),
+                }});
+                applyStatusPayload(response);
+                setFlash('ok', response.message || 'Synchronisatie-instellingen opgeslagen.');
+            }} catch (error) {{
+                setFlash('error', error.message);
+            }}
+        }});
+
         debugToggleButton.addEventListener('click', async () => {{
             try {{
                 const response = await fetch('/status/debug-toggle', {{
@@ -1955,7 +2026,7 @@ def _render_status_page(
             try {{
                 const response = await callJson('/api/v1/admin/calendar/sync', {{ method: 'POST' }});
                 applyStatusPayload(response);
-                setFlash('ok', response.message || 'Google Calendar synchronisatie uitgevoerd.');
+                setFlash('ok', response.message || 'Kalender is bijgewerkt vanuit opgeslagen JSON.');
             }} catch (error) {{
                 setFlash('error', error.message);
             }}
