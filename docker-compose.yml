@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: ons-rooster-backend:latest
+    # image: ons-rooster-backend:latest
     container_name: ons-rooster
     restart: unless-stopped
     environment:
