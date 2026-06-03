@@ -562,6 +562,7 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     # Dedicated timeout for the OTP-field-disappears transition after clicking Submit.
     # This is independent of login_timeout_seconds so it never inherits an exhausted budget.
     POST_OTP_TRANSITION_TIMEOUT = 30
+    ROSTER_MONTH_MAX_OFFSET = 6
     DUTCH_MONTHS = {
         "jan": 1,
         "januari": 1,
@@ -1985,14 +1986,18 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         else:
             debug_notes.append("Rooster button was not used from dashboard; continuing with direct roster URLs.")
 
-        for month_start, month_url in self._resolve_month_targets(login_url, page.url, config.roster_url):
+        initial_month, roster_scheme, roster_host = self._resolve_month_reference(
+            login_url,
+            page.url,
+            config.roster_url,
+        )
+        month_offset = 0
+        while month_offset <= self.ROSTER_MONTH_MAX_OFFSET:
+            month_start = self._add_months(initial_month, month_offset)
+            month_url = self._build_month_roster_url(roster_scheme, roster_host, month_start)
             month_key = f"{month_start.year:04d}-{month_start.month:02d}"
             month_tuple = (month_start.year, month_start.month)
-            if stop_from is not None and month_tuple >= stop_from:
-                debug_notes.append(
-                    f"Skipped month {month_key} because publication status blocks months from {stop_from[0]:04d}-{stop_from[1]:02d}."
-                )
-                continue
+            is_publication_probe = stop_from is not None and month_tuple >= stop_from
 
             await self._dismiss_dashboard_confirmation_modal(page, debug_notes=debug_notes)
             try:
@@ -2046,10 +2051,36 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 page_title=page_title,
             )
             debug_notes.extend(extraction_notes)
+            has_roster_data = bool(export_payload.get("items"))
+            if is_publication_probe and not has_roster_data:
+                debug_notes.append(
+                    f"Stopped month probing at {month_key} because the publication notice month has no roster data."
+                )
+                break
             exports.append(export_payload)
             roster_items.extend(month_items)
             if publication_stop is not None and stop_from is None:
                 stop_from = publication_stop
+            next_month = self._add_months(initial_month, month_offset + 1)
+            next_month_tuple = (next_month.year, next_month.month)
+            if stop_from is None and month_offset >= 1:
+                break
+            if stop_from is not None and month_tuple >= stop_from and not has_roster_data:
+                break
+            if stop_from is not None and month_tuple >= stop_from and has_roster_data:
+                month_offset += 1
+                continue
+            if stop_from is not None and month_offset >= 1 and next_month_tuple < stop_from:
+                month_offset += 1
+                continue
+            if stop_from is not None and next_month_tuple >= stop_from:
+                month_offset += 1
+                continue
+            month_offset += 1
+        else:
+            debug_notes.append(
+                f"Stopped month probing after reaching offset {self.ROSTER_MONTH_MAX_OFFSET} to avoid unbounded scraping."
+            )
 
         if not exports:
             raise RuntimeError("De backend kon geen roostermaanden ophalen na OTP-verificatie.")
@@ -2168,6 +2199,22 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
         current_url: str,
         configured_roster_url: str,
     ) -> list[tuple[date, str]]:
+        initial_month, scheme, host = self._resolve_month_reference(
+            login_url,
+            current_url,
+            configured_roster_url,
+        )
+        return [
+            (month_start, self._build_month_roster_url(scheme, host, month_start))
+            for month_start in (initial_month, self._add_months(initial_month, 1))
+        ]
+
+    def _resolve_month_reference(
+        self,
+        login_url: str,
+        current_url: str,
+        configured_roster_url: str,
+    ) -> tuple[date, str, str]:
         reference_url = ""
         parsed_login = urlparse(login_url)
         jump_values = parse_qs(parsed_login.query).get("jump", [])
@@ -2195,12 +2242,12 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             raise RuntimeError("De backend kon geen geldige HasMoves-host bepalen voor roostermaanden.")
 
         initial_month = self._extract_month_from_roster_url(parsed_reference.path) or date.today().replace(day=1)
-        next_month = self._add_months(initial_month, 1)
-        targets: list[tuple[date, str]] = []
-        for month_start in (initial_month, next_month):
-            month_path = f"/onsdraaiboek/roster/{month_start.isoformat()}/month"
-            targets.append((month_start, f"{scheme}://{host}{month_path}"))
-        return targets
+        return initial_month, scheme, host
+
+    @staticmethod
+    def _build_month_roster_url(scheme: str, host: str, month_start: date) -> str:
+        month_path = f"/onsdraaiboek/roster/{month_start.isoformat()}/month"
+        return f"{scheme}://{host}{month_path}"
 
     @staticmethod
     def _infer_hasmoves_host(login_host: str, current_host: str) -> str:
