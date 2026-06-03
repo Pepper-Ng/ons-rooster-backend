@@ -1957,7 +1957,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     ) -> AuthenticationResult:
         exports: list[dict[str, Any]] = []
         roster_items: list[RosterItem] = []
-        stop_from: tuple[int, int] | None = None
 
         await self._attach_best_effort_dialog_dismiss_handler(page, debug_notes=debug_notes)
         trace_index = await self._record_playwright_page_step(
@@ -1996,8 +1995,6 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
             month_start = self._add_months(initial_month, month_offset)
             month_url = self._build_month_roster_url(roster_scheme, roster_host, month_start)
             month_key = f"{month_start.year:04d}-{month_start.month:02d}"
-            month_tuple = (month_start.year, month_start.month)
-            is_publication_probe = stop_from is not None and month_tuple >= stop_from
 
             await self._dismiss_dashboard_confirmation_modal(page, debug_notes=debug_notes)
             try:
@@ -2044,38 +2041,21 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
                 page=page,
             )
 
-            export_payload, month_items, extraction_notes, publication_stop = self._extract_month_roster_export(
+            export_payload, month_items, extraction_notes, _ = self._extract_month_roster_export(
                 html,
                 month_start=month_start,
                 source_url=page.url,
                 page_title=page_title,
             )
             debug_notes.extend(extraction_notes)
-            has_roster_data = bool(export_payload.get("items"))
-            if is_publication_probe and not has_roster_data:
+            has_month_data = self._month_export_has_data(export_payload, month_key)
+            if month_offset > 0 and not has_month_data:
                 debug_notes.append(
-                    f"Stopped month probing at {month_key} because the publication notice month has no roster data."
+                    f"Stopped month probing at {month_key} because the future month has no roster data."
                 )
                 break
             exports.append(export_payload)
             roster_items.extend(month_items)
-            if publication_stop is not None and stop_from is None:
-                stop_from = publication_stop
-            next_month = self._add_months(initial_month, month_offset + 1)
-            next_month_tuple = (next_month.year, next_month.month)
-            if stop_from is None and month_offset >= 1:
-                break
-            if stop_from is not None and month_tuple >= stop_from and not has_roster_data:
-                break
-            if stop_from is not None and month_tuple >= stop_from and has_roster_data:
-                month_offset += 1
-                continue
-            if stop_from is not None and month_offset >= 1 and next_month_tuple < stop_from:
-                month_offset += 1
-                continue
-            if stop_from is not None and next_month_tuple >= stop_from:
-                month_offset += 1
-                continue
             month_offset += 1
         else:
             debug_notes.append(
@@ -2248,6 +2228,17 @@ class HttpLoginAutomationClient(PlaywrightAutomationClient):
     def _build_month_roster_url(scheme: str, host: str, month_start: date) -> str:
         month_path = f"/onsdraaiboek/roster/{month_start.isoformat()}/month"
         return f"{scheme}://{host}{month_path}"
+
+    @staticmethod
+    def _month_export_has_data(export_payload: dict[str, Any], month_key: str) -> bool:
+        items = export_payload.get("items", [])
+        if not isinstance(items, list):
+            return False
+        return any(
+            isinstance(item, dict)
+            and str(item.get("date", "")).strip().startswith(f"{month_key}-")
+            for item in items
+        )
 
     @staticmethod
     def _infer_hasmoves_host(login_host: str, current_host: str) -> str:

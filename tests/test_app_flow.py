@@ -4,7 +4,7 @@ import asyncio
 import json
 import re
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from urllib.parse import urlparse
 
 import pytest
@@ -15,7 +15,7 @@ from ons_backend.app import create_app
 from ons_backend.clients import FcmPushClient, HttpLoginAutomationClient
 from ons_backend.config import AppConfig
 from ons_backend.google_calendar import CalendarSyncSummary
-from ons_backend.models import AuthenticationResult, DeviceRegistration, LoginCredentials, RosterItem
+from ons_backend.models import AppState, AuthenticationResult, DeviceRegistration, LoginCredentials, RosterItem
 from ons_backend.service import BackendService
 from ons_backend.storage import StateStore
 
@@ -819,6 +819,51 @@ async def test_status_page_supports_autosync_interval_settings(aiohttp_client, t
     assert "Laatste succesvolle login" not in body
     assert 'id="sync_interval_minutes"' in body
     assert 'value="45"' in body
+
+
+@pytest.mark.asyncio
+async def test_scheduler_preserves_future_planned_sync_after_restart(tmp_path):
+    assert BackendService._parse_sync_timestamp(123) is None
+
+    config = replace(build_config(tmp_path), sync_interval_minutes=1440)
+    store = StateStore(config)
+    persisted_next_sync = (
+        datetime.now(UTC).replace(microsecond=0) + timedelta(hours=5)
+    ).isoformat().replace("+00:00", "Z")
+    state = AppState()
+    state.sync.sync_enabled = True
+    state.sync.sync_interval_minutes = 1440
+    state.sync.next_scheduled_sync_at = persisted_next_sync
+    store.save(state, None)
+
+    automation_client = CountingAutomationClient()
+    service = BackendService(
+        config=config,
+        store=store,
+        push_client=FakePushClient(),
+        automation_client=automation_client,
+    )
+    observed_timeouts: list[float] = []
+    wait_forever = asyncio.Event()
+
+    async def capture_scheduler_wait(timeout_seconds: float) -> bool:
+        observed_timeouts.append(timeout_seconds)
+        await wait_forever.wait()
+        return True
+
+    service._wait_for_scheduler_wakeup = capture_scheduler_wait  # type: ignore[method-assign]
+
+    await service.start()
+    try:
+        await wait_for(lambda: bool(observed_timeouts))
+    finally:
+        await service.stop()
+
+    assert service.state.sync.next_scheduled_sync_at == persisted_next_sync
+    reloaded_state, _ = store.load()
+    assert reloaded_state.sync.next_scheduled_sync_at == persisted_next_sync
+    assert 4 * 60 * 60 < observed_timeouts[0] <= 5 * 60 * 60
+    assert automation_client.call_count == 0
 
 
 @pytest.mark.asyncio
@@ -2239,6 +2284,63 @@ async def test_http_login_automation_client_probes_publication_stop_until_empty_
     ]
     assert len(result.roster_items) == 2
     assert any("Stopped month probing at 2026-08" in note for note in result.debug_notes)
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_keeps_probing_while_future_months_have_data(tmp_path):
+    automation_client = HttpLoginAutomationClient()
+    month_with_slot = """
+<html>
+    <body>
+        <table class="month-roster" id="grid-table">
+            <tr>
+                <td class="week-content">
+                    <div class="roster_slot shiftassignment">
+                        <span class="slot_header">2 {month_name}</span>
+                        <h3 class="title">{title}</h3>
+                        <span class="timepair"><span class="start">08:00</span><span class="stop">16:00</span></span>
+                    </div>
+                </td>
+            </tr>
+        </table>
+    </body>
+</html>
+"""
+    page = FakeRosterMonthPage(
+        {
+            "2026-06": month_with_slot.format(month_name="jun", title="Juni dienst"),
+            "2026-07": month_with_slot.format(month_name="jul", title="Juli dienst"),
+            "2026-08": month_with_slot.format(month_name="aug", title="Augustus dienst"),
+            "2026-09": month_with_slot.format(month_name="aug", title="Alleen vorige maand zichtbaar"),
+        }
+    )
+
+    result = await automation_client._collect_roster_months_after_otp(
+        page=page,
+        snapshot_path=tmp_path / "snapshot.html",
+        config=build_config(tmp_path),
+        report_progress=None,
+        trace_index=1,
+        debug_notes=[],
+        login_url=(
+            "https://landvanhorne.startmetons.nl/"
+            "?jump=https%3A%2F%2Flandvanhorne.hasmoves.com%2Fonsdraaiboek%2Froster%2F2026-06-01%2Fmonth"
+        ),
+    )
+
+    assert [export["month"] for export in result.roster_exports] == [
+        "2026-06",
+        "2026-07",
+        "2026-08",
+    ]
+    assert [url.rsplit("/roster/", 1)[-1][:7] for url in page.visited_urls] == [
+        "2026-06",
+        "2026-07",
+        "2026-08",
+        "2026-09",
+    ]
+    assert len(result.roster_items) == 3
+    assert any("Stopped month probing at 2026-09" in note for note in result.debug_notes)
 
 
 def test_http_login_automation_client_resolves_month_targets_from_jump_url():
