@@ -232,6 +232,23 @@ class BackendService:
         self.state.sync.next_scheduled_sync_at = self._next_scheduled_sync_timestamp()
 
     @staticmethod
+    def _parse_sync_timestamp(value: object) -> datetime | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        if not normalized:
+            return None
+        if normalized.endswith("Z"):
+            normalized = f"{normalized[:-1]}+00:00"
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).replace(microsecond=0)
+
+    @staticmethod
     def _roster_item_date_in_month(item: dict[str, Any], month_key: str) -> bool:
         date_value = str(item.get("date", "")).strip()
         return bool(month_key and date_value.startswith(f"{month_key}-"))
@@ -1351,10 +1368,15 @@ class BackendService:
                 continue
 
             async with self._state_lock:
-                self._set_next_scheduled_sync_locked()
-                await self._persist_state()
+                scheduled_at = self._parse_sync_timestamp(self.state.sync.next_scheduled_sync_at)
+                if scheduled_at is None:
+                    self._set_next_scheduled_sync_locked()
+                    scheduled_at = self._parse_sync_timestamp(self.state.sync.next_scheduled_sync_at)
+                    await self._persist_state()
 
-            if await self._wait_for_scheduler_wakeup(interval_minutes * 60):
+            now = datetime.now(UTC).replace(microsecond=0)
+            wait_seconds = max(0.0, (scheduled_at - now).total_seconds()) if scheduled_at is not None else interval_minutes * 60
+            if await self._wait_for_scheduler_wakeup(wait_seconds):
                 continue
 
             try:
@@ -1362,6 +1384,19 @@ class BackendService:
                     await self.trigger_refresh(reason="scheduled", wait=True)
             except Exception:
                 log.exception("Scheduled sync failed.")
+            finally:
+                async with self._state_lock:
+                    current_scheduled_at = self._parse_sync_timestamp(self.state.sync.next_scheduled_sync_at)
+                    if (
+                        self.sync_enabled()
+                        and self.sync_interval_minutes() > 0
+                        and (
+                            current_scheduled_at is None
+                            or current_scheduled_at <= datetime.now(UTC).replace(microsecond=0)
+                        )
+                    ):
+                        self._set_next_scheduled_sync_locked()
+                        await self._persist_state()
 
     async def _wait_for_scheduler_wakeup(self, timeout_seconds: float) -> bool:
         try:
