@@ -333,6 +333,50 @@ class CountingAutomationClient:
         )
 
 
+class FakeHiddenLocator:
+    @property
+    def first(self):
+        return self
+
+    async def is_visible(self, timeout=0):
+        return False
+
+    async def click(self, timeout=0, force=False):
+        raise AssertionError("Hidden fake locator should not be clicked.")
+
+
+class FakeRosterMonthPage:
+    def __init__(self, pages_by_month: dict[str, str]) -> None:
+        self.pages_by_month = pages_by_month
+        self.url = "https://landvanhorne.hasmoves.com/medewerkerportaal"
+        self.visited_urls: list[str] = []
+
+    def on(self, event_name: str, callback) -> None:
+        del event_name, callback
+
+    def locator(self, selector: str) -> FakeHiddenLocator:
+        del selector
+        return FakeHiddenLocator()
+
+    async def goto(self, url: str, wait_until: str = "domcontentloaded") -> None:
+        del wait_until
+        self.url = url
+        self.visited_urls.append(url)
+
+    async def wait_for_selector(self, selector: str, timeout: int = 0) -> None:
+        del selector, timeout
+
+    async def wait_for_timeout(self, timeout: int) -> None:
+        del timeout
+
+    async def content(self) -> str:
+        month_key = self.url.rsplit("/roster/", 1)[-1][:7] if "/roster/" in self.url else ""
+        return self.pages_by_month.get(month_key, "<html><body></body></html>")
+
+    async def title(self) -> str:
+        return "Rooster"
+
+
 class ExportingAutomationClient:
     async def authenticate_and_scrape(
         self,
@@ -2127,6 +2171,74 @@ def test_http_login_automation_client_extracts_month_roster_export():
     assert planned_items[0].end == "14:00"
     assert publication_stop == (2026, 8)
     assert any("Publication notice detected" in note for note in notes)
+
+
+@pytest.mark.asyncio
+async def test_http_login_automation_client_probes_publication_stop_until_empty_month(tmp_path):
+    automation_client = HttpLoginAutomationClient()
+    month_with_slot = """
+<html>
+    <body>
+        {notice}
+        <table class="month-roster" id="grid-table">
+            <tr>
+                <td class="week-content">
+                    <div class="roster_slot shiftassignment">
+                        <span class="slot_header">2 {month_name}</span>
+                        <h3 class="title">{title}</h3>
+                        <span class="timepair"><span class="start">08:00</span><span class="stop">16:00</span></span>
+                    </div>
+                </td>
+            </tr>
+        </table>
+    </body>
+</html>
+"""
+    empty_month = """
+<html>
+    <body>
+        <div class="publication-status">Deze maand is nog niet gepubliceerd.</div>
+        <table class="month-roster" id="grid-table"></table>
+    </body>
+</html>
+"""
+    page = FakeRosterMonthPage(
+        {
+            "2026-06": month_with_slot.format(
+                notice='<div class="publication-status">Vanaf 01 juli kan je al je diensten inplannen.</div>',
+                month_name="jun",
+                title="Juni dienst",
+            ),
+            "2026-07": month_with_slot.format(
+                notice="",
+                month_name="jul",
+                title="Juli dienst",
+            ),
+            "2026-08": empty_month,
+        }
+    )
+
+    result = await automation_client._collect_roster_months_after_otp(
+        page=page,
+        snapshot_path=tmp_path / "snapshot.html",
+        config=build_config(tmp_path),
+        report_progress=None,
+        trace_index=1,
+        debug_notes=[],
+        login_url=(
+            "https://landvanhorne.startmetons.nl/"
+            "?jump=https%3A%2F%2Flandvanhorne.hasmoves.com%2Fonsdraaiboek%2Froster%2F2026-06-01%2Fmonth"
+        ),
+    )
+
+    assert [export["month"] for export in result.roster_exports] == ["2026-06", "2026-07"]
+    assert [url.rsplit("/roster/", 1)[-1][:7] for url in page.visited_urls] == [
+        "2026-06",
+        "2026-07",
+        "2026-08",
+    ]
+    assert len(result.roster_items) == 2
+    assert any("Stopped month probing at 2026-08" in note for note in result.debug_notes)
 
 
 def test_http_login_automation_client_resolves_month_targets_from_jump_url():
